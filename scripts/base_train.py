@@ -96,7 +96,7 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", 
 
 # Flash Attention status
 if HAS_FA3:
-    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+    print0("✓ Using Flash Attention 3: efficient, new and awesome.")
 else:
     print0("!" * 80)
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")

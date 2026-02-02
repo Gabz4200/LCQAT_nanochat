@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
-# Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
+# Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
 
 @dataclass
@@ -93,7 +93,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
 
-        # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
+        # Flash Attention (FA3 or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window

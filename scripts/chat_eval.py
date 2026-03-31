@@ -241,6 +241,7 @@ if __name__ == "__main__":
             centered_acc = (acc - baseline_acc) / (1.0 - baseline_acc)
             centered_mean += centered_acc
         chatcore_metric = centered_mean / len(results)
+        print0(f"CORE score: {100 * chatcore_metric:.2f}%")
         chatcore_metric_dict = {"ChatCORE metric": chatcore_metric}
     get_report().log(section="Chat evaluation " + args.source, data=[
         vars(args), # CLI args

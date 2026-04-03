@@ -237,6 +237,8 @@ class GPT(nn.Module):
         # Decaying x0 init: earlier layers get more input embedding blending
         for i in range(n_layer):
             self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+        self.smear_lambda.fill_(0.0)
+        self.backout_lambda.fill_(0.2)
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():

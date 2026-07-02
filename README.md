@@ -155,7 +155,6 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── logo.svg
 │   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
 │   ├── optim.py                    # AdamW + Muon optimizer, 1GPU and distributed
-│   ├── report.py                   # Utilities for writing the nanochat Report
 │   ├── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
 │   └── ui.html                     # HTML/CSS/JS for nanochat frontend
 ├── pyproject.toml

@@ -228,12 +228,9 @@ if __name__ == "__main__":
         results[task_name] = acc
         print0(f"{task_name} accuracy: {100 * acc:.2f}%")
 
-    # Log to report
-    from nanochat.report import get_report
-    all_tasks_were_evaluated = all(task_name in results for task_name in all_tasks)
     # calculate the ChatCORE metric if we can (similar to CORE, it's the mean centered accuracy)
     # this way, ChatCORE ranges from 0 (at random baseline) to 1 (peak performance)
-    chatcore_metric_dict = {}
+    all_tasks_were_evaluated = all(task_name in results for task_name in all_tasks)
     if all_tasks_were_evaluated:
         centered_mean = 0
         for task_name, acc in results.items():
@@ -241,12 +238,6 @@ if __name__ == "__main__":
             centered_acc = (acc - baseline_acc) / (1.0 - baseline_acc)
             centered_mean += centered_acc
         chatcore_metric = centered_mean / len(results)
-        print0(f"CORE score: {100 * chatcore_metric:.2f}%")
-        chatcore_metric_dict = {"ChatCORE metric": chatcore_metric}
-    get_report().log(section="Chat evaluation " + args.source, data=[
-        vars(args), # CLI args
-        results,
-        chatcore_metric_dict,
-    ])
+        print0(f"ChatCORE metric: {chatcore_metric:.4f}")
 
     compute_cleanup()

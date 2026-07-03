@@ -57,6 +57,3 @@ python -m scripts.chat_sft \
 # It might even know that the color of the sky is blue.
 # Sometimes the model likes it if you first say Hi before you ask it questions.
 # python -m scripts.chat_cli -p "What is the capital of France?"
-
-# Chat with the model over a pretty WebUI ChatGPT style
-# python -m scripts.chat_web

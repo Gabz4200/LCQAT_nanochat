@@ -81,6 +81,3 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"
-
-# even better, chat with your model over a pretty WebUI ChatGPT style
-# python -m scripts.chat_web

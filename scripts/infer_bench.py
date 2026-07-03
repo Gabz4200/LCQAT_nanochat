@@ -44,64 +44,13 @@ from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
 # -----------------------------------------------------------------------------
-# Static accounting: what the architecture implies about inference cost
-
-def kv_bytes_per_token(model):
-    """Bytes to *store* one token of KV cache, per row (all layers)."""
-    config = model.config
-    head_dim = config.n_embd // config.n_head
-    kv_dtype_bytes = 2 # KV cache is kept in bf16
-    return config.n_layer * 2 * config.n_kv_head * head_dim * kv_dtype_bytes
-
-def kv_read_bytes(model, context_len):
-    """Bytes of KV cache *read* by one decode step at a given context length, per row.
-    Sliding window layers only attend to (and read) the last `window` tokens."""
-    config = model.config
-    head_dim = config.n_embd // config.n_head
-    kv_dtype_bytes = 2
-    total = 0
-    for window, _ in model.window_sizes:
-        total += 2 * config.n_kv_head * head_dim * kv_dtype_bytes * min(context_len, window)
-    return total
+# Measurement
+# (the architecture-side cost accounting - FLOPs, KV cache bytes - lives on the
+# GPT model itself: estimate_decode_flops, estimate_prefill_flops, kv_bytes_per_token, kv_read_bytes)
 
 def weight_bytes(model):
     """Bytes of parameters as stored (each decode step reads all of them)."""
     return sum(p.numel() * p.element_size() for p in model.parameters())
-
-def matmul_param_count(model):
-    """Number of matmul (weight) parameters. Backed out of estimate_flops() so that
-    the exclusion list of non-matmul params (embeddings, scalars, ...) lives in one place."""
-    config = model.config
-    h = config.n_head
-    q = config.n_embd // config.n_head
-    t = config.sequence_len
-    train_attn_flops = sum(12 * h * q * min(window, t) for window, _ in model.window_sizes)
-    matmul_params = (model.estimate_flops() - train_attn_flops) // 6
-    return matmul_params
-
-def decode_flops_per_token(model, context_len):
-    """Forward FLOPs to decode one token at a given context length: 2 FLOPs per
-    matmul param, plus attention reads of min(context, window) per layer."""
-    config = model.config
-    h = config.n_head
-    q = config.n_embd // config.n_head
-    attn_flops = sum(4 * h * q * min(context_len, window) for window, _ in model.window_sizes)
-    return 2 * matmul_param_count(model) + attn_flops
-
-def prefill_flops(model, prompt_len):
-    """Forward FLOPs to prefill a prompt: causal, so token t attends to min(t, window)."""
-    config = model.config
-    h = config.n_head
-    q = config.n_embd // config.n_head
-    attn_flops = 0
-    for window, _ in model.window_sizes:
-        w = min(window, prompt_len)
-        attended = w * (w + 1) // 2 + (prompt_len - w) * w # ramp up to w, then flat
-        attn_flops += 4 * h * q * attended
-    return 2 * matmul_param_count(model) * prompt_len + attn_flops
-
-# -----------------------------------------------------------------------------
-# Measurement
 
 def bench_generate(engine, prompt_tokens, batch_size, decode_tokens, temperature):
     """Run one timed generation. Returns dict of measurements."""
@@ -180,9 +129,9 @@ def main():
     total_vram = torch.cuda.get_device_properties(device).total_memory
     w_bytes = weight_bytes(model)
     num_params = sum(p.numel() for p in model.parameters())
-    kv_store = kv_bytes_per_token(model)
+    kv_store = model.kv_bytes_per_token()
     context_mid = prompt_len + args.decode_tokens // 2 # representative decode context
-    kv_read = kv_read_bytes(model, context_mid)
+    kv_read = model.kv_read_bytes(context_mid)
     # tokens/sec ceiling at batch 1: every step must at least re-read weights + KV
     ceiling_bs1 = peak_bw / (w_bytes + kv_read)
     # how many rows of full-context KV fit next to the weights
@@ -221,7 +170,7 @@ def main():
         "kv_read_bytes_per_step": kv_read,
         "context_mid": context_mid,
         "peak_flops_per_sec": peak_flops if peak_flops != float("inf") else None,
-        "decode_flops_per_token": decode_flops_per_token(model, context_mid),
+        "decode_flops_per_token": model.estimate_decode_flops(context_mid),
         "ceiling_bs1_tok_per_sec": round(ceiling_bs1, 1) if ceiling_bs1 != float("inf") else None,
         "max_full_context_rows": max_rows,
         "prompt_tokens": prompt_len,
@@ -236,7 +185,7 @@ def main():
     bench_generate(engine, prompt_tokens, 1, 2, args.temperature) # warmup
     prefill_result = bench_generate(engine, prompt_tokens, 1, 2, args.temperature)
     prefill_time = prefill_result["ttft"]
-    prefill_mfu = 100 * prefill_flops(model, prompt_len) / prefill_time / peak_flops
+    prefill_mfu = 100 * model.estimate_prefill_flops(prompt_len) / prefill_time / peak_flops
     prefill_tok_per_sec = prompt_len / prefill_time
     print(f"Prefill (batch 1, {prompt_len} tokens): {prefill_tok_per_sec:,.0f} tok/s | MFU {prefill_mfu:.1f}%")
     payload["prefill"] = {
@@ -269,7 +218,7 @@ def main():
         bytes_per_step = w_bytes + batch_size * kv_read
         mbu = 100 * (bytes_per_step / tpot) / peak_bw
         # MFU: FLOPs each decode step must do, over what the GPU can do
-        flops_per_step = batch_size * decode_flops_per_token(model, context_mid)
+        flops_per_step = batch_size * model.estimate_decode_flops(context_mid)
         mfu = 100 * (flops_per_step / tpot) / peak_flops
         vram_gib = result["peak_vram"] / 2**30
         note = "" if num_steps == args.decode_tokens - 1 else f" (early stop @ {num_steps})"

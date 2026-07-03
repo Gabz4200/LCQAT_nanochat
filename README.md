@@ -108,7 +108,7 @@ nanochat does not use `torch.amp.autocast`. Instead, precision is managed explic
 |----------|--------------|-----|
 | CUDA SM 80+ (A100, H100, ...) | `bfloat16` | Native bf16 tensor cores |
 | CUDA SM < 80 (V100, T4, ...) | `float32` | No bf16; fp16 available via `NANOCHAT_DTYPE=float16` (uses GradScaler) |
-| CPU / MPS | `float32` | No reduced-precision tensor cores |
+| CPU / MPS | `float32` | Safe default. On recent macOS, MPS also runs `NANOCHAT_DTYPE=bfloat16` fine (~25% less memory, similar speed) |
 
 You can override the default with the `NANOCHAT_DTYPE` environment variable:
 

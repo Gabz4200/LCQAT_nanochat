@@ -186,7 +186,12 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── mmlu.py                     # Multiple choice questions, broad topics
 │   └── smoltalk.py                 # Conglomerate dataset of SmolTalk from HF
 ├── tests
-│   └── test_engine.py
+│   ├── test_attention_fallback.py  # FA3/SDPA attention fallback
+│   ├── test_engine.py              # Inference engine, KV cache
+│   ├── test_execution.py           # Sandboxed code execution
+│   ├── test_optim.py               # MuonAdamW optimizer (needs GPU)
+│   ├── test_tasks.py               # Task slicing, mixtures, HubDataset
+│   └── test_tokenizer.py           # BPE round-trips, chat rendering
 └── uv.lock
 ```
 

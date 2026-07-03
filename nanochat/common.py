@@ -277,3 +277,52 @@ def get_peak_flops(device_name: str) -> float:
     # Unknown GPU - return inf so MFU shows as 0% rather than a wrong guess
     logger.warning(f"Peak flops undefined for: {device_name}, MFU will show as 0%")
     return float('inf')
+
+def get_peak_bandwidth(device_name: str) -> float:
+    """Peak HBM/GDDR memory bandwidth in bytes/sec. The decode phase of inference
+    is memory-bandwidth-bound, so this is the roofline for tokens/sec (see MBU)."""
+    name = device_name.lower()
+
+    # Table order matters: more specific patterns first.
+    _PEAK_BANDWIDTH_TABLE = (
+        # NVIDIA Blackwell (HBM3e)
+        (["gb200"], 8.0e12),
+        (["grace blackwell"], 8.0e12),
+        (["b200"], 8.0e12),
+        (["b100"], 8.0e12),
+        # NVIDIA Hopper
+        (["h200"], 4.8e12),
+        (["h100", "nvl"], 3.9e12),
+        (["h100", "pcie"], 2.0e12),
+        (["h100"], 3.35e12), # SXM
+        (["h800", "pcie"], 2.0e12),
+        (["h800"], 3.35e12), # SXM
+        # NVIDIA Ampere data center (A100 80GB; the 40GB variant is 1.6e12)
+        (["a100"], 2.0e12),
+        (["a800"], 2.0e12),
+        (["a40"], 696e9),
+        (["a30"], 933e9),
+        # NVIDIA Ada data center
+        (["l40s"], 864e9),
+        (["l40-s"], 864e9),
+        (["l40 s"], 864e9),
+        (["l4"], 300e9),
+        # AMD CDNA accelerators
+        (["mi355"], 8.0e12),
+        (["mi325"], 6.0e12),
+        (["mi300x"], 5.3e12),
+        (["mi300a"], 5.3e12),
+        (["mi250x"], 3.28e12),
+        (["mi250"], 3.28e12),
+        # Consumer RTX
+        (["5090"], 1.79e12),
+        (["4090"], 1.01e12),
+        (["3090"], 936e9),
+    )
+    for patterns, bandwidth in _PEAK_BANDWIDTH_TABLE:
+        if all(p in name for p in patterns):
+            return bandwidth
+
+    # Unknown GPU - return inf so MBU shows as 0% rather than a wrong guess
+    logger.warning(f"Peak bandwidth undefined for: {device_name}, MBU will show as 0%")
+    return float('inf')

@@ -176,6 +176,7 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── chat_eval.py                # Chat model: eval tasks
 │   ├── chat_rl.py                  # Chat model: reinforcement learning
 │   ├── chat_sft.py                 # Chat model: train SFT
+│   ├── infer_bench.py              # Inference: latency/throughput/VRAM bench
 │   ├── tok_eval.py                 # Tokenizer: evaluate compression rate
 │   └── tok_train.py                # Tokenizer: train it
 ├── tasks

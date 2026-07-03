@@ -139,7 +139,6 @@ I've published a number of guides that might contain helpful information, most r
 - [Feb 1 2026: Beating GPT-2 for <<$100: the nanochat journey](https://github.com/karpathy/nanochat/discussions/481)
 - [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) documents the first nanochat miniseries of models.
 - To add new abilities to nanochat, see [Guide: counting r in strawberry (and how to add abilities generally)](https://github.com/karpathy/nanochat/discussions/164).
-- To customize your nanochat, see [Guide: infusing identity to your nanochat](https://github.com/karpathy/nanochat/discussions/139) in Discussions, which describes how you can tune your nanochat's personality through synthetic data generation and mixing that data into the SFT stage.
 - [Oct 13 2025: original nanochat post](https://github.com/karpathy/nanochat/discussions/1) introducing nanochat, though now it contains some deprecated information and the model is a lot older (with worse results) than current master.
 
 ## File structure
@@ -149,7 +148,6 @@ I've published a number of guides that might contain helpful information, most r
 ├── LICENSE
 ├── README.md
 ├── dev
-│   ├── gen_synthetic_data.py       # Example synthetic data for identity
 │   ├── nanochat.png
 │   └── repackage_data_reference.py # Pretraining data shard generation
 ├── nanochat
@@ -183,12 +181,10 @@ I've published a number of guides that might contain helpful information, most r
 ├── tasks
 │   ├── arc.py                      # Multiple choice science questions
 │   ├── common.py                   # TaskMixture | TaskSequence
-│   ├── customjson.py               # Make Task from arbitrary jsonl convos
 │   ├── gsm8k.py                    # 8K Grade School Math questions
 │   ├── humaneval.py                # Misnomer; Simple Python coding task
 │   ├── mmlu.py                     # Multiple choice questions, broad topics
-│   ├── smoltalk.py                 # Conglomerate dataset of SmolTalk from HF
-│   └── spellingbee.py              # Task teaching model to spell/count letters
+│   └── smoltalk.py                 # Conglomerate dataset of SmolTalk from HF
 ├── tests
 │   └── test_engine.py
 └── uv.lock

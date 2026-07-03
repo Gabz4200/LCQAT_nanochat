@@ -36,18 +36,29 @@ def adamw_step_fused(
     All in one compiled graph to eliminate Python overhead between ops.
     The 0-D CPU tensors avoid recompilation when hyperparameter values change.
     """
+    # Some params (wte, value_embeds) are stored in bf16, so do the math in fp32 and
+    # cast back at the end. MPS errors on mixed-dtype ops (CUDA promotes them), and
+    # scalar arithmetic like 1 - beta2 loses all precision in bf16. compile fuses the casts.
+    p32 = p.float()
+    exp_avg32 = exp_avg.float()
+    exp_avg_sq32 = exp_avg_sq.float()
+    grad32 = grad.float()
     # Weight decay (decoupled, applied before the update)
-    p.mul_(1 - lr_t * wd_t)
+    p32.mul_(1 - lr_t * wd_t)
     # Update running averages (lerp_ is cleaner and fuses well)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
+    exp_avg32.lerp_(grad32, 1 - beta1_t)
+    exp_avg_sq32.lerp_(grad32.square(), 1 - beta2_t)
     # Bias corrections
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
     # Compute update and apply
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
+    denom = (exp_avg_sq32 / bias2).sqrt() + eps_t
     step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
+    p32.add_(exp_avg32 / denom, alpha=-step_size)
+    # Write back (no-ops in the common case where everything is already fp32)
+    p.copy_(p32)
+    exp_avg.copy_(exp_avg32)
+    exp_avg_sq.copy_(exp_avg_sq32)
 
 # -----------------------------------------------------------------------------
 """
@@ -139,7 +150,8 @@ def muon_step_fused(
             A = X @ X.mT
             B = b * A + c * (A @ A)
             X = a * X + B @ X
-    g = X
+    # Cast back to the param dtype (MPS errors on the mixed-dtype ops below when X is bf16)
+    g = X.to(stacked_params.dtype)
 
     # Muon+ renormalization: snap Frobenius norm to sqrt(min(m, n))
     target_norm = min(g.size(-2), g.size(-1)) ** 0.5

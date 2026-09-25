@@ -25,12 +25,15 @@ dataset preparation and it is not used during the project runtime.
 (For that reason, it imports `datasets`, which is not a nanochat
 dependency - pip install it ad hoc if you actually want to run this.)
 """
+
 import os
 import time
 
-from datasets import load_dataset
-import pyarrow.parquet as pq
 import pyarrow as pa
+import pyarrow.parquet as pq
+
+# reference script only: `datasets` is intentionally not a project dependency
+from datasets import load_dataset  # pyrefly: ignore[missing-import]
 
 # You can change these:
 dataset_tag = "climbmix"
@@ -41,7 +44,7 @@ if dataset_tag == "fineweb_edu":
     dataset_kwargs = {
         "path": "HuggingFaceFW/fineweb-edu",
         "split": "train",
-        "name": "sample-100BT", # ~100B GPT-2 tokens at ~3 chars/token => ~300B chars total
+        "name": "sample-100BT",  # ~100B GPT-2 tokens at ~3 chars/token => ~300B chars total
     }
     output_dirname = "fineweb_edu"
     data_column_name = "text"
@@ -49,7 +52,8 @@ if dataset_tag == "fineweb_edu":
     upload_tag = "fineweb-edu-100b-shuffle"
 
 elif dataset_tag == "climbmix":
-    import tiktoken # the ClimbMix data is stored tokenized with GPT-2 tokenizer
+    import tiktoken  # the ClimbMix data is stored tokenized with GPT-2 tokenizer
+
     dataset_kwargs = {
         "path": "nvidia/Nemotron-ClimbMix",
         "split": "train",
@@ -67,7 +71,7 @@ ds = load_dataset(**dataset_kwargs)
 
 # Shuffle to scramble the order
 ds = ds.shuffle(seed=42)
-ndocs = len(ds) # total number of documents to process
+ndocs = len(ds)  # total number of documents to process
 print(f"Total number of documents: {ndocs}")
 
 # Repackage into parquet files
@@ -76,7 +80,7 @@ os.makedirs(output_dir, exist_ok=True)
 
 # Write to parquet files
 chars_per_shard = 250_000_000
-row_group_size = 1024 # HF uses 1000 but we use multiple of 2, nicer for distributed data loader later
+row_group_size = 1024  # HF uses 1000 but we use multiple of 2, nicer for distributed data loader later
 shard_docs = []
 shard_index = 0
 shard_characters = 0
@@ -90,20 +94,22 @@ for doc in ds:
     shard_characters += len(text)
     collected_enough_chars = shard_characters >= chars_per_shard
     docs_multiple_of_row_group_size = len(shard_docs) % row_group_size == 0
-    if collected_enough_chars and docs_multiple_of_row_group_size: # leads to ~100MB of text (compressed)
+    if (
+        collected_enough_chars and docs_multiple_of_row_group_size
+    ):  # leads to ~100MB of text (compressed)
         shard_path = os.path.join(output_dir, f"shard_{shard_index:05d}.parquet")
         shard_table = pa.Table.from_pydict({"text": shard_docs})
         pq.write_table(
             shard_table,
             shard_path,
             row_group_size=row_group_size,
-            use_dictionary=False, # this is usually used for categorical data
-            compression="zstd", # Valid values: {‘NONE’, ‘SNAPPY’, ‘GZIP’, ‘BROTLI’, ‘LZ4’, ‘ZSTD’}
+            use_dictionary=False,  # this is usually used for categorical data
+            compression="zstd",  # Valid values: {‘NONE’, ‘SNAPPY’, ‘GZIP’, ‘BROTLI’, ‘LZ4’, ‘ZSTD’}
             compression_level=3,
-            write_statistics=False, # not needed for text
+            write_statistics=False,  # not needed for text
         )
         t1 = time.time()
-        dt = t1 - t0 # for this shard alone
+        dt = t1 - t0  # for this shard alone
         t0 = t1
         total_docs_processed += len(shard_docs)
         total_time_spent += dt
@@ -111,7 +117,9 @@ for doc in ds:
         avg_time_per_doc = total_time_spent / total_docs_processed
         remaining_time = remaining_docs * avg_time_per_doc
         remaining_time_hours = remaining_time / 3600
-        print(f"Wrote {shard_path}. #documents: {len(shard_docs)} | #characters: {shard_characters} | time: {dt:.2f}s | remaining time: {remaining_time_hours:.2f}h")
+        print(
+            f"Wrote {shard_path}. #documents: {len(shard_docs)} | #characters: {shard_characters} | time: {dt:.2f}s | remaining time: {remaining_time_hours:.2f}h"
+        )
         shard_docs = []
         shard_characters = 0
         shard_index += 1
@@ -119,6 +127,7 @@ for doc in ds:
 # Demonstration of how the data was later uploaded to HuggingFace
 if upload_to_hf:
     from huggingface_hub import HfApi
+
     token = os.getenv("HF_TOKEN")
     api = HfApi(token=token)
     api.upload_large_folder(

@@ -7,7 +7,9 @@ python -m pytest tests/test_execution.py -v
 
 import os
 import time
+
 import pytest
+
 from nanochat.execution import execute_code
 
 
@@ -38,13 +40,16 @@ def test_memory_limit():
     assert result.memory_exceeded
 
 
-@pytest.mark.parametrize("evil", [
-    "import os; os.system('echo pwned')",
-    "import shutil; shutil.rmtree('/tmp')",
-    "import subprocess; subprocess.Popen(['ls'])",
-    "import os; os.kill(1, 9)",
-    "import os; os.fork()",
-])
+@pytest.mark.parametrize(
+    "evil",
+    [
+        "import os; os.system('echo pwned')",
+        "import shutil; shutil.rmtree('/tmp')",
+        "import subprocess; subprocess.Popen(['ls'])",
+        "import os; os.kill(1, 9)",
+        "import os; os.fork()",
+    ],
+)
 def test_destructive_functions_disabled(evil):
     result = execute_code(evil)
     assert not result.success
@@ -56,7 +61,9 @@ def test_stdin_disabled():
 
 
 def test_writes_go_to_tempdir():
-    result = execute_code("open('landmine.txt', 'w').write('x'); print(open('landmine.txt').read())")
+    result = execute_code(
+        "open('landmine.txt', 'w').write('x'); print(open('landmine.txt').read())"
+    )
     assert result.success and result.stdout == "x\n"
     assert not os.path.exists("landmine.txt"), "file leaked outside the sandbox tempdir"
 
@@ -72,7 +79,7 @@ def test_environment_is_scrubbed():
 
 def test_tricky_string_content():
     # quotes, backslashes and braces must survive being embedded into the runner
-    tricky = '''s = 'it\\'s "quoted" \\\\ {braces} \\n'; print(len(s))'''
+    tricky = """s = 'it\\'s "quoted" \\\\ {braces} \\n'; print(len(s))"""
     result = execute_code(tricky)
     assert result.success
 

@@ -27,11 +27,11 @@ import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
-# -----------------------------------------------------------------------------
 
 @dataclass
 class ExecutionResult:
     """Result of executing Python code in a sandbox."""
+
     success: bool
     stdout: str
     stderr: str
@@ -73,8 +73,8 @@ for name in ("ipdb", "joblib", "resource", "psutil", "tkinter"):
 
 def execute_code(
     code: str,
-    timeout: float = 5.0, # 5 seconds default
-    maximum_memory_bytes: Optional[int] = 256 * 1024 * 1024, # 256MB default
+    timeout: float = 5.0,  # 5 seconds default
+    maximum_memory_bytes: Optional[int] = 256 * 1024 * 1024,  # 256MB default
 ) -> ExecutionResult:
     """
     Execute Python code in a sandboxed environment.
@@ -96,14 +96,17 @@ def execute_code(
     """
     # the guard runs first, then the untrusted code (with fresh globals, as a repr'd literal)
     guard = GUARD.format(maximum_memory_bytes=maximum_memory_bytes)
-    program = guard + f"\nexec(compile({code!r}, '<llm>', 'exec'), {{'__name__': '__main__'}})\n"
+    program = (
+        guard
+        + f"\nexec(compile({code!r}, '<llm>', 'exec'), {{'__name__': '__main__'}})\n"
+    )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
             process = subprocess.run(
                 [sys.executable, "-c", program],
-                cwd=tmpdir, # writes land in the tempdir, deleted afterwards
-                env={"PATH": "/usr/bin:/bin"}, # scrub the environment
+                cwd=tmpdir,  # writes land in the tempdir, deleted afterwards
+                env={"PATH": "/usr/bin:/bin"},  # scrub the environment
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
@@ -122,7 +125,9 @@ def execute_code(
     success = process.returncode == 0
     stderr = process.stderr
     # the last line of the traceback identifies the exception, e.g. "TypeError: ..."
-    error = None if success else (stderr.strip().splitlines() or ["Execution failed"])[-1]
+    error = (
+        None if success else (stderr.strip().splitlines() or ["Execution failed"])[-1]
+    )
     memory_exceeded = "MemoryError" in stderr
     result = ExecutionResult(
         success=success,

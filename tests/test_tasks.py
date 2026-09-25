@@ -7,7 +7,8 @@ python -m pytest tests/test_tasks.py -v
 
 import numpy as np
 import pyarrow as pa
-from tasks.common import Task, TaskMixture, HubDataset, render_mc
+
+from tasks.common import HubDataset, Task, TaskMixture, render_mc
 
 
 class ToyTask(Task):
@@ -38,7 +39,7 @@ def test_task_slicing():
     assert len(task) == 5
     assert task[0]["i"] == 5
     # step slicing uses ceil division for the length
-    task = ToyTask(n=10, start=0, stop=10, step=3) # 0, 3, 6, 9
+    task = ToyTask(n=10, start=0, stop=10, step=3)  # 0, 3, 6, 9
     assert len(task) == 4
     assert [task[i]["i"] for i in range(4)] == [0, 3, 6, 9]
 
@@ -49,7 +50,16 @@ def test_mixture_covers_all_examples_deterministically():
     examples = [mixture[i] for i in range(8)]
     # every example appears exactly once
     keys = sorted((ex["tag"], ex["i"]) for ex in examples)
-    assert keys == [("a", 0), ("a", 1), ("a", 2), ("b", 0), ("b", 1), ("b", 2), ("b", 3), ("b", 4)]
+    assert keys == [
+        ("a", 0),
+        ("a", 1),
+        ("a", 2),
+        ("b", 0),
+        ("b", 1),
+        ("b", 2),
+        ("b", 3),
+        ("b", 4),
+    ]
     # the shuffle is deterministic: a second instance yields the same order
     mixture2 = TaskMixture([ToyTask(n=3, tag="a"), ToyTask(n=5, tag="b")])
     assert examples == [mixture2[i] for i in range(8)]

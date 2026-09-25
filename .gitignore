@@ -11,3 +11,9 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
+
+# Local working notes (not for the repo)
+TODO_LCQAT.md
+
+# Aislop session state
+.aislop/*.jsonl

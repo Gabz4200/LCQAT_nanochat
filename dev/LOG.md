@@ -4,6 +4,22 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-09-25: LC-QAT - Learned Codebook Quantization-Aware Training
+
+Implemented the LC-QAT PRD (`dev/lcqat_kv_cache.md` documents the single deferred piece: KV-cache storage). Every retrofitted `Linear` gets asymmetric odd-size codebooks `K = 2M + 1` with an exact zero anchor at index `M`, monotonic levels via cumulative `softplus` steps, and an STE that trains both the input and the codebook (the PRD's plain `x + (C[Q] - x).detach()` zeroes the codebook gradient, so the forward is written as `C[Q] + (x - x.detach())` instead).
+
+**Wiring:**
+- `nanochat/lcqat/` holds the functional core: codebook, `LCQATLinear` (with output quantizers on Q/K/V and `mlp.c_fc`), per-role retrofit with `small` (max compression: q/k K=3, rest K=15) and `prd` (8-bit down_proj) presets + `--lcqat-k-map` overrides, activation LUT compiler, bit-packing, export.
+- One root-cause integration covers *all* training options: `GPT.setup_optimizer` splits `raw_*_deltas` into their own AdamW group (LR `--codebook-lr`, wd=0, never Muon - they're 1-D), and `checkpoint_manager.build_model` auto-detects LC-QAT checkpoints from state keys and retrofits before/after load as needed. `base_train`/`chat_sft`/`chat_rl` just add `--lcqat` flags; checkpoint meta saves the active config so resumes stay provenance-correct. `--fp8` conflicts are rejected (both convert `Linear`).
+- Mul-less inference GEMV (`K_W=3`): `dispatch_gemv(backend=naive|cpu|gpu)` with a pure-PyTorch oracle, a C++ AVX-512/AVX2/scalar runtime-dispatched kernel (two asymmetric scales per row - PRD's single `c0` assumed symmetric codebooks), and a portable Slang/Vulkan shader, all lazy-loaded, no silent fallback, three-way parity + `opcheck` + `torch.compile` tests green on this machine (AVX2 i5-8250U + Intel UHD 620 iGPU).
+
+**Notes / gotchas found along the way:**
+- nanochat zero-initializes the projections, so on the very first optimizer step *nothing* behind them (including codebooks) receives any gradient - second step onwards trains normally. Tests account for this.
+- slangpy's native torch bridge requires CUDA torch; with CPU-only torch we stage tensors through numpy (`Tensor.from_numpy`), a copy path noted for the runtime follow-up.
+- The PRD's eval-mode codebook auto-cache was dropped: it would permanently freeze codebook gradients for `chat_rl` (which trains under `model.eval()`) and mutate buffers inside `torch.compile` graphs. Freezing only happens explicitly via `compile_for_inference()` at export.
+
+---
+
 ## 2026-05-05: DyT for d12 pretraining (negative)
 
 Tried replacing normalization with [DyT](https://arxiv.org/abs/2503.10622) for d12-scale pretraining following some [hype](https://x.com/LodestoneRock/status/2050367217087512953) on X.
@@ -231,11 +247,15 @@ So far, the `--total-batch-size` was hardcoded to be `2**19 = 524,288` ~= 0.5M t
 Added `--total-batch-size=-1` (now the default) to auto-compute optimal batch:
 
 ```python
-get_scaling_params = lambda m: m.num_scaling_params()['transformer_matrices'] + m.num_scaling_params()['lm_head']
+get_scaling_params = lambda m: (
+    m.num_scaling_params()["transformer_matrices"] + m.num_scaling_params()["lm_head"]
+)
 if args.total_batch_size == -1:
     D_REF = args.target_param_data_ratio * get_scaling_params(build_model_meta(12))
     B_REF = 2**19
-    args.total_batch_size = 2 ** round(math.log2(B_REF * (target_tokens / D_REF) ** 0.383))
+    args.total_batch_size = 2 ** round(
+        math.log2(B_REF * (target_tokens / D_REF) ** 0.383)
+    )
 ```
 
 Reference point: d=12 model with B=2^19 (empirically validated). The reference is computed dynamically so that if the architecture changes (e.g., different `--aspect-ratio`), the math automatically adjusts. However, if the model actually does change too much, one would also want to re-tune the optimal batch size for d=12.
@@ -278,7 +298,7 @@ Replaced ReLU² MLP activation with SwiGLU (inspired by [twitter](https://x.com/
 # Old ReLU²: 2 matrices, 4x expansion
 #   params: 2 × n × 4n = 8n²
 #   flops:  2 × 2n × 4n = 16n² per token
-self.c_fc   = Linear(n_embd, 4 * n_embd)
+self.c_fc = Linear(n_embd, 4 * n_embd)
 self.c_proj = Linear(4 * n_embd, n_embd)
 x = c_proj(relu(c_fc(x)).square())
 
@@ -328,6 +348,7 @@ FP8 (8-bit floating point) uses H100's FP8 tensor cores for ~2x theoretical matm
 
 ```python
 from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+
 config = Float8LinearConfig.from_recipe_name("tensorwise")
 convert_to_float8_training(model, config=config)
 ```

@@ -2,21 +2,39 @@
 Train a tokenizer using our own BPE Tokenizer library.
 In the style of GPT-4 tokenizer.
 """
+
+import argparse
 import os
 import time
-import argparse
+
 import torch
-from nanochat.tokenizer import RustBPETokenizer
+
 from nanochat.common import get_base_dir
 from nanochat.dataset import parquets_iter_batched
+from nanochat.tokenizer import RustBPETokenizer
 
 # -----------------------------------------------------------------------------
 # Parse command line arguments
 
-parser = argparse.ArgumentParser(description='Train a BPE tokenizer')
-parser.add_argument('--max-chars', type=int, default=2_000_000_000, help='Maximum characters to train on (default: 2B)')
-parser.add_argument('--doc-cap', type=int, default=10_000, help='Maximum characters per document (default: 10,000)')
-parser.add_argument('--vocab-size', type=int, default=32768, help='Vocabulary size (default: 32768 = 2^15)')
+parser = argparse.ArgumentParser(description="Train a BPE tokenizer")
+parser.add_argument(
+    "--max-chars",
+    type=int,
+    default=2_000_000_000,
+    help="Maximum characters to train on (default: 2B)",
+)
+parser.add_argument(
+    "--doc-cap",
+    type=int,
+    default=10_000,
+    help="Maximum characters per document (default: 10,000)",
+)
+parser.add_argument(
+    "--vocab-size",
+    type=int,
+    default=32768,
+    help="Vocabulary size (default: 32768 = 2^15)",
+)
 args = parser.parse_args()
 print(f"max_chars: {args.max_chars:,}")
 print(f"doc_cap: {args.doc_cap:,}")
@@ -24,6 +42,7 @@ print(f"vocab_size: {args.vocab_size:,}")
 
 # -----------------------------------------------------------------------------
 # Text iterator
+
 
 def text_iterator():
     """
@@ -36,11 +55,13 @@ def text_iterator():
         for doc in batch:
             doc_text = doc
             if len(doc_text) > args.doc_cap:
-                doc_text = doc_text[:args.doc_cap]
+                doc_text = doc_text[: args.doc_cap]
             nchars += len(doc_text)
             yield doc_text
             if nchars > args.max_chars:
                 return
+
+
 text_iter = text_iterator()
 
 # -----------------------------------------------------------------------------
@@ -78,13 +99,13 @@ special_ids = set(tokenizer.encode_special(s) for s in tokenizer.get_special_tok
 token_bytes = []
 for token_id in range(vocab_size):
     if token_id in special_ids:
-        token_bytes.append(0) # special tokens are not counted
+        token_bytes.append(0)  # special tokens are not counted
     else:
         # use the raw bytes of the token: decoding to a string first corrupts
         # tokens that are not valid standalone UTF-8 (e.g. the raw bytes >= 0x80)
         num_bytes = len(tokenizer.decode_single_token_bytes(token_id))
         token_bytes.append(num_bytes)
-token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device='cpu')
+token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device="cpu")
 token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
 with open(token_bytes_path, "wb") as f:
     torch.save(token_bytes, f)

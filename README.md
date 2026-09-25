@@ -132,6 +132,47 @@ How it works: model weights are stored in fp32 (for optimizer precision), but ou
 
 Note: `float16` training automatically enables a `GradScaler` in `base_train.py` to prevent gradient underflow. SFT supports this too but RL currently does not. Inference in fp16 works fine everywhere.
 
+## LC-QAT quantization
+
+Learned Codebook Quantization-Aware Training (LC-QAT, PRD in `dev/`): every retrofitted `Linear` gets asymmetric odd-size codebooks `K = 2M + 1` with index `M` anchored **exactly to 0.0**, so zero-initialized weights and sparse activations quantize without noise. Levels are cumulative `softplus` steps (monotonic under gradient descent), forward uses a straight-through estimator that trains both the input and the codebook, and codebook parameters (`raw_pos_deltas` / `raw_neg_deltas`) get their own AdamW group with a dedicated learning rate (`--codebook-lr`, default `1e-3`, no weight decay).
+
+Enable it on any training entry point:
+
+```bash
+python -m scripts.base_train --lcqat                  # QAT from scratch
+python -m scripts.base_train --lcqat --lcqat-preset prd
+torchrun --nproc_per_node=8 -m scripts.chat_sft -- --lcqat   # start QAT during SFT
+python -m scripts.chat_rl --lcqat                     # start QAT during RL
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--lcqat` | Retrofit Linear layers with codebooks (fresh/float checkpoints; LC-QAT checkpoints are auto-detected from their state and resume without the flag) |
+| `--lcqat-preset small` | **Default, maximum compression**: q/k weights K=3 (mul-less ternary), everything else K=15 |
+| `--lcqat-preset prd` | PRD table: `mlp.c_proj` (down_proj) at K=255/255, rest as small |
+| `--lcqat-k-map substr:KW/KA,...` | Per-module overrides, e.g. `mlp.c_proj:255/255,attn.c_v:15/15` |
+| `--codebook-lr` | Codebook AdamW LR (PRD: 10-50x network weights) |
+
+Per-layer roles (`nanochat/lcqat/retrofit.py`): `attn.c_q`/`c_k` get ternary weights, Q/K/V **outputs** are quantized during training (the KV-cache storage format is the deferred piece - see [dev/lcqat_kv_cache.md](dev/lcqat_kv_cache.md)), `mlp.c_fc` output is quantized as the input side of the fused relu² LUT, `lm_head` and linears under 128 dims stay in floating point. `--fp8` and `--lcqat` are mutually exclusive (both convert `Linear`).
+
+### Mul-less GEMV kernels
+
+For `K_W = 3` inference, `dispatch_gemv(..., backend=...)` routes to:
+
+- `naive` - pure PyTorch oracle (`nanochat/lcqat/ops/references/`), for parity tests and debugging;
+- `cpu` - C++ kernel (`nanochat/lcqat/native/cpu/gemv.cpp`), runtime-dispatched AVX-512 / AVX2 / scalar, no floating-point multiplications in the inner loop, lazy JIT-built by torch on first use (needs `g++`/`clang++`; build cached under `~/.cache/torch_extensions`);
+- `gpu` - portable Slang shader (`nanochat/lcqat/kernels/slang/gemv/forward.slang`) on Vulkan (Intel/AMD/NVIDIA), loaded lazily (needs `slangpy`, installed in the dev group, plus a Vulkan ICD).
+
+A requested backend that cannot run raises - it never silently falls back to naive. Three-way parity (`naive == cpu == gpu`), `torch.library.opcheck`, and `torch.compile` composition are covered by `tests/test_lcqat_ops.py`.
+
+### Export
+
+```bash
+uv run python -m scripts.export_lcqat --source base --out exports/lcqat_base.pt
+```
+
+Freezes codebooks into static FP32 LUTs, replaces FP32 weight matrices with `uint8` index buffers, and saves a minimal artifact for the quantized inference runtime (not resumable for training).
+
 ## Guides
 
 I've published a number of guides that might contain helpful information, most recent to least recent:
@@ -160,6 +201,7 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── engine.py                   # Efficient model inference with KV Cache
 │   ├── execution.py                # Allows the LLM to execute Python code as tool
 │   ├── gpt.py                      # The GPT nn.Module Transformer
+│   ├── lcqat                       # LC-QAT: codebooks, retrofit, ops/kernels, export
 │   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
 │   ├── optim.py                    # AdamW + Muon optimizer, 1GPU and distributed
 │   └── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
@@ -176,6 +218,7 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── chat_eval.py                # Chat model: eval tasks
 │   ├── chat_rl.py                  # Chat model: reinforcement learning
 │   ├── chat_sft.py                 # Chat model: train SFT
+│   ├── export_lcqat.py             # Export stripped LC-QAT artifact
 │   ├── infer_bench.py              # Inference: latency/throughput/VRAM bench
 │   ├── tok_eval.py                 # Tokenizer: evaluate compression rate
 │   └── tok_train.py                # Tokenizer: train it
@@ -190,6 +233,7 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── test_attention_fallback.py  # FA3/SDPA attention fallback
 │   ├── test_engine.py              # Inference engine, KV cache
 │   ├── test_execution.py           # Sandboxed code execution
+│   ├── test_lcqat_*.py             # LC-QAT: codebooks, retrofit, kernels, export
 │   ├── test_optim.py               # MuonAdamW optimizer (needs GPU)
 │   ├── test_tasks.py               # Task slicing, mixtures, HubDataset
 │   └── test_tokenizer.py           # BPE round-trips, chat rendering

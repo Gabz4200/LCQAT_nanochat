@@ -22,7 +22,6 @@ from nanochat.common import COMPUTE_DTYPE, print0
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
-from nanochat.optim import MuonAdamW
 
 
 @dataclass
@@ -54,7 +53,7 @@ class Linear(nn.Linear):
 
 def _is_codebook_param(name: str) -> bool:
     # Stable name contract with nanochat.lcqat.codebook parameters (LC-QAT PRD section 5):
-    # these get their own AdamW group and must never be handed to Muon (they are 1-D).
+    # these get their own AdamW group and must never be handed to AdamW matrix groups (they are 1-D).
     return name.endswith(("raw_pos_deltas", "raw_neg_deltas"))
 
 
@@ -95,7 +94,7 @@ class CausalSelfAttention(nn.Module):
             else None
         )
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache=None, attn_mask=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -124,9 +123,9 @@ class CausalSelfAttention(nn.Module):
         # Flash Attention (FA3 or SDPA fallback)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
+            # Training: causal attention with optional sliding window and custom mask
             y = flash_attn.flash_attn_func(
-                q, k, v, causal=True, window_size=window_size
+                q, k, v, causal=True, window_size=window_size, attn_mask=attn_mask
             )
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
@@ -198,8 +197,10 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache=None, attn_mask=None):
+        x = x + self.attn(
+            norm(x), ve, cos_sin, window_size, kv_cache, attn_mask=attn_mask
+        )
         x = x + self.mlp(norm(x))
         return x
 
@@ -557,7 +558,7 @@ class GPT(nn.Module):
 
         # Separate out all parameters into groups. Codebook step params (LC-QAT PRD
         # section 5) live inside LCQATLinear modules: they get their own AdamW group
-        # with a dedicated LR and no weight decay, and never reach Muon (they are 1-D).
+        # with a dedicated LR and no weight decay, and never reach the matrix AdamW group (they are 1-D).
         codebook_params = [
             p for n, p in self.named_parameters() if _is_codebook_param(n)
         ]
@@ -647,27 +648,26 @@ class GPT(nn.Module):
                     weight_decay=0.0,
                 )
             )
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(
-                dict(
-                    kind="muon",
-                    params=group_params,
-                    lr=matrix_lr,
-                    momentum=0.95,
-                    ns_steps=5,
-                    beta2=0.9,
-                    weight_decay=weight_decay,
-                )
+        # Matrix params (all transformer blocks) into AdamW
+        param_groups.append(
+            dict(
+                kind="adamw",
+                params=matrix_params,
+                lr=matrix_lr,
+                betas=(0.8, 0.95),
+                eps=1e-10,
+                weight_decay=weight_decay,
             )
+        )
 
-        optimizer = MuonAdamW(param_groups)
+        optimizer = torch.optim.AdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
+    def forward(
+        self, idx, targets=None, kv_cache=None, loss_reduction="mean", attn_mask=None
+    ):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -731,7 +731,9 @@ class GPT(nn.Module):
                 if str(i) in self.value_embeds
                 else None
             )
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(
+                x, ve, cos_sin, self.window_sizes[i], kv_cache, attn_mask=attn_mask
+            )
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection

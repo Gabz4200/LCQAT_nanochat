@@ -44,6 +44,7 @@ from nanochat.dataloader import (
     tokenizing_distributed_data_loader_bos_bestfit,
     tokenizing_distributed_data_loader_with_state_bos_bestfit,
 )
+from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from nanochat.gpt import GPT, GPTConfig, Linear
@@ -171,16 +172,22 @@ parser.add_argument(
     help="learning rate for unembedding parameters (Adam)",
 )
 parser.add_argument(
+    "--db-blocks",
+    type=int,
+    default=4,
+    help="number of diffusion blocks for block-wise training (default: 4)",
+)
+parser.add_argument(
     "--weight-decay",
     type=float,
     default=0.28,
-    help="cautious weight decay for the Muon optimizer (for weights)",
+    help="weight decay for the AdamW optimizer (for weights)",
 )
 parser.add_argument(
     "--matrix-lr",
     type=float,
     default=0.02,
-    help="learning rate for matrix parameters (Muon)",
+    help="learning rate for matrix parameters (AdamW)",
 )
 parser.add_argument(
     "--scalar-lr",
@@ -471,9 +478,17 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model  # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(
-    model, dynamic=False
-)  # the inputs to model will never change shape so dynamic=False is safe
+
+# Initialize DiffusionBlocks Engine for block-wise training
+num_db_blocks = min(args.db_blocks, args.depth)
+partitioner = EquiProbabilityPartitioner(
+    num_blocks=num_db_blocks,
+    sigma_min=0.002,
+    sigma_max=80.0,
+    sigma_data=0.5,
+)
+engine = DiffusionBlockEngine(model, partitioner)
+print0(f"Initialized DiffusionBlocks Engine with {num_db_blocks} independent blocks")
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -526,9 +541,7 @@ if total_batch_size == -1:
 batch_lr_scale = 1.0
 batch_ratio = total_batch_size / B_REF  # B/B_ref
 if batch_ratio != 1.0:
-    # SGD: linear scaling with batch size is standard (not used in nanochat)
     # AdamW: sqrt scaling is standard: η ∝ √(B/B_ref)
-    # Muon: we will use the same scaling for Muon as for AdamW: η ∝ √(B/B_ref) (not studied carefully, assumption!)
     batch_lr_scale = batch_ratio**0.5  # η ∝ √(B/B_ref)
     print0(
         f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})"
@@ -549,17 +562,17 @@ if weight_decay_scaled != args.weight_decay:
     )
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
-    unembedding_lr=args.unembedding_lr * batch_lr_scale,
-    embedding_lr=args.embedding_lr * batch_lr_scale,
-    scalar_lr=args.scalar_lr * batch_lr_scale,
-    codebook_lr=args.codebook_lr * batch_lr_scale,
-    # Muon hyperparameters
-    matrix_lr=args.matrix_lr * batch_lr_scale,
+# Initialize the Optimizer (AdamW-only for DiffusionBlocks engine)
+optimizer = torch.optim.AdamW(
+    engine.parameters(),
+    lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    betas=(0.8, 0.95),
+    eps=1e-10,
+    fused=(device_type == "cpu"),
 )
+for group in optimizer.param_groups:
+    group["initial_lr"] = group["lr"]
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -624,36 +637,17 @@ print0(
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 
-# Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
     warmup_iters = args.warmup_steps
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
     if it < warmup_iters:
-        return (it + 1) / warmup_iters
+        frac = it / warmup_iters
+        return frac * 1.0 + (1 - frac) * args.init_lr_frac
     elif it <= num_iterations - warmdown_iters:
         return 1.0
     else:
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
-
-
-# Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
-def get_muon_momentum(it):
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    warmdown_start = num_iterations - warmdown_iters
-    if it < 400:
-        frac = it / 400
-        return (1 - frac) * 0.85 + frac * 0.97
-    elif it >= warmdown_start:
-        progress = (it - warmdown_start) / warmdown_iters
-        return 0.97 * (1 - progress) + 0.90 * progress
-    else:
-        return 0.97
-
-
-# Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
-def get_weight_decay(it):
-    return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
 
 # -----------------------------------------------------------------------------
@@ -793,6 +787,12 @@ while True:
                 "model_config": model_config_kwargs,
                 "user_config": user_config,  # inputs to the training script
                 "lcqat": asdict(lcqat_active) if lcqat_active is not None else None,
+                "db": {
+                    "num_blocks": num_db_blocks,
+                    "sigma_min": 0.002,
+                    "sigma_max": 80.0,
+                    "sigma_data": 0.5,
+                },
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
@@ -816,7 +816,7 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = engine.train_step(x, y)
         train_loss = loss.detach()  # for logging
         loss = (
             loss / grad_accum_steps
@@ -830,13 +830,8 @@ while True:
         )  # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group["kind"] == "muon":
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
     if scaler is not None:
         scaler.unscale_(optimizer)
         # In distributed training, all ranks must agree on whether to skip the step.

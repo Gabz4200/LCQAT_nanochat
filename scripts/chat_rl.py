@@ -34,6 +34,7 @@ from nanochat.common import (
     get_base_dir,
     print0,
 )
+from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
 from nanochat.engine import Engine
 from nanochat.lcqat import lcqat_config_from_args, retrofit_summary
 from tasks.gsm8k import GSM8K
@@ -127,7 +128,7 @@ parser.add_argument(
     "--matrix-lr",
     type=float,
     default=0.02,
-    help="learning rate for matrix parameters (Muon)",
+    help="learning rate for matrix parameters (AdamW)",
 )
 parser.add_argument(
     "--weight-decay",
@@ -183,7 +184,21 @@ if lcqat_meta is None and lcqat_requested is not None:
     lcqat_meta = asdict(lcqat_requested)
 if lcqat_requested is not None:
     print0(f"LC-QAT RL: {retrofit_summary(model)}")
-engine = Engine(model, tokenizer)  # for sampling rollouts
+if isinstance(model, DiffusionBlockEngine):
+    db_engine = model
+    base_model = db_engine.model
+else:
+    base_model = model
+    num_db_blocks = min(getattr(args, "db_blocks", 4), base_model.config.n_layer)
+    partitioner = EquiProbabilityPartitioner(
+        num_blocks=num_db_blocks,
+        sigma_min=0.002,
+        sigma_max=80.0,
+        sigma_data=0.5,
+    )
+    db_engine = DiffusionBlockEngine(base_model, partitioner)
+
+engine = Engine(base_model, tokenizer)  # for sampling rollouts
 
 # -----------------------------------------------------------------------------
 # Rollout / sampling generator loop that yields batches of examples for training
@@ -326,13 +341,14 @@ def run_gsm8k_eval(
 # -----------------------------------------------------------------------------
 # Training loop
 
-# Init the optimizer
-optimizer = model.setup_optimizer(
-    unembedding_lr=args.unembedding_lr,
-    embedding_lr=args.embedding_lr,
-    matrix_lr=args.matrix_lr,
+# Init the optimizer (pure AdamW for DiffusionBlocks engine)
+optimizer = torch.optim.AdamW(
+    db_engine.parameters(),
+    lr=args.matrix_lr,
     weight_decay=args.weight_decay,
-    codebook_lr=args.codebook_lr,
+    betas=(0.8, 0.95),
+    eps=1e-10,
+    fused=(device_type == "cpu"),
 )
 
 # Set the initial learning rate as a fraction of the base learning rate
@@ -423,10 +439,10 @@ for step in range(num_steps):
             targets = targets_all[b0:b1]
             rewards = rewards_all[b0:b1]
             advantages = advantages_all[b0:b1]
-            # Calculate log probabilities. Note that the loss calculates NLL = -logp, so we negate
-            logp = -model(inputs, targets, loss_reduction="none").view_as(
-                inputs
-            )  # (B, T)
+            # Calculate log probabilities via DiffusionBlocks engine.
+            # db_engine.logprobs evaluates cross-entropy loss with block-isolation (L/B layers active)
+            # and returns per-token NLL = -logp, so we negate
+            logp = -db_engine.logprobs(inputs, targets).view_as(inputs)  # (B, T)
             # Calculate the PG objective. Note that ignore_index=-1 ensures that invalid tokens have loss 0.
             pg_obj = (logp * advantages.unsqueeze(-1)).sum()
             # normalize by the number of valid tokens, number of passes, and examples_per_rank
@@ -471,7 +487,7 @@ for step in range(num_steps):
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
     optimizer.step()
-    model.zero_grad(set_to_none=True)
+    optimizer.zero_grad(set_to_none=True)
     wandb_run.log(
         {
             "step": step,

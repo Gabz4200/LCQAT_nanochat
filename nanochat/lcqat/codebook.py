@@ -119,3 +119,9 @@ class MemoryEfficientLearnedCodebook(nn.Module):
             del self.raw_pos_deltas
         if hasattr(self, "raw_neg_deltas"):
             del self.raw_neg_deltas
+
+
+# Public alias matching the PRD section 4 class name. The asymmetric split
+# codebook (M_neg + 1 + M_pos = K) is the only learned codebook in this
+# codebase; the name is kept stable so PRD-named imports resolve.
+AsymmetricLearnedCodebook = MemoryEfficientLearnedCodebook

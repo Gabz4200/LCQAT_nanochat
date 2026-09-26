@@ -10,42 +10,80 @@ layers (PRD section 6).
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from nanochat.lcqat.linear import LCQATLinear
-from nanochat.lcqat.lut import compile_activation_lut
+from nanochat.lcqat.lut import ACTIVATION_LUTS, compile_activation
 from nanochat.lcqat.packing import pack_weight_indices
 
 
 @torch.no_grad()
-def wire_activation_luts(model: nn.Module) -> int:
-    """Compile elementwise activation tables for quantized-inference MLP pairs.
+def wire_activation_luts(model: nn.Module, activations: tuple | None = None) -> int:
+    """Compile elementwise activation tables for quantized-inference layer pairs.
 
-    nanochat's MLP is c_fc (out-quantized) -> relu^2 -> c_proj
-    (act-quantized); the composition compiles to an index->index table on
-    c_fc (`activation_lut`), which the fused MLP forward consumes instead
-    of float math. Returns the number of tables wired. Call before
-    load_state_dict on a fresh model so exported state keys match.
+    "Activation Functions become LUTs too" (PRD section 6): every activation
+    sitting between two quantized LCQATLinear layers is compiled into an
+    index->index LUT stored on the first layer (`activation_lut`), so the
+    runtime replaces float math with a zero-FLOP gather.
+
+    The default `ACTIVATION_LUTS` table wires `relu^2` between every MLP
+    `c_fc` (out-quantized) and its `c_proj` (act-quantized). Extra activations
+    (SiLU, GELU, tanh, ...) are picked up by adding entries of the form
+    `(module_name_substring, activation_name, kwargs)`.
+
+    Returns the number of tables wired.
     """
+    table = activations if activations is not None else ACTIVATION_LUTS
     count = 0
     for name, module in model.named_modules():
-        if not name.endswith("mlp.c_fc") or not isinstance(module, LCQATLinear):
+        if not isinstance(module, LCQATLinear) or module.out_quantizer is None:
             continue
-        parent = model.get_submodule(name[: -len(".c_fc")])
-        next_linear = getattr(parent, "c_proj", None)
-        if not isinstance(next_linear, LCQATLinear) or module.out_quantizer is None:
-            continue
-        table = compile_activation_lut(
-            lambda t: F.relu(t).square(),
-            module.out_quantizer.get_codebook(),
-            next_linear.act_quantizer.get_codebook(),
-        )
-        if "activation_lut" in module._buffers:
-            module.activation_lut.copy_(table)
-        else:
-            module.register_buffer("activation_lut", table, persistent=True)
-        count += 1
+        for substr, act_name, kwargs in table:
+            if not name.endswith(substr):
+                continue
+            # Parent is the dotted path up to (but excluding) the leaf suffix.
+            parent_name = name[: -len(substr)]
+            parent_name = parent_name[:-1] if parent_name.endswith(".") else parent_name
+            sibling = _next_quantized_sibling(model, parent_name, substr.split(".")[-1])
+            if sibling is None or sibling.act_quantizer is None:
+                continue
+            lut = compile_activation(
+                act_name,
+                module.out_quantizer.get_codebook(),
+                sibling.act_quantizer.get_codebook(),
+                kwargs,
+            )
+            _install_lut(module, lut)
+            count += 1
     return count
+
+
+def _next_quantized_sibling(
+    model: nn.Module, parent_name: str, leaf: str
+) -> LCQATLinear | None:
+    """Find the quantized Linear sibling that follows `leaf` under `parent_name`.
+
+    nanochat's MLP is `c_fc -> relu^2 -> c_proj` (leaf names `c_fc` and `c_proj`
+    under the same parent). Walks the parent's registered child modules in
+    declaration order and returns the first LCQATLinear with an act_quantizer
+    whose key comes after `leaf`.
+    """
+    parent = model.get_submodule(parent_name) if parent_name else model
+    found_self = False
+    for attr, child in parent.named_children():
+        if attr == leaf:
+            found_self = True
+            continue
+        if found_self and isinstance(child, LCQATLinear) and child.act_quantizer is not None:
+            return child
+    return None
+
+
+def _install_lut(module: LCQATLinear, table: torch.Tensor) -> None:
+    """Register (or overwrite) the `activation_lut` buffer on `module`."""
+    if "activation_lut" in module._buffers:
+        module.activation_lut.copy_(table)
+    else:
+        module.register_buffer("activation_lut", table, persistent=True)
 
 
 @torch.no_grad()

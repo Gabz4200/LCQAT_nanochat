@@ -14,6 +14,7 @@ from nanochat.gpt import GPT, GPTConfig
 from nanochat.lcqat.retrofit import (
     LayerKConfig,
     finish_lcqat_after_load,
+    is_exported_lcqat_state,
     prepare_lcqat_before_load,
 )
 from nanochat.tokenizer import get_tokenizer
@@ -105,6 +106,11 @@ def build_model(checkpoint_dir, step, device, phase, lcqat=None):
     model_data, optimizer_data, meta_data = load_checkpoint(
         checkpoint_dir, step, device, load_optimizer=False
     )
+    if is_exported_lcqat_state(model_data) and phase == "train":
+        raise RuntimeError(
+            "exported LC-QAT artifact is inference-only (weights stripped); "
+            "cannot train or resume from it - load a training checkpoint instead"
+        )
     if device.type in {"cpu", "mps"}:
         # Convert bfloat16 tensors to float for CPU inference
         model_data = {

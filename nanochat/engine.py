@@ -23,6 +23,7 @@ import torch.nn.functional as F
 
 from nanochat.checkpoint_manager import load_model
 from nanochat.common import COMPUTE_DTYPE, autodetect_device_type, compute_init
+from nanochat.lcqat.packing import pack_nibbles, unpack_nibbles
 
 # Restricted expression evaluator for the calculator tool: parses the formula
 # as an AST and only executes whitelisted nodes, so model-generated formulas can
@@ -157,6 +158,8 @@ class KVCache:
     - Position tracked per batch element via cache_seqlens tensor
     """
 
+    quantized = False  # dispatch tag: gpt.py branches on this for attention
+
     def __init__(
         self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype
     ):
@@ -229,6 +232,185 @@ class KVCache:
             ).clone()
 
 
+class QuantizedKVCache:
+    """4-bit packed KV cache (LC-QAT PRD section 7.1).
+
+    Stores K/V as nibble-packed uint8 codebook indices instead of bf16 values:
+    index buffers are [n_layers, B, T, H, ceil(D/2)] (two values per byte along
+    D), resolved through per-(layer, head) FP32 codebooks of K <= 15 levels.
+    Position bookkeeping matches KVCache (cache_seqlens int32 per batch
+    element): write() stores at cache_seqlens, advance() moves past the step,
+    mirroring FA3's append-at-cache_seqlens contract. FA3 cannot consume this
+    layout - it pairs with the index-native dispatch_quant_attn op.
+    """
+
+    quantized = True  # dispatch tag: gpt.py branches on this for attention
+
+    def __init__(
+        self,
+        batch_size,
+        num_heads,
+        seq_len,
+        head_dim,
+        num_layers,
+        device,
+        k_codebooks,
+        v_codebooks,
+    ):
+        for label, cb in (("k_codebooks", k_codebooks), ("v_codebooks", v_codebooks)):
+            if cb.shape != (num_layers, num_heads, cb.shape[-1]):
+                raise ValueError(
+                    f"{label} must be [n_layers, num_heads, K] = "
+                    f"[{num_layers}, {num_heads}, K], got {tuple(cb.shape)}"
+                )
+            if cb.shape[-1] < 3 or cb.shape[-1] > 15 or cb.shape[-1] % 2 != 1:
+                raise ValueError(
+                    f"{label} last dim must be an odd K in [3, 15] (nibble-packed), "
+                    f"got {cb.shape[-1]}"
+                )
+        self.batch_size = batch_size
+        self.max_seq_len = seq_len
+        self.n_layers = num_layers
+        self.n_heads = num_heads
+        self.head_dim = head_dim
+        self.n_bytes = (head_dim + 1) // 2
+        self.k_codebooks = k_codebooks.to(device=device, dtype=torch.float32)
+        self.v_codebooks = v_codebooks.to(device=device, dtype=torch.float32)
+        shape = (num_layers, batch_size, seq_len, num_heads, self.n_bytes)
+        self.k_idx = torch.zeros(shape, dtype=torch.uint8, device=device)
+        self.v_idx = torch.zeros(shape, dtype=torch.uint8, device=device)
+        self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        self.prev_embedding = None
+
+    @staticmethod
+    def storage_bytes(
+        batch_size: int, num_heads: int, seq_len: int, head_dim: int, num_layers: int
+    ) -> int:
+        """Bytes of packed K+V index storage (uint8, nibble-packed along D)."""
+        return 2 * num_layers * batch_size * seq_len * num_heads * ((head_dim + 1) // 2)
+
+    @staticmethod
+    def _quantize(x: torch.Tensor, codebooks: torch.Tensor) -> torch.Tensor:
+        """[B, T, H, D] float -> uint8 codebook indices via midpoint bucketize."""
+        x_fp32 = x.detach().to(torch.float32)
+        b, t, h, d = x_fp32.shape
+        indices = torch.empty(b, t, h, d, dtype=torch.uint8, device=x.device)
+        for head in range(h):
+            cb = codebooks[head]
+            midpoints = (cb[:-1] + cb[1:]) * 0.5
+            indices[:, :, head] = torch.bucketize(
+                x_fp32[:, :, head].contiguous(), midpoints
+            )
+        return indices
+
+    def reset(self):
+        """Reset cache to empty state."""
+        self.cache_seqlens.zero_()
+        self.prev_embedding = None
+
+    def get_pos(self):
+        """Get current position (assumes all batch elements at same position)."""
+        return self.cache_seqlens[0].item()
+
+    def advance(self, num_tokens):
+        """Advance the cache position by num_tokens."""
+        self.cache_seqlens += num_tokens
+
+    def write(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor):
+        """Quantize and append this step's K/V at cache_seqlens (does not advance).
+
+        Args:
+            layer_idx: which layer's buffers/codebooks to write.
+            k, v: [B, T_cur, H, D] post-rotary keys and post-ve-mix values.
+        """
+        if not 0 <= layer_idx < self.n_layers:
+            raise ValueError(f"layer_idx {layer_idx} out of range [0, {self.n_layers})")
+        t_cur = k.shape[1]
+        for label, x in (("k", k), ("v", v)):
+            if (
+                x.ndim != 4
+                or x.shape[0] != self.batch_size
+                or x.shape[2:] != (self.n_heads, self.head_dim)
+            ):
+                raise ValueError(
+                    f"{label} must be [B, T_cur, H, D] = [{self.batch_size}, T, "
+                    f"{self.n_heads}, {self.head_dim}], got {tuple(x.shape)}"
+                )
+        for b in range(self.batch_size):
+            pos = int(self.cache_seqlens[b])
+            if pos + t_cur > self.max_seq_len:
+                raise ValueError(
+                    f"write of {t_cur} tokens at position {pos} exceeds seq_len "
+                    f"{self.max_seq_len} (batch element {b})"
+                )
+        k_packed = pack_nibbles(self._quantize(k, self.k_codebooks[layer_idx]))
+        v_packed = pack_nibbles(self._quantize(v, self.v_codebooks[layer_idx]))
+        for b in range(self.batch_size):
+            pos = int(self.cache_seqlens[b])
+            self.k_idx[layer_idx, b, pos : pos + t_cur] = k_packed[b]
+            self.v_idx[layer_idx, b, pos : pos + t_cur] = v_packed[b]
+
+    def get_layer_indices(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (k_idx, v_idx) views [B, T, H, n_bytes] for a specific layer."""
+        return self.k_idx[layer_idx], self.v_idx[layer_idx]
+
+    def dequant_window(
+        self, layer_idx: int, start: int, end: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve packed rows [start, end) back to FP32 [B, end-start, H, D]."""
+        if not 0 <= start < end <= self.max_seq_len:
+            raise ValueError(f"window [{start}, {end}) outside [0, {self.max_seq_len})")
+        heads = torch.arange(self.n_heads, device=self.k_idx.device).view(1, 1, -1, 1)
+        out = []
+        for packed, codebooks in (
+            (self.k_idx[layer_idx, :, start:end], self.k_codebooks),
+            (self.v_idx[layer_idx, :, start:end], self.v_codebooks),
+        ):
+            indices = unpack_nibbles(packed, self.head_dim)
+            out.append(codebooks[layer_idx][heads, indices.long()])
+        return out[0], out[1]
+
+    def prefill(self, other: "QuantizedKVCache"):
+        """Copy packed KV from another cache (batch=1 prefill -> N parallel rows)."""
+        assert self.get_pos() == 0, "Cannot prefill a non-empty KV cache"
+        assert (
+            self.n_layers == other.n_layers
+            and self.n_heads == other.n_heads
+            and self.head_dim == other.head_dim
+        )
+        assert self.max_seq_len >= other.max_seq_len
+        other_pos = other.get_pos()
+        self.k_idx[:, :, :other_pos] = other.k_idx[:, :, :other_pos]
+        self.v_idx[:, :, :other_pos] = other.v_idx[:, :, :other_pos]
+        self.cache_seqlens.fill_(other_pos)
+        if other.prev_embedding is not None:
+            self.prev_embedding = other.prev_embedding.expand(
+                self.batch_size, -1, -1
+            ).clone()
+
+
+def kv_codebooks_from_model(model) -> tuple[torch.Tensor, torch.Tensor]:
+    """Export per-(layer, head) K/V codebooks from the live out-quantizers.
+
+    Reads each block's attn.c_k/c_v LCQATLinear out_quantizer (training
+    quantizes with one codebook per projection, shared across heads); the
+    PRD 7.1 storage layout is per (layer, head), so the module codebook is
+    repeated across that layer's KV heads. Returns fp32 [n_layers, n_kv_head, K].
+    """
+    k_list, v_list, n_kv_head = [], [], None
+    for block in model.transformer.h:
+        n_kv_head = block.attn.n_kv_head
+        k_list.append(block.attn.c_k.out_quantizer.get_codebook())
+        v_list.append(block.attn.c_v.out_quantizer.get_codebook())
+
+    def per_head(lst):
+        return (
+            torch.stack(lst, dim=0)[:, None, :].expand(-1, n_kv_head, -1).contiguous()
+        )
+
+    return per_head(k_list), per_head(v_list)
+
+
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
     """Sample a single next token from given logits of shape (B, vocab_size). Returns (B, 1)."""
@@ -274,8 +456,15 @@ class Engine:
         temperature=1.0,
         top_k=None,
         seed=42,
+        quantized_kv=False,
     ):
-        """Same as generate, but does single prefill and then clones the KV cache."""
+        """Same as generate, but does single prefill and then clones the KV cache.
+
+        quantized_kv=True selects the QuantizedKVCache decode path (4-bit
+        packed K/V resolved through per-head codebooks, dispatch_quant_attn)
+        instead of the default bf16/FA3 cache; FA3 stays the default until
+        parity is proven (dev/lcqat_kv_cache.md).
+        """
         assert isinstance(tokens, list) and isinstance(tokens[0], int), (
             "expecting list of ints"
         )
@@ -301,13 +490,28 @@ class Engine:
             "head_dim": m.n_embd // m.n_head,
             "num_layers": m.n_layer,
         }
-        kv_cache_prefill = KVCache(
-            batch_size=1,
-            seq_len=len(tokens),
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
+        if quantized_kv:
+            k_codebooks, v_codebooks = kv_codebooks_from_model(self.model)
+
+        def make_cache(batch_size, seq_len):
+            if quantized_kv:
+                return QuantizedKVCache(
+                    batch_size=batch_size,
+                    seq_len=seq_len,
+                    device=device,
+                    k_codebooks=k_codebooks,
+                    v_codebooks=v_codebooks,
+                    **kv_model_kwargs,
+                )
+            return KVCache(
+                batch_size=batch_size,
+                seq_len=seq_len,
+                device=device,
+                dtype=dtype,
+                **kv_model_kwargs,
+            )
+
+        kv_cache_prefill = make_cache(batch_size=1, seq_len=len(tokens))
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
         logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
@@ -318,13 +522,7 @@ class Engine:
             if max_tokens is not None
             else self.model.config.sequence_len
         )
-        kv_cache_decode = KVCache(
-            batch_size=num_samples,
-            seq_len=kv_length_hint,
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
+        kv_cache_decode = make_cache(batch_size=num_samples, seq_len=kv_length_hint)
         kv_cache_decode.prefill(kv_cache_prefill)
         del kv_cache_prefill  # no need to keep this memory around
 

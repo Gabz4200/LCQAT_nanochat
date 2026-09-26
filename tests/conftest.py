@@ -25,6 +25,23 @@ def build_tiny_gpt() -> GPT:
     return model
 
 
+def build_active_tiny_gpt() -> GPT:
+    """Tiny GPT whose zero-initialized projections are randomized.
+
+    nanochat zero-inits attn.c_proj / mlp.c_proj, so in an untrained model
+    attention and MLP outputs are exactly zero and block outputs equal the
+    embedding stream - KV-cache or runtime parity tests would pass vacuously.
+    Randomize those projections BEFORE retrofitting so quantizer init spans
+    see the real weight ranges.
+    """
+    model = build_tiny_gpt()
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name.endswith("c_proj.weight"):
+                param.normal_(std=0.02)
+    return model
+
+
 @pytest.fixture
 def tiny_gpt() -> GPT:
     return build_tiny_gpt()

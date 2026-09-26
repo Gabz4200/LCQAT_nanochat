@@ -8,10 +8,17 @@ import pytest
 import torch
 
 from nanochat.lcqat.packing import (
+    FORMAT_INT32,
+    FORMAT_NIBBLES,
+    FORMAT_TRITS,
+    FORMAT_UINT8,
+    index_format_for_k,
     pack_nibbles,
     pack_trits,
+    pack_weight_indices,
     unpack_nibbles,
     unpack_trits,
+    unpack_weight_indices,
 )
 
 
@@ -66,3 +73,69 @@ def test_when_packing_nibbles_then_even_index_goes_to_low_nibble() -> None:
 def test_when_nibbles_contain_invalid_value_then_raises() -> None:
     with pytest.raises(ValueError, match=r"\{0\.\.15\}"):
         pack_nibbles(torch.tensor([16], dtype=torch.uint8))
+
+
+@pytest.mark.parametrize("shape", [(2, 3, 8), (4, 5, 1), (2, 1, 7)])
+def test_when_roundtripping_batched_nibbles_then_indices_are_recovered(shape) -> None:
+    # Trailing-dim contract: pack/unpack apply row-wise over any leading dims
+    # (the quantized KV cache packs [B, T, H, D] in one call).
+    torch.manual_seed(0)
+    idx = torch.randint(0, 16, shape, dtype=torch.uint8)
+    packed = pack_nibbles(idx)
+    assert packed.shape == (*shape[:-1], (shape[-1] + 1) // 2)
+    assert torch.equal(unpack_nibbles(packed, shape[-1]), idx)
+
+
+@pytest.mark.parametrize(
+    ("k", "expected_format"),
+    [
+        (3, FORMAT_TRITS),
+        (5, FORMAT_NIBBLES),
+        (15, FORMAT_NIBBLES),
+        (17, FORMAT_UINT8),
+        (33, FORMAT_UINT8),
+        (255, FORMAT_UINT8),
+        (257, FORMAT_INT32),
+        (65537, FORMAT_INT32),
+    ],
+    ids=["k3", "k5", "k15", "k17", "k33", "k255", "k257", "k65537"],
+)
+def test_when_k_given_then_format_matches_dtype_table(
+    k: int, expected_format: int
+) -> None:
+    # The TODO's K -> storage table: dtype is chosen from the codebook size.
+    assert index_format_for_k(k) == expected_format
+
+
+@pytest.mark.parametrize("k", [3, 7, 15, 33, 255, 257])
+def test_when_packing_weight_indices_then_roundtrip_and_size_match_format(
+    k: int,
+) -> None:
+    torch.manual_seed(k)
+    m, n = 11, 130
+    idx = torch.randint(0, k, (m, n))
+    idx32 = idx.to(torch.int32) if k > 255 else idx.to(torch.uint8)
+    packed, fmt = pack_weight_indices(idx32, k)
+    assert fmt == index_format_for_k(k)
+    if fmt == FORMAT_TRITS:
+        assert packed.dtype == torch.uint8 and packed.shape == (m, (n + 4) // 5)
+    elif fmt == FORMAT_NIBBLES:
+        assert packed.dtype == torch.uint8 and packed.shape == (m, (n + 1) // 2)
+    elif fmt == FORMAT_UINT8:
+        assert packed.dtype == torch.uint8 and packed.shape == (m, n)
+    else:
+        assert packed.dtype == torch.int32 and packed.shape == (m, n)
+    back = unpack_weight_indices(packed, n, k)
+    assert back.dtype == idx32.dtype
+    assert torch.equal(back, idx32)
+
+
+def test_when_weight_index_k_invalid_then_raises() -> None:
+    with pytest.raises(ValueError, match="odd integer"):
+        index_format_for_k(4)
+    with pytest.raises(ValueError, match="odd integer"):
+        index_format_for_k(1)
+    idx = torch.zeros(2, 8, dtype=torch.uint8)
+    idx[0, 0] = 3  # K=3 accepts only {0, 1, 2}
+    with pytest.raises(ValueError, match=r"\{0, 1, 2\}"):
+        pack_weight_indices(idx, k=3)

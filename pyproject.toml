@@ -3,7 +3,7 @@ name = "nanochat"
 version = "0.1.0"
 description = "the minimal full-stack ChatGPT clone"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "filelock>=3.19.0",
     "jinja2>=3.1.6",
@@ -14,7 +14,7 @@ dependencies = [
     "requests>=2.32.5",
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
-    "torch==2.9.1",
+    "torch>=2.14.0",
     "wandb>=0.21.3",
 ]
 
@@ -29,7 +29,7 @@ dev = [
     "pytest>=8.0.0",
     "python-dotenv>=1.2.1",
     "ruff>=0.16.9",
-    "slangpy>=0.43.1",
+    "taichi>=1.7.4",
 ]
 
 [tool.ruff.lint]
@@ -51,11 +51,12 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
-# target torch to cuda 12.8 or CPU
+# CPU-only: torch resolves from the PyTorch CPU index (CUDA support was
+# dropped for the LC-QAT runtime; re-add a gpu extra + matching CUDA index
+# if GPU training is ever needed again).
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cpu", extra = "cpu" },
-    { index = "pytorch-cu128", extra = "gpu" },
 ]
 
 [[tool.uv.index]]
@@ -63,25 +64,11 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
-
 [project.optional-dependencies]
 cpu = [
     "setuptools>=65.0.0",
-    "torch==2.9.1",
-]
-gpu = [
-    "torch==2.9.1",
+    "torch>=2.14.0",
 ]
 
 [tool.uv]
 default-groups = []
-conflicts = [
-    [
-        { extra = "cpu" },
-        { extra = "gpu" },
-    ],
-]

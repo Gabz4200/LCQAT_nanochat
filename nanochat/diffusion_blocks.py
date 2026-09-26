@@ -241,6 +241,44 @@ class DiffusionBlockEngine:
         self.denoise_head.to(*args, **kwargs)
         return self
 
+    def apply_lcqat(self, layer_config) -> int:
+        """Retrofit the diffusion engine's adapter MLPs + denoise_head to LC-QAT.
+
+        The base transformer is retrofitted separately (via `retrofit_model` on
+        `self.model`); this method covers the engine-owned Linear layers that
+        `base_train`'s `--lcqat` flag must also quantize so the whole training
+        pipeline is LC-QAT (PRD: "the only training method that exists must
+        use it"). Returns the number of LCQATLinear modules created.
+        """
+        from nanochat.lcqat import retrofit_model
+
+        # The denoise_head is a plain nn.Linear; retrofit it in place.
+        self.denoise_head = retrofit_model(
+            self.denoise_head, layer_config
+        )
+        # Each NoiseConditionedBlockAdapter owns 2 Linear layers (c_fc, c_proj);
+        # retrofit them too. retrofit_model returns a new module, so replace
+        # the ModuleList slot in place.
+        for i, adapter in enumerate(self.adapters):
+            self.adapters[i] = retrofit_model(adapter, layer_config)
+        return sum(
+            1
+            for m in self.adapters
+            for sub in m.modules()
+            if sub.__class__.__name__ == "LCQATLinear"
+        ) + 1
+
+    def kv_codebooks(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-(layer, head) K/V codebooks for the QuantizedKVCache (PRD 7.1).
+
+        Reads each block's attn.c_k/c_v out-quantizer. The PRD 7.1 storage
+        layout is per (layer, head), so the module codebook is repeated across
+        that layer's KV heads. Returns fp32 [n_layers, n_kv_head, K].
+        """
+        from nanochat.engine import kv_codebooks_from_model
+
+        return kv_codebooks_from_model(self.model)
+
     def state_dict(self) -> dict[str, torch.Tensor]:
         """Export full engine state (base model + adapters + denoise_head)."""
         sd = self.model.state_dict()
@@ -269,6 +307,21 @@ class DiffusionBlockEngine:
             self.adapters.load_state_dict(adapters_sd, strict=strict)
         if head_sd:
             self.denoise_head.load_state_dict(head_sd, strict=strict)
+
+    def named_parameters(self, recurse: bool = True, remove_duplicate: bool = False):
+        """Yield (name, param) for model + adapters + denoise_head.
+
+        `build_qat_param_groups` and `SelectiveFreezer` need a single
+        `named_parameters()` view over the whole engine tree, so we forward
+        into the three owned subtrees with the `db_` prefix for adapter/head
+        params (matching the `state_dict` key prefix).
+        """
+        for name, p in self.model.named_parameters("", recurse, remove_duplicate):
+            yield name, p
+        for name, p in self.adapters.named_parameters("db_adapters", recurse, remove_duplicate):
+            yield f"db_adapters.{name}", p
+        for name, p in self.denoise_head.named_parameters("db_denoise_head", recurse, remove_duplicate):
+            yield f"db_denoise_head.{name}", p
 
     def parameters(self) -> list[torch.nn.Parameter]:
         """Model + adapter + denoise_head params for the optimizer."""

@@ -38,6 +38,7 @@ from nanochat.common import (
     is_ddp_initialized,
     print0,
 )
+from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from nanochat.lcqat import lcqat_config_from_args, retrofit_summary
@@ -143,7 +144,7 @@ parser.add_argument(
     "--matrix-lr",
     type=float,
     default=None,
-    help="learning rate for matrix parameters (Muon) (default: inherit from pretrain)",
+    help="learning rate for matrix parameters (AdamW) (default: inherit from pretrain)",
 )
 parser.add_argument(
     "--init-lr-frac", type=float, default=0.8, help="initial LR as fraction of base LR"
@@ -280,9 +281,22 @@ for name, fallback, source in [
         print0(f"Using {name}={arg_val}")
 
 orig_model = model
-model = torch.compile(model, dynamic=False)
-depth = model.config.n_layer
-num_flops_per_token = model.estimate_flops()
+if isinstance(model, DiffusionBlockEngine):
+    engine = model
+    base_model = engine.model
+else:
+    base_model = model
+    num_db_blocks = min(getattr(args, "db_blocks", 4), base_model.config.n_layer)
+    partitioner = EquiProbabilityPartitioner(
+        num_blocks=num_db_blocks,
+        sigma_min=0.002,
+        sigma_max=80.0,
+        sigma_data=0.5,
+    )
+    engine = DiffusionBlockEngine(base_model, partitioner)
+
+depth = base_model.config.n_layer
+num_flops_per_token = base_model.estimate_flops()
 tokens_per_fwdbwd = (
     args.device_batch_size * args.max_seq_len
 )  # tokens per iteration for a single rank
@@ -302,15 +316,17 @@ print0(
 )
 token_bytes = get_token_bytes(device=device)
 
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
-# Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
-optimizer = model.setup_optimizer(
-    unembedding_lr=args.unembedding_lr,
-    embedding_lr=args.embedding_lr,
-    matrix_lr=args.matrix_lr,
+# Initialize the Optimizer (AdamW-only for DiffusionBlocks engine)
+optimizer = torch.optim.AdamW(
+    engine.parameters(),
+    lr=args.matrix_lr if args.matrix_lr is not None else 3e-4,
     weight_decay=0.0,
-    codebook_lr=args.codebook_lr,
+    betas=(0.8, 0.95),
+    eps=1e-10,
+    fused=(device_type == "cpu"),
 )
+for group in optimizer.param_groups:
+    group["initial_lr"] = group["lr"]
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
@@ -533,13 +549,6 @@ def get_lr_multiplier(progress):
         return (1 - decay) * 1.0 + decay * args.final_lr_frac
 
 
-# Momentum scheduler for Muon optimizer
-def get_muon_momentum(it):
-    frac = min(it / 300, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.95
-    return momentum
-
-
 # -----------------------------------------------------------------------------
 # Training loop
 x, y = next(train_loader)  # prefetch the very first batch of data
@@ -677,7 +686,7 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = engine.train_step(x, y)
         train_loss = loss.detach()  # for logging
         loss = (
             loss / grad_accum_steps
@@ -694,11 +703,8 @@ while True:
         )  # only increase progress monotonically
     # step the optimizer
     lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group["kind"] == "muon":
-            group["momentum"] = muon_momentum
     if scaler is not None:
         scaler.unscale_(optimizer)
         if is_ddp_initialized():
@@ -708,7 +714,7 @@ while True:
         scaler.update()
     else:
         optimizer.step()
-    model.zero_grad(set_to_none=True)
+    optimizer.zero_grad(set_to_none=True)
     synchronize()
     t1 = time.time()
     dt = t1 - t0

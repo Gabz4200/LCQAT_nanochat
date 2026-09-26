@@ -10,6 +10,7 @@ import re
 import torch
 
 from nanochat.common import get_base_dir, setup_default_logging
+from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.lcqat.retrofit import (
     LayerKConfig,
@@ -133,20 +134,46 @@ def build_model(checkpoint_dir, step, device, phase, lcqat=None):
     lcqat_active = prepare_lcqat_before_load(
         model, model_data, meta_data.get("lcqat"), lcqat
     )
-    model.load_state_dict(model_data, strict=True, assign=True)
+    # Strip db_ keys for base model load
+    base_model_data = {
+        k: v
+        for k, v in model_data.items()
+        if not k.startswith("db_adapters.") and not k.startswith("db_denoise_head.")
+    }
+    model.load_state_dict(base_model_data, strict=True, assign=True)
     if lcqat_active is None:
         finish_lcqat_after_load(model, lcqat)
+
+    # Check if DiffusionBlocks state was saved in metadata or state keys
+    db_meta = meta_data.get("db")
+    if db_meta is not None:
+        num_blocks = db_meta.get("num_blocks", 4)
+        sigma_min = db_meta.get("sigma_min", 0.002)
+        sigma_max = db_meta.get("sigma_max", 80.0)
+        sigma_data = db_meta.get("sigma_data", 0.5)
+        partitioner = EquiProbabilityPartitioner(
+            num_blocks=num_blocks,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            sigma_data=sigma_data,
+        )
+        engine = DiffusionBlockEngine(model, partitioner)
+        engine.load_state_dict(model_data, strict=False)
+        target_model = engine
+    else:
+        target_model = model
+
     # Put the model in the right training phase / mode
     if phase == "eval":
-        model.eval()
+        target_model.eval()
     else:
-        model.train()
+        target_model.train()
     tokenizer = get_tokenizer()
     # Sanity check: compatibility between model and tokenizer
     assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], (
         f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {model_config_kwargs['vocab_size']}"
     )
-    return model, tokenizer, meta_data
+    return target_model, tokenizer, meta_data
 
 
 def find_largest_model(checkpoints_dir):

@@ -187,10 +187,10 @@ def test_when_setup_optimizer_then_codebooks_get_their_own_adamw_group(
     assert group["weight_decay"] == 0.0
     assert group["lr"] > 0
     assert {id(p) for p in group["params"]} == codebook_params
-    # Muon must only ever see 2-D matrices
-    for group in optimizer.param_groups:
-        if group["kind"] == "muon":
-            assert all(p.ndim == 2 for p in group["params"])
+    # No Muon groups remain in the codebase
+    muon_groups = [g for g in optimizer.param_groups if g.get("kind") == "muon"]
+    assert len(muon_groups) == 0, f"Expected no Muon groups, got {len(muon_groups)}"
+    # All params covered by some AdamW group
     covered = {id(p) for group in optimizer.param_groups for p in group["params"]}
     assert covered == {id(p) for p in tiny_gpt_lcqat.parameters()}
 

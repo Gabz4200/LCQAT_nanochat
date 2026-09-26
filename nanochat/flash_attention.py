@@ -73,14 +73,30 @@ def _resolve_use_fa3():
 USE_FA3 = _resolve_use_fa3()
 
 
-def _sdpa_attention(q, k, v, window_size, enable_gqa):
+def _sdpa_attention(q, k, v, window_size, enable_gqa, attn_mask=None):
     """
-    SDPA attention with sliding window support.
+    SDPA attention with sliding window and custom attention mask support.
     q, k, v are (B, H, T, D) format.
     """
     Tq = q.size(2)
     Tk = k.size(2)
     window = window_size[0]
+
+    # Explicit user-supplied attention mask (e.g., block-diagonal sequence packing)
+    if attn_mask is not None:
+        mask = attn_mask
+        if window >= 0 and window < Tk and Tq == Tk:
+            device = q.device
+            row_idx = torch.arange(Tq, device=device).unsqueeze(1)
+            col_idx = torch.arange(Tk, device=device).unsqueeze(0)
+            window_mask = (row_idx - col_idx) <= window
+            if mask.dtype == torch.bool:
+                mask = mask & window_mask
+            else:
+                mask = mask.masked_fill(~window_mask, float("-inf"))
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, enable_gqa=enable_gqa
+        )
 
     # Full context, same length
     if (window < 0 or window >= Tq) and Tq == Tk:
@@ -115,7 +131,7 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     )
 
 
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), attn_mask=None):
     """
     Flash Attention for training (no KV cache).
 
@@ -123,11 +139,12 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         q, k, v: Tensors of shape (B, T, H, D)
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
+        attn_mask: Optional explicit attention mask tensor (forces SDPA)
 
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if USE_FA3:
+    if USE_FA3 and attn_mask is None:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
@@ -135,7 +152,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
     enable_gqa = q.size(1) != k.size(1)
-    y = _sdpa_attention(q, k, v, window_size, enable_gqa)
+    y = _sdpa_attention(q, k, v, window_size, enable_gqa, attn_mask=attn_mask)
     return y.transpose(1, 2)  # back to (B, T, H, D)
 
 

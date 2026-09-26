@@ -111,6 +111,20 @@ The important thing to note is that nanochat is written and configured around on
 
 The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
 
+### DiffusionBlocks-CPU training
+
+`nanochat/diffusion_blocks.py` partitions depth into `B` blocks trained one at a time (SakanaAI DiffusionBlocks, ICLR 2026): equi-probability noise partitioner, per-block AdaLN adapters, EDM denoising loss (`denoise_step`) plus block-local CE (`train_step`), fused FP32 AdamW on 4 threads, cyclic packed batches. Only the active block holds gradients, cutting grad/optimizer memory ~`B`x.
+
+Measured on CPU (d4/256-wide toy, seq 64, batch 2, peak RSS 406MB):
+
+| B | CE `train_step` | EDM `denoise_step` |
+|---|-----------------|-------------------|
+| 1 | 1108 tok/s | 1171 tok/s |
+| 2 | 1298 tok/s | 2365 tok/s |
+| 4 | 1284 tok/s | 4045 tok/s |
+
+`denoise_step` scales ~`B`x (runs only the active block); `train_step` still forwards the full model and saves only backward/optimizer work.
+
 ## Precision / dtype
 
 nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/common.py`). By default this is auto-detected based on your hardware:

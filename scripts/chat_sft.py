@@ -317,12 +317,20 @@ print0(
 token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (AdamW-only for DiffusionBlocks engine)
-optimizer = torch.optim.AdamW(
-    engine.parameters(),
-    lr=args.matrix_lr if args.matrix_lr is not None else 3e-4,
+# PRD section 5: codebook delta params get their own AdamW group with a
+# dedicated LR and zero weight decay, distinct from the matrix-weight group.
+from nanochat.lcqat.optimizer import build_qat_param_groups
+
+param_groups = build_qat_param_groups(
+    engine,
+    matrix_lr=args.matrix_lr if args.matrix_lr is not None else 3e-4,
     weight_decay=0.0,
-    betas=(0.8, 0.95),
-    eps=1e-10,
+    codebook_lr=args.codebook_lr if args.codebook_lr is not None else 1e-3,
+    matrix_betas=(0.8, 0.95),
+    matrix_eps=1e-10,
+)
+optimizer = torch.optim.AdamW(
+    param_groups,
     fused=(device_type == "cpu"),
 )
 for group in optimizer.param_groups:

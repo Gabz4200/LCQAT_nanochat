@@ -23,7 +23,8 @@ command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 # create a .venv local virtual environment (if it doesn't exist)
 [ -d ".venv" ] || uv venv
 # install the repo dependencies
-uv sync --extra gpu
+# gpu extra was dropped from pyproject; re-add it there for CUDA boxes
+uv sync --extra cpu
 # activate venv so that `python` uses the project's venv instead of system python
 source .venv/bin/activate
 

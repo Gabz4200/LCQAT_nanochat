@@ -6,7 +6,7 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ## 2026-09-25: LC-QAT - Learned Codebook Quantization-Aware Training
 
-Implemented the LC-QAT PRD (`dev/lcqat_kv_cache.md` documents the single deferred piece: KV-cache storage). Every retrofitted `Linear` gets asymmetric odd-size codebooks `K = 2M + 1` with an exact zero anchor at index `M`, monotonic levels via cumulative `softplus` steps, and an STE that trains both the input and the codebook (the PRD's plain `x + (C[Q] - x).detach()` zeroes the codebook gradient, so the forward is written as `C[Q] + (x - x.detach())` instead).
+Implemented the LC-QAT PRD (the deferred KV-cache storage piece has since been implemented). Every retrofitted `Linear` gets asymmetric odd-size codebooks `K = 2M + 1` with an exact zero anchor at index `M`, monotonic levels via cumulative `softplus` steps, and an STE that trains both the input and the codebook (the PRD's plain `x + (C[Q] - x).detach()` zeroes the codebook gradient, so the forward is written as `C[Q] + (x - x.detach())` instead).
 
 **Wiring:**
 - `nanochat/lcqat/` holds the functional core: codebook, `LCQATLinear` (with output quantizers on Q/K/V and `mlp.c_fc`), per-role retrofit with `small` (max compression: q/k K=3, rest K=15) and `prd` (8-bit down_proj) presets + `--lcqat-k-map` overrides, activation LUT compiler, bit-packing, export.

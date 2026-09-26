@@ -1,6 +1,6 @@
 """
 Tests for the 4-bit quantized KV cache storage layer (LC-QAT PRD section 7.1),
-seams A (storage API) and D (byte budget) of dev/lcqat_kv_cache.md.
+the KV-cache storage (seam A) and byte-budget (seam D) contracts.
 
 python -m pytest tests/test_lcqat_kv_cache.py -v
 """

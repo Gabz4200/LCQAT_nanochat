@@ -462,8 +462,8 @@ class Engine:
 
         quantized_kv=True selects the QuantizedKVCache decode path (4-bit
         packed K/V resolved through per-head codebooks, dispatch_quant_attn)
-        instead of the default bf16/FA3 cache; FA3 stays the default until
-        parity is proven (dev/lcqat_kv_cache.md).
+        instead of the default bf16/FA3 cache; FA3 stays the default
+        until parity is proven (tests/test_lcqat_engine_runtime.py).
         """
         assert isinstance(tokens, list) and isinstance(tokens[0], int), (
             "expecting list of ints"

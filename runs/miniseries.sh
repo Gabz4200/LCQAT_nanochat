@@ -14,7 +14,8 @@ if [ -z "$SKIP_SETUP" ]; then
     # uv
     command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
     [ -d ".venv" ] || uv venv
-    uv sync --extra gpu
+    # gpu extra was dropped from pyproject; re-add it there for CUDA boxes
+uv sync --extra cpu
     source .venv/bin/activate
 
     # Tokenizer, download 1000 shards for pretraining

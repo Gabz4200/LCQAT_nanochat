@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+*.so
 dev-ignore/
 report.md
 eval_bundle/
@@ -17,3 +18,21 @@ TODO_LCQAT.md
 
 # Aislop session state
 .aislop/*.jsonl
+
+# Tool caches (pytest/ruff self-ignore too; explicit so fresh clones are safe)
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Python build artifacts
+*.egg-info/
+dist/
+build/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Tool local state
+.opencode/
+.claude/settings.local.json

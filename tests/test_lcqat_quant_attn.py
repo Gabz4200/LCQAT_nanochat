@@ -1,6 +1,6 @@
 """
 Tests for the index-native quantized-KV decode attention op (LC-QAT PRD section
-7.1), seam B of dev/lcqat_kv_cache.md: three-way parity naive == cpu == gpu
+7.1), seam B: three-way parity naive == cpu == gpu
 against an independent pure-Python oracle, torch.library opcheck, and
 torch.compile composition.
 

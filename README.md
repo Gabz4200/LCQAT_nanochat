@@ -32,15 +32,15 @@ See [dev/LEADERBOARD.md](dev/LEADERBOARD.md) for more docs on how to interpret a
 nanochat uses [uv](https://docs.astral.sh/uv/) for dependency management. To install:
 
 ```bash
-uv sync --extra gpu    # Use for CUDA (A100/H100/etc.)
-uv sync --extra cpu    # (or) Use for CPU-only / MPS
+uv sync --extra cpu    # CPU wheels (the CUDA extra was dropped; re-add it
+                       # per pyproject.toml if you need GPU training)
 source .venv/bin/activate
 ```
 
 For development (adds pytest, matplotlib, ipykernel, transformers, etc.):
 
 ```bash
-uv sync --extra gpu --group dev
+uv sync --extra cpu --group dev
 ```
 
 ### Reproduce and talk to GPT-2
@@ -153,7 +153,7 @@ python -m scripts.chat_rl --lcqat                     # start QAT during RL
 | `--lcqat-k-map substr:KW/KA,...` | Per-module overrides, e.g. `mlp.c_proj:255/255,attn.c_v:15/15` |
 | `--codebook-lr` | Codebook AdamW LR (PRD: 10-50x network weights) |
 
-Per-layer roles (`nanochat/lcqat/retrofit.py`): `attn.c_q`/`c_k` get ternary weights, Q/K/V **outputs** are quantized during training (the KV-cache storage format is the deferred piece - see [dev/lcqat_kv_cache.md](dev/lcqat_kv_cache.md)), `mlp.c_fc` output is quantized as the input side of the fused relu² LUT, `lm_head` and linears under 128 dims stay in floating point. `--fp8` and `--lcqat` are mutually exclusive (both convert `Linear`).
+Per-layer roles (`nanochat/lcqat/retrofit.py`): `attn.c_q`/`c_k` get ternary weights, Q/K/V **outputs** are quantized during training and the quantized KV-cache runtime is implemented (`Engine.generate(quantized_kv=True)`), `mlp.c_fc` output is quantized as the input side of the fused relu² LUT, `lm_head` and linears under 128 dims stay in floating point. `--fp8` and `--lcqat` are mutually exclusive (both convert `Linear`).
 
 ### Mul-less GEMV kernels
 
@@ -161,7 +161,7 @@ For `K_W = 3` inference, `dispatch_gemv(..., backend=...)` routes to:
 
 - `naive` - pure PyTorch oracle (`nanochat/lcqat/ops/references/`), for parity tests and debugging;
 - `cpu` - C++ kernel (`nanochat/lcqat/native/cpu/gemv.cpp`), runtime-dispatched AVX-512 / AVX2 / scalar, no floating-point multiplications in the inner loop, lazy JIT-built by torch on first use (needs `g++`/`clang++`; build cached under `~/.cache/torch_extensions`);
-- `gpu` - portable Slang shader (`nanochat/lcqat/kernels/slang/gemv/forward.slang`) on Vulkan (Intel/AMD/NVIDIA), loaded lazily (needs `slangpy`, installed in the dev group, plus a Vulkan ICD).
+- `gpu` - Taichi kernel (`nanochat/lcqat/kernels/gpu_loader.py`) on Vulkan (Intel/AMD/NVIDIA), loaded lazily (needs `taichi`, installed in the dev group, plus a Vulkan ICD).
 
 A requested backend that cannot run raises - it never silently falls back to naive. Three-way parity (`naive == cpu == gpu`), `torch.library.opcheck`, and `torch.compile` composition are covered by `tests/test_lcqat_ops.py`.
 

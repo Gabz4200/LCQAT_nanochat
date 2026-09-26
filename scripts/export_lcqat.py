@@ -6,7 +6,7 @@ index matrices (LC-QAT PRD section 8). Run from the project root:
 python -m scripts.export_lcqat --source base --out exports/model.pt
 
 The artifact is consumed by the quantized inference runtime (see
-dev/lcqat_kv_cache.md); it is not a resumable training checkpoint.
+the quantized runtime); it is not a resumable training checkpoint.
 """
 
 import argparse

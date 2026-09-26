@@ -55,6 +55,9 @@ from nanochat.lcqat import (
     retrofit_model,
     retrofit_summary,
 )
+from nanochat.lcqat.efqat import SelectiveFreezer
+from nanochat.lcqat.kd import KDLoss
+from nanochat.lcqat.optimizer import build_qat_param_groups
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.tokenizer import get_token_bytes, get_tokenizer
 from scripts.base_eval import evaluate_core
@@ -109,6 +112,44 @@ parser.add_argument(
     type=float,
     default=1e-3,
     help="learning rate for codebook step parameters (PRD: 10-50x network weights)",
+)
+# Knowledge Distillation (PRD 3.1)
+parser.add_argument(
+    "--kd-teacher-source",
+    type=str,
+    default=None,
+    help="checkpoint source tag to load the FP32 teacher for KD anchoring (PRD 3.1)",
+)
+parser.add_argument(
+    "--kd-teacher-tag",
+    type=str,
+    default=None,
+    help="checkpoint tag of the teacher model (PRD 3.1)",
+)
+parser.add_argument(
+    "--kd-alpha",
+    type=float,
+    default=0.1,
+    help="weight of the KL-distillation term (PRD 3.1): L_total = (1-a)*CE + a*KD",
+)
+parser.add_argument(
+    "--kd-temperature",
+    type=float,
+    default=2.0,
+    help="softmax temperature for KL distillation (PRD 3.1)",
+)
+# EfQAT selective layer freezing (PRD 3.2)
+parser.add_argument(
+    "--efqat-freeze-after",
+    type=int,
+    default=-1,
+    help="freeze middle-layer codebook+weight grads after N steps (PRD 3.2), -1 = disabled",
+)
+parser.add_argument(
+    "--efqat-freeze-frac",
+    type=float,
+    default=0.5,
+    help="fraction of middle transformer layers to freeze (PRD 3.2)",
 )
 # Model architecture
 parser.add_argument(
@@ -490,6 +531,13 @@ partitioner = EquiProbabilityPartitioner(
 engine = DiffusionBlockEngine(model, partitioner)
 print0(f"Initialized DiffusionBlocks Engine with {num_db_blocks} independent blocks")
 
+# PRD: "the only training method that exists must use it" — when LC-QAT is
+# enabled, retrofit the engine-owned Linear layers (adapters + denoise_head)
+# too, so the whole training pipeline is LC-QAT.
+if lcqat_active is not None:
+    n_lcqat = engine.apply_lcqat(lcqat_active)
+    print0(f"LC-QAT retrofitted {n_lcqat} diffusion-engine Linear layers")
+
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
 
@@ -563,12 +611,19 @@ if weight_decay_scaled != args.weight_decay:
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (AdamW-only for DiffusionBlocks engine)
-optimizer = torch.optim.AdamW(
-    engine.parameters(),
-    lr=args.matrix_lr * batch_lr_scale,
+# PRD section 5: codebook delta params (`raw_pos_deltas`, `raw_neg_deltas`)
+# get their own AdamW group with a dedicated LR and zero weight decay,
+# distinct from the matrix-weight group.
+param_groups = build_qat_param_groups(
+    engine,
+    matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
-    betas=(0.8, 0.95),
-    eps=1e-10,
+    codebook_lr=args.codebook_lr * batch_lr_scale,
+    matrix_betas=(0.8, 0.95),
+    matrix_eps=1e-10,
+)
+optimizer = torch.optim.AdamW(
+    param_groups,
     fused=(device_type == "cpu"),
 )
 for group in optimizer.param_groups:
@@ -577,6 +632,59 @@ for group in optimizer.param_groups:
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
+
+# -----------------------------------------------------------------------------
+# Knowledge Distillation teacher (PRD 3.1): optionally load a frozen FP32
+# teacher and anchor QAT with a KL-divergence loss. The teacher is built from
+# a separate checkpoint so it stays float (no codebook deltas).
+kd_loss_fn: KDLoss | None = None
+if args.kd_alpha > 0.0:
+    if args.kd_teacher_source is None or args.kd_teacher_tag is None:
+        raise SystemExit(
+            "--kd-alpha > 0 requires --kd-teacher-source and --kd-teacher-tag"
+        )
+    if lcqat_active is None:
+        raise SystemExit(
+            "KD anchoring (PRD 3.1) requires LC-QAT; pass --lcqat"
+        )
+    teacher_checkpoint_dir = os.path.join(
+        get_base_dir(), "checkpoints", args.kd_teacher_source
+    )
+    print0(
+        f"Loading frozen KD teacher from {teacher_checkpoint_dir} step {args.kd_teacher_tag}"
+    )
+    teacher_state, _, teacher_meta = load_checkpoint(
+        teacher_checkpoint_dir, int(args.kd_teacher_tag), device
+    )
+    from nanochat.gpt import GPTConfig
+
+    teacher_config = GPTConfig(**teacher_meta["model_config"])
+    teacher = GPT(teacher_config)
+    # Teacher is float; load raw weights (strip compiled _orig_mod prefix).
+    with torch.no_grad():
+        clean_state = {k.removeprefix("_orig_mod."): v for k, v in teacher_state.items()}
+        teacher.load_state_dict(clean_state, strict=False)
+    teacher.to(device=device, dtype=COMPUTE_DTYPE)
+    teacher.eval()
+    kd_loss_fn = KDLoss(teacher, alpha=args.kd_alpha, tau=args.kd_temperature)
+    del teacher_state
+    print0(f"KD teacher loaded: alpha={args.kd_alpha}, tau={args.kd_temperature}")
+
+# -----------------------------------------------------------------------------
+# EfQAT selective layer freezing (PRD 3.2): freeze middle-layer codebook +
+# weight gradients after a warmup window, keeping only critical outlier
+# layers (embeddings, attn q/k, output) trainable.
+efqat_freezer: SelectiveFreezer | None = None
+if lcqat_active is not None and args.efqat_freeze_after >= 0:
+    efqat_freezer = SelectiveFreezer(
+        model,
+        warmup_steps=args.efqat_freeze_after,
+        freeze_middle_frac=args.efqat_freeze_frac,
+    )
+    print0(
+        f"EfQAT selective freezing enabled: freezing after {args.efqat_freeze_after} steps "
+        f"(middle {args.efqat_freeze_frac:.0%} of {len(efqat_freezer.model.transformer.h)} layers)"
+    )
 
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
@@ -815,8 +923,20 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    # EfQAT: drive the selective freezer from the global step (PRD 3.2).
+    if efqat_freezer is not None:
+        efqat_freezer.update(step)
     for micro_step in range(grad_accum_steps):
         loss = engine.train_step(x, y)
+        # Knowledge Distillation anchoring (PRD 3.1): blend an extra KL term
+        # against the frozen FP32 teacher so the quantized student follows the
+        # smooth FP32 loss manifold instead of the sharp QAT minimum.
+        if kd_loss_fn is not None:
+            with torch.no_grad():
+                teacher_logits = kd_loss_fn.teacher(x)
+            student_logits = engine.model(x, targets=None, attn_mask=None)
+            loss_kd = kd_loss_fn(student_logits, teacher_logits, y)
+            loss = (1.0 - kd_loss_fn.alpha) * loss + kd_loss_fn.alpha * loss_kd
         train_loss = loss.detach()  # for logging
         loss = (
             loss / grad_accum_steps

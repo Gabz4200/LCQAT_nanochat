@@ -22,6 +22,12 @@ _lock = Lock()
 _initialized = False
 _init_error: BaseException | None = None
 
+_VULKAN_ERROR = (
+    "LC-QAT GPU backend unavailable: Taichi could not initialize a Vulkan "
+    "device. Install a Vulkan driver/ICD (e.g. vulkan-intel, vulkan-radeon, "
+    "nvidia drivers), or dispatch with backend='cpu' or backend='naive'."
+)
+
 
 def _ensure_init() -> None:
     """Initialize the Taichi Vulkan runtime once (actionable error if absent)."""
@@ -32,22 +38,12 @@ def _ensure_init() -> None:
         if _initialized:
             return
         if _init_error is not None:
-            raise RuntimeError(
-                "LC-QAT GPU backend unavailable: Taichi could not "
-                "initialize a Vulkan device. Install a Vulkan driver/ICD "
-                "(e.g. vulkan-intel, vulkan-radeon, nvidia drivers), or "
-                "dispatch with backend='cpu' or backend='naive'."
-            ) from _init_error
+            raise RuntimeError(_VULKAN_ERROR) from _init_error
         try:
             ti.init(arch=ti.vulkan, log_level="error")
         except Exception as error:
             _init_error = error
-            raise RuntimeError(
-                "LC-QAT GPU backend unavailable: Taichi could not initialize "
-                "a Vulkan device. Install a Vulkan driver/ICD (e.g. "
-                "vulkan-intel, vulkan-radeon, nvidia drivers), or dispatch "
-                "with backend='cpu' or backend='naive'."
-            ) from error
+            raise RuntimeError(_VULKAN_ERROR) from error
         _initialized = True
 
 
@@ -60,7 +56,6 @@ def vulkan_available() -> bool:
         return False
 
 
-# Kernels.
 # Taichi annotations must be NdarrayType INSTANCES; binding them to names keeps
 # them valid taichi annotations without call expressions inside signatures
 # (pyrefly rejects calls in annotations).

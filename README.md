@@ -134,7 +134,7 @@ Note: `float16` training automatically enables a `GradScaler` in `base_train.py`
 
 ## LC-QAT quantization
 
-Learned Codebook Quantization-Aware Training (LC-QAT, PRD in `dev/`): every retrofitted `Linear` gets asymmetric odd-size codebooks `K = 2M + 1` with index `M` anchored **exactly to 0.0**, so zero-initialized weights and sparse activations quantize without noise. Levels are cumulative `softplus` steps (monotonic under gradient descent), forward uses a straight-through estimator that trains both the input and the codebook, and codebook parameters (`raw_pos_deltas` / `raw_neg_deltas`) get their own AdamW group with a dedicated learning rate (`--codebook-lr`, default `1e-3`, no weight decay).
+Learned Codebook Quantization-Aware Training (LC-QAT): every retrofitted `Linear` gets asymmetric odd-size codebooks `K = 2M + 1` with index `M` anchored **exactly to 0.0**, so zero-initialized weights and sparse activations quantize without noise. Levels are cumulative `softplus` steps (monotonic under gradient descent), forward uses a straight-through estimator that trains both the input and the codebook, and codebook parameters (`raw_pos_deltas` / `raw_neg_deltas`) get their own AdamW group with a dedicated learning rate (`--codebook-lr`, default `1e-3`, no weight decay).
 
 Enable it on any training entry point:
 

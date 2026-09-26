@@ -59,7 +59,6 @@ parser.add_argument(
 parser.add_argument(
     "--model-step", type=int, default=None, help="model step to load from"
 )
-# LC-QAT (learned codebook quantization-aware training)
 parser.add_argument(
     "--lcqat",
     action="store_true",

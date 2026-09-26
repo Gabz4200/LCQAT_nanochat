@@ -1,4 +1,4 @@
-"""LC-QAT: learned codebook quantization-aware training (PRD in dev/)."""
+"""LC-QAT: learned codebook quantization-aware training."""
 
 from nanochat.lcqat.codebook import MemoryEfficientLearnedCodebook, QuantizedOutput
 from nanochat.lcqat.export import export_lcqat_checkpoint, wire_activation_luts

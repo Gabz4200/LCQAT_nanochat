@@ -76,7 +76,6 @@ parser.add_argument(
     default=1,
     help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)",
 )
-# LC-QAT (learned codebook quantization-aware training)
 parser.add_argument(
     "--lcqat",
     action="store_true",

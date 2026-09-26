@@ -85,7 +85,6 @@ parser.add_argument(
     choices=["rowwise", "tensorwise"],
     help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)",
 )
-# LC-QAT (learned codebook quantization-aware training)
 parser.add_argument(
     "--lcqat",
     action="store_true",

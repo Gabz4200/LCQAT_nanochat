@@ -1,9 +1,20 @@
 """LC-QAT: learned codebook quantization-aware training."""
 
-from nanochat.lcqat.codebook import MemoryEfficientLearnedCodebook, QuantizedOutput
+from nanochat.lcqat.codebook import (
+    AsymmetricLearnedCodebook,
+    MemoryEfficientLearnedCodebook,
+    QuantizedOutput,
+)
+from nanochat.lcqat.efqat import SelectiveFreezer
 from nanochat.lcqat.export import export_lcqat_checkpoint, wire_activation_luts
+from nanochat.lcqat.kd import KDLoss, kd_loss
 from nanochat.lcqat.linear import LCQATLinear
-from nanochat.lcqat.lut import compile_activation_lut
+from nanochat.lcqat.lut import (
+    ACTIVATION_LUTS,
+    compile_activation,
+    compile_activation_lut,
+    get_activation,
+)
 from nanochat.lcqat.retrofit import (
     PRESETS,
     LayerKConfig,
@@ -19,12 +30,19 @@ from nanochat.lcqat.retrofit import (
 )
 
 __all__ = [
+    "AsymmetricLearnedCodebook",
     "MemoryEfficientLearnedCodebook",
     "QuantizedOutput",
     "LCQATLinear",
     "LayerKConfig",
     "PRESETS",
+    "SelectiveFreezer",
+    "ACTIVATION_LUTS",
+    "compile_activation",
     "compile_activation_lut",
+    "get_activation",
+    "kd_loss",
+    "KDLoss",
     "export_lcqat_checkpoint",
     "wire_activation_luts",
     "finish_lcqat_after_load",

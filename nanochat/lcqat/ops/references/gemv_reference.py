@@ -4,7 +4,7 @@ Pure PyTorch reference for the mul-less ternary GEMV (LC-QAT PRD sections 5.1-5.
 Ground-truth oracle for parity tests: dequantizes the ternary weights in
 floating point and runs a plain matmul. Device-agnostic, no packed inputs,
 no custom operators - mathematically the same computation the CPU (AVX) and
-GPU (Slang) kernels must reproduce.
+GPU (Taichi/Vulkan) kernels must reproduce.
 """
 
 import torch

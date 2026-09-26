@@ -207,7 +207,10 @@ at::Tensor lcqat_gemv_k3(
 
 }  // namespace
 
-TORCH_LIBRARY(nanochat, m) {
+// Fragment: quant_attn.cpp's extension may already own the `nanochat`
+// library in this process; TORCH_LIBRARY enforces single registration per
+// namespace and aborts (uncaught exception in static init) on a second one.
+TORCH_LIBRARY_FRAGMENT(nanochat, m) {
     m.def(
         "lcqat_gemv_k3(Tensor act_nibbles, Tensor act_lut, Tensor weight_trits, "
         "int n, float scale_neg, float scale_pos) -> Tensor");

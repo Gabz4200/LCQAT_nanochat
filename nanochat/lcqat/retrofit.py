@@ -248,23 +248,68 @@ def resolve_lcqat_config(
     return PRESETS["small"]
 
 
+def _prepare_exported_buffers(model: nn.Module, model_data: dict) -> None:
+    """Strip shadow weights and register the exported runtime buffers.
+
+    Turns a retrofitted float-structure model into the shape the exported
+    artifact expects: each LCQATLinear loses `weight` and gains
+    `packed_weight_indices`, `weight_index_format` (and `activation_lut`
+    when present), taken from the state itself so shapes and formats can
+    never disagree. A missing index key means the active LayerKConfig does
+    not match the artifact - fail fast with that hint.
+    """
+    for name, module in model.named_modules():
+        if not isinstance(module, LCQATLinear):
+            continue
+        idx_key = f"{name}.packed_weight_indices"
+        if idx_key not in model_data:
+            raise RuntimeError(
+                f"exported artifact has no {idx_key}: the active LC-QAT config "
+                "does not match the model structure this artifact was built from"
+            )
+        # Freeze quantizers exactly like export does: raw step params are
+        # deleted, only compiled_codebook buffers remain in the state.
+        module.weight_quantizer.compile_for_inference()
+        module.act_quantizer.compile_for_inference()
+        if module.out_quantizer is not None:
+            module.out_quantizer.compile_for_inference()
+        del module.weight
+        module.register_buffer("packed_weight_indices", model_data[idx_key])
+        module.register_buffer(
+            "weight_index_format", model_data[f"{name}.weight_index_format"]
+        )
+        lut_key = f"{name}.activation_lut"
+        if lut_key in model_data:
+            module.register_buffer("activation_lut", model_data[lut_key])
+
+
 def prepare_lcqat_before_load(
     model: nn.Module,
     model_data: dict,
     meta_lcqat: dict | None,
     requested: LayerKConfig | None,
 ) -> LayerKConfig | None:
-    """Retrofit before load_state_dict when the checkpoint is LC-QAT.
+    """Prepare a model for load_state_dict when the checkpoint is LC-QAT.
 
     Returns the active config, or None when the checkpoint is plain float
     (caller may then retrofit after loading via finish_lcqat_after_load).
+
+    Exported artifacts (weights stripped) are supported for inference: the
+    model is retrofitted to the checkpoint's config and re-shaped into the
+    exported runtime structure (packed IDs, no shadow weights); training
+    from such a state is rejected by the caller (checkpoint_manager).
     """
     if is_exported_lcqat_state(model_data):
-        raise RuntimeError(
-            "This checkpoint is an exported LC-QAT artifact (weights stripped); "
-            "it cannot be loaded for training or eval yet - the quantized inference "
-            "runtime is the deferred follow-up (see dev/lcqat_kv_cache.md)"
-        )
+        if requested is not None:
+            raise RuntimeError(
+                "cannot start QAT training from an exported LC-QAT artifact "
+                "(weights are stripped); pass the artifact's config via meta "
+                "or load a training checkpoint instead"
+            )
+        config = resolve_lcqat_config(meta_lcqat, None)
+        retrofit_model(model, config)
+        _prepare_exported_buffers(model, model_data)
+        return config
     if is_lcqat_state(model_data):
         config = resolve_lcqat_config(meta_lcqat, requested)
         retrofit_model(model, config)

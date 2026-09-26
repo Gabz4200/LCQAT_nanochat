@@ -16,6 +16,64 @@ import torch.nn.functional as F
 _TRIT_POWERS = torch.tensor([1, 3, 9, 27, 81], dtype=torch.int32)
 _TRITS_PER_BYTE = 5
 
+# Storage-format tags for weight indices (dtype chosen from the codebook
+# size K; persisted as a 0-dim int buffer next to each packed weight).
+FORMAT_TRITS = 0  # K = 3: 5 trits/byte
+FORMAT_NIBBLES = 1  # K <= 15: 2 values/byte
+FORMAT_UINT8 = 2  # K <= 255: one byte/value
+FORMAT_INT32 = 3  # K > 255: matches codebook.py index dtype
+
+
+def index_format_for_k(k: int) -> int:
+    """Select the weight-index storage format from the codebook size K."""
+    k = int(k)
+    if k < 3 or k % 2 != 1:
+        raise ValueError(f"codebook size K must be an odd integer >= 3, got {k}")
+    if k == 3:
+        return FORMAT_TRITS
+    if k <= 15:
+        return FORMAT_NIBBLES
+    if k <= 255:
+        return FORMAT_UINT8
+    return FORMAT_INT32
+
+
+def pack_weight_indices(indices: torch.Tensor, k: int) -> tuple[torch.Tensor, int]:
+    """Pack [m, n] weight indices into their K-selected storage format.
+
+    Returns (packed, format_tag) where the tag is one of FORMAT_*.
+    """
+    fmt = index_format_for_k(k)
+    if fmt == FORMAT_TRITS:
+        return pack_trits(indices), fmt
+    if fmt == FORMAT_NIBBLES:
+        return pack_nibbles(indices), fmt
+    if fmt == FORMAT_UINT8:
+        if indices.numel() and int(indices.max()) >= k:
+            raise ValueError(f"weight index out of range for K={k}")
+        return indices.to(torch.uint8).contiguous(), fmt
+    if indices.numel() and int(indices.max()) >= k:
+        raise ValueError(f"weight index out of range for K={k}")
+    return indices.to(torch.int32).contiguous(), fmt
+
+
+def unpack_weight_indices(packed: torch.Tensor, n: int, k: int) -> torch.Tensor:
+    """Inverse of pack_weight_indices: recover [m, n] indices for K.
+
+    The caller knows n (in_features) and K (codebook size), which is what
+    distinguishes the formats unambiguously.
+    """
+    fmt = index_format_for_k(k)
+    if fmt == FORMAT_TRITS:
+        return unpack_trits(packed, n)
+    if fmt == FORMAT_NIBBLES:
+        return unpack_nibbles(packed, n)
+    if packed.shape[-1] != n:
+        raise ValueError(
+            f"unpacked width {packed.shape[-1]} != expected n={n} for K={k}"
+        )
+    return packed
+
 
 def pack_trits(trits: torch.Tensor) -> torch.Tensor:
     """Pack K=3 indices {0,1,2} from [M, N] uint8 into [M, ceil(N/5)] bytes.
@@ -58,34 +116,35 @@ def unpack_trits(packed: torch.Tensor, n: int) -> torch.Tensor:
 
 
 def pack_nibbles(indices: torch.Tensor) -> torch.Tensor:
-    """Pack K<=15 indices from [N] uint8 into [ceil(N/2)] bytes (even=low nibble)."""
-    if indices.ndim != 1:
-        raise ValueError(
-            f"pack_nibbles expects a 1-D tensor, got shape {tuple(indices.shape)}"
-        )
+    """Pack K<=15 indices from [..., N] uint8 into [..., ceil(N/2)] bytes.
+
+    Applies row-wise over any leading dims (even index of each pair goes to the
+    low nibble), matching the PRD kernel's decode.
+    """
+    if indices.ndim == 0:
+        raise ValueError("pack_nibbles expects at least a 1-D tensor")
+    n = indices.shape[-1]
     if (
         indices.numel()
         and not torch.compiler.is_compiling()
         and int(indices.max()) > 15
     ):
         raise ValueError("pack_nibbles only accepts indices in {0..15}")
-    n = indices.numel()
     padded = F.pad(indices.to(torch.uint8), (0, n % 2))
-    low, high = padded[0::2], padded[1::2]
+    low, high = padded[..., 0::2], padded[..., 1::2]
     return (low | (high << 4)).to(torch.uint8)
 
 
 def unpack_nibbles(packed: torch.Tensor, n: int) -> torch.Tensor:
-    """Unpack nibble bytes back into a [n] uint8 index tensor (even=low nibble)."""
-    if packed.ndim != 1:
+    """Unpack nibble bytes back into [..., n] uint8 indices (even=low nibble)."""
+    if packed.ndim == 0:
+        raise ValueError("unpack_nibbles expects at least a 1-D tensor")
+    if packed.shape[-1] * 2 < n:
         raise ValueError(
-            f"unpack_nibbles expects a 1-D tensor, got shape {tuple(packed.shape)}"
-        )
-    if packed.numel() * 2 < n:
-        raise ValueError(
-            f"packed buffer too small: {packed.numel()} bytes hold {packed.numel() * 2} nibbles, need {n}"
+            f"packed buffer too small: {packed.shape[-1]} bytes hold "
+            f"{packed.shape[-1] * 2} nibbles, need {n}"
         )
     low = packed & 0x0F
     high = packed >> 4
-    interleaved = torch.stack([low, high], dim=-1).view(-1)
-    return interleaved[:n].to(torch.uint8)
+    interleaved = torch.stack([low, high], dim=-1).flatten(-2)[..., :n]
+    return interleaved.to(torch.uint8)

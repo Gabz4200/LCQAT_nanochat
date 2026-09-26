@@ -84,8 +84,8 @@ def gemv_k3_gpu(
     scale_neg: float,
     scale_pos: float,
 ) -> torch.Tensor:
-    """Run the portable Slang mul-less GEMV (loaded lazily on first call)."""
+    """Run the Taichi/Vulkan mul-less GEMV (loaded lazily on first call)."""
     validate_gemv_inputs(act_indices, act_lut, weight_indices)
-    from nanochat.lcqat.kernels.slang_loader import gemv_slang
+    from nanochat.lcqat.kernels.gpu_loader import run_gemv
 
-    return gemv_slang(act_indices, act_lut, weight_indices, scale_neg, scale_pos)
+    return run_gemv(act_indices, act_lut, weight_indices, scale_neg, scale_pos)

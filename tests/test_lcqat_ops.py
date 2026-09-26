@@ -9,14 +9,14 @@ python -m pytest tests/test_lcqat_ops.py -v
 import pytest
 import torch
 
-from nanochat.lcqat.kernels.slang_loader import vulkan_available
+from nanochat.lcqat.kernels.gpu_loader import vulkan_available
 from nanochat.lcqat.ops import dispatch_gemv
 from nanochat.lcqat.ops.gemv import _ensure_cpu_op, ternary_scales
 from nanochat.lcqat.ops.references.gemv_reference import reference_gemv_k3
 from nanochat.lcqat.packing import pack_nibbles, pack_trits
 
 requires_vulkan = pytest.mark.skipif(
-    not vulkan_available(), reason="Vulkan device unavailable for the Slang backend"
+    not vulkan_available(), reason="Vulkan device unavailable for the Taichi backend"
 )
 
 

@@ -130,17 +130,37 @@ class CausalSelfAttention(nn.Module):
             )
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
-                q,
-                k_cache,
-                v_cache,
-                k=k,
-                v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
-            )
+            if getattr(kv_cache, "quantized", False):
+                # Quantized KV (LC-QAT PRD 7.1): write this step's K/V as
+                # packed IDs, then resolve the window through per-head LUTs
+                # inside the index-native op. Lazy import: the lcqat package
+                # imports gpt, so a module-level import here would cycle.
+                from nanochat.lcqat.ops import dispatch_quant_attn
+
+                kv_cache.write(self.layer_idx, k, v)
+                k_idx, v_idx = kv_cache.get_layer_indices(self.layer_idx)
+                y = dispatch_quant_attn(
+                    q,
+                    k_idx,
+                    v_idx,
+                    kv_cache.k_codebooks[self.layer_idx],
+                    kv_cache.v_codebooks[self.layer_idx],
+                    kv_cache.cache_seqlens + T,  # valid rows incl. this step
+                    window_size[0],
+                    backend="cpu",
+                )
+            else:
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                y = flash_attn.flash_attn_with_kvcache(
+                    q,
+                    k_cache,
+                    v_cache,
+                    k=k,
+                    v=v,
+                    cache_seqlens=kv_cache.cache_seqlens,
+                    causal=True,
+                    window_size=window_size,
+                )
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
@@ -158,6 +178,14 @@ class MLP(nn.Module):
         self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
+        # Quantized-inference runtime (LC-QAT PRD 6): once export has installed
+        # packed weights + the relu^2 index table, the elementwise op runs as
+        # an index->index gather instead of float math. Duck-typed so gpt.py
+        # keeps no import-time dependency on the lcqat package.
+        c_fc = self.c_fc
+        buffers = getattr(c_fc, "_buffers", {})
+        if "activation_lut" in buffers and "packed_weight_indices" in buffers:
+            return c_fc.quantized_mlp_chain(x, self.c_proj)
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)

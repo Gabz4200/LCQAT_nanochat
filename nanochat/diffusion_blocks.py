@@ -268,6 +268,30 @@ class DiffusionBlockEngine:
             if sub.__class__.__name__ == "LCQATLinear"
         ) + 1
 
+    def apply_sparseprop(self, sparsity: float = 0.75, target_modules: list[str] | None = None) -> int:
+        """Retrofit the engine's Linear modules with SparseProp sparse backward.
+
+        Replaces nn.Linear modules in the base transformer and denoise_head
+        with SparsePropLinear (drop-in, O(nnz) backward via AVX2 kernels).
+        Module name grouping used by the DB-CPU partitioner is preserved
+        because SparsePropLinear subclasses nanochat Linear. Returns the
+        number of SparsePropLinear modules created.
+        """
+        from nanochat.lcqat.sparseprop import inject_sparseprop_layers
+
+        inject_sparseprop_layers(self.model, sparsity=sparsity, target_modules=target_modules)
+        inject_sparseprop_layers(self.denoise_head, sparsity=sparsity, target_modules=target_modules)
+        for i, adapter in enumerate(self.adapters):
+            self.adapters[i] = inject_sparseprop_layers(adapter, sparsity=sparsity, target_modules=target_modules)
+        return sum(
+            1 for m in self.adapters
+            for sub in m.modules()
+            if sub.__class__.__name__ == "SparsePropLinear"
+        ) + sum(
+            1 for m in self.model.modules()
+            if m.__class__.__name__ == "SparsePropLinear"
+        ) + 1
+
     def kv_codebooks(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-(layer, head) K/V codebooks for the QuantizedKVCache (PRD 7.1).
 

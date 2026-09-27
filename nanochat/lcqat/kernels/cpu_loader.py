@@ -60,7 +60,18 @@ def load_cpu_attn_extension():
 def load_cpu_index_linear_extension():
     """Build (once per process) the K-agnostic index-weight linear extension.
 
-    Registers `nanochat::lcqat_index_linear` (separate extension so each
-    kernel compiles and caches independently).
+    Registers `nanochat::lcqat_index_linear` (separate extension so the GEMV
+    and attention kernels compile and cache independently).
     """
-    return _load("nanochat_lcqat_cpu_index_linear", "index_linear.cpp")
+    return _load("nanochat_lcqt_cpu_index_linear", "index_linear.cpp")
+
+
+def load_cpu_sparseprop_extension():
+    """Build (once per process) and import the SparseProp CPU extension.
+
+    Importing the extension runs its TORCH_LIBRARY static initializers,
+    registering `nanochat::lcqat_sparseprop_forward` and
+    `lcqat_sparseprop_backward`. The object file build is cached by
+    torch.utils.cpp_extension across processes (~/.cache/torch_extensions).
+    """
+    return _load("nanochat_lcqat_cpu_sparseprop", "sparseprop.cpp")

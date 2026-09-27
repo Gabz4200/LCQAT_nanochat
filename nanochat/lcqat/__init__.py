@@ -15,6 +15,13 @@ from nanochat.lcqat.lut import (
     compile_activation_lut,
     get_activation,
 )
+from nanochat.lcqat.sparseprop import (
+    SparsePropLinear,
+    SparsePropLinearLCQAT,
+    SparsePropLinearFunction,
+    apply_static_sparsity_mask,
+    inject_sparseprop_layers,
+)
 from nanochat.lcqat.retrofit import (
     PRESETS,
     LayerKConfig,
@@ -34,6 +41,11 @@ __all__ = [
     "MemoryEfficientLearnedCodebook",
     "QuantizedOutput",
     "LCQATLinear",
+    "SparsePropLinear",
+    "SparsePropLinearLCQAT",
+    "SparsePropLinearFunction",
+    "apply_static_sparsity_mask",
+    "inject_sparseprop_layers",
     "LayerKConfig",
     "PRESETS",
     "SelectiveFreezer",

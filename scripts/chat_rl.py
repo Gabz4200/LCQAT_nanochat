@@ -37,6 +37,7 @@ from nanochat.common import (
 from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
 from nanochat.engine import Engine
 from nanochat.lcqat import lcqat_config_from_args, retrofit_summary
+from nanochat.lcqat.retrofit import LayerKConfig
 from tasks.gsm8k import GSM8K
 
 # -----------------------------------------------------------------------------
@@ -61,9 +62,11 @@ parser.add_argument(
     "--model-step", type=int, default=None, help="model step to load from"
 )
 parser.add_argument(
-    "--lcqat",
-    action="store_true",
-    help="start LC-QAT during RL from a float checkpoint (LC-QAT checkpoints resume without this flag)",
+    "--no-lcqat",
+    action="store_false",
+    dest="lcqat",
+    default=True,
+    help="disable LC-QAT (default: LC-QAT is always on; pass this to run plain float training)",
 )
 parser.add_argument(
     "--lcqat-preset",
@@ -139,6 +142,25 @@ parser.add_argument(
 parser.add_argument(
     "--init-lr-frac", type=float, default=0.05, help="initial LR as fraction of base LR"
 )
+parser.add_argument(
+    "--db-blocks",
+    type=int,
+    default=4,
+    help="number of diffusion blocks for block-wise training (default: 4)",
+)
+parser.add_argument(
+    "--no-sparseprop",
+    action="store_false",
+    dest="sparseprop",
+    default=True,
+    help="disable SparseProp sparse backprop (default: SparseProp is always on)",
+)
+parser.add_argument(
+    "--sparseprop-sparsity",
+    type=float,
+    default=0.75,
+    help="sparsity level for SparseProp (fraction of weights pruned, 0.0-1.0)",
+)
 # Evaluation / checkpointing
 parser.add_argument(
     "--eval-every", type=int, default=60, help="evaluate pass@k every N steps"
@@ -184,12 +206,17 @@ if lcqat_meta is None and lcqat_requested is not None:
     lcqat_meta = asdict(lcqat_requested)
 if lcqat_requested is not None:
     print0(f"LC-QAT RL: {retrofit_summary(model)}")
+# Track whether LC-QAT is active (from loaded checkpoint or freshly requested)
+lcqat_active = lcqat_meta if lcqat_meta is not None else lcqat_requested
+if lcqat_active is not None and not isinstance(lcqat_active, LayerKConfig):
+    lcqat_active = LayerKConfig.from_dict(lcqat_active)
 if isinstance(model, DiffusionBlockEngine):
     db_engine = model
     base_model = db_engine.model
+    num_db_blocks = db_engine.partitioner.num_blocks
 else:
     base_model = model
-    num_db_blocks = min(getattr(args, "db_blocks", 4), base_model.config.n_layer)
+    num_db_blocks = min(args.db_blocks, base_model.config.n_layer)
     partitioner = EquiProbabilityPartitioner(
         num_blocks=num_db_blocks,
         sigma_min=0.002,
@@ -197,6 +224,21 @@ else:
         sigma_data=0.5,
     )
     db_engine = DiffusionBlockEngine(base_model, partitioner)
+
+# LC-QAT: retrofit the engine-owned Linear layers (adapters + denoise_head)
+# so the whole training pipeline is LC-QAT. The base model was already
+# retrofitted by load_model/retrofit_model during checkpoint load.
+if lcqat_active is not None:
+    n_lcqat = db_engine.apply_lcqat(lcqat_active)
+    print0(f"LC-QAT retrofitted {n_lcqat} diffusion-engine Linear layers")
+
+# SparseProp: unstructured sparsity with AVX2 sparse backprop.
+if args.sparseprop:
+    n_sparse = db_engine.apply_sparseprop(
+        sparsity=args.sparseprop_sparsity,
+        with_lcqat=lcqat_active is not None,
+    )
+    print0(f"SparseProp injected {n_sparse} sparse Linear layers")
 
 engine = Engine(base_model, tokenizer)  # for sampling rollouts
 
@@ -516,6 +558,16 @@ for step in range(num_steps):
             {
                 "model_config": model_config_kwargs,
                 "lcqat": lcqat_meta,
+                "db": {
+                    "num_blocks": num_db_blocks,
+                    "sigma_min": 0.002,
+                    "sigma_max": 80.0,
+                    "sigma_data": 0.5,
+                },
+                "sparseprop": {
+                    "enabled": args.sparseprop,
+                    "sparsity": args.sparseprop_sparsity,
+                },
             },
         )
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")

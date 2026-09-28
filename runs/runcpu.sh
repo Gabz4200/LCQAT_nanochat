@@ -29,6 +29,8 @@ python -m scripts.tok_eval
 # train a small 6 layer model
 # I tuned this run to complete in about 30 minutes on my MacBook Pro M3 Max.
 # To get better results, try increasing num_iterations, or get other ideas from your favorite LLM.
+# LC-QAT, SparseProp, and the DiffusionBlocks training engine are on by default;
+# --db-blocks=2 keeps block-wise overhead small on this toy depth.
 python -m scripts.base_train \
     --depth=6 \
     --head-dim=64 \
@@ -41,14 +43,17 @@ python -m scripts.base_train \
     --core-metric-every=-1 \
     --sample-every=100 \
     --num-iterations=5000 \
+    --db-blocks=2 \
     --run=$WANDB_RUN
 python -m scripts.base_eval --device-batch-size=1 --split-tokens=16384 --max-per-task=16
 
 # SFT (~10 minutes on my MacBook Pro M3 Max)
+# LC-QAT + SparseProp are on by default; DiffusionBlocks engine uses 2 blocks.
 python -m scripts.chat_sft \
     --eval-every=200 \
     --eval-tokens=524288 \
     --num-iterations=1500 \
+    --db-blocks=2 \
     --run=$WANDB_RUN
 
 # Chat with the model over CLI

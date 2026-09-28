@@ -28,11 +28,13 @@ def test_when_adapter_conditioned_then_sigma_changes_output_and_gets_grad() -> N
     torch.manual_seed(0)
     adapter = NoiseConditionedBlockAdapter(n_embd=16, cond_dim=8)
     # Break zero-init symmetry so conditioning has an effect.
+    # The final linear is mlp[-1] (no self.out alias — that would share the
+    # Parameter object under two paths and trip the optimizer's dup-param check).
     with torch.no_grad():
-        adapter.out.weight.fill_(0.01)
+        adapter.mlp[-1].weight.fill_(0.01)
     x = torch.randn(2, 8, 16)
     y1 = adapter(x, torch.tensor([0.5, 0.5]))
     y2 = adapter(x, torch.tensor([4.0, 4.0]))
     assert not torch.equal(y1, y2)
     y1.sum().backward()
-    assert adapter.out.weight.grad is not None
+    assert adapter.mlp[-1].weight.grad is not None

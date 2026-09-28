@@ -20,14 +20,18 @@ class NoiseConditionedBlockAdapter(nn.Module):
     def __init__(self, n_embd: int, cond_dim: int = 32) -> None:
         super().__init__()
         self.cond_dim = cond_dim
+        # NOTE: do NOT keep a `self.out = self.mlp[-1]` alias here. That alias
+        # shares the same nn.Linear Parameter object under two attribute paths
+        # (`mlp.2` and `out`), so nn.Module registers it twice and the optimizer
+        # emits "parameter group with duplicate parameters". The final linear is
+        # reachable as self.mlp[-1]; nothing reads self.out.
         self.mlp = nn.Sequential(
             nn.Linear(cond_dim, 4 * cond_dim),
             nn.SiLU(),
             nn.Linear(4 * cond_dim, 2 * n_embd),
         )
-        self.out = self.mlp[-1]
-        nn.init.zeros_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
         c = self.mlp(

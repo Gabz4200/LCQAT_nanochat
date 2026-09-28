@@ -90,9 +90,11 @@ parser.add_argument(
     help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)",
 )
 parser.add_argument(
-    "--lcqat",
-    action="store_true",
-    help="enable LC-QAT: retrofit Linear layers with learned codebooks (LC-QAT checkpoints resume without this flag)",
+    "--no-lcqat",
+    action="store_false",
+    dest="lcqat",
+    default=True,
+    help="disable LC-QAT (default: LC-QAT is always on; pass this to run plain float training)",
 )
 parser.add_argument(
     "--lcqat-preset",
@@ -144,6 +146,19 @@ parser.add_argument(
     type=int,
     default=-1,
     help="freeze middle-layer codebook+weight grads after N steps (PRD 3.2), -1 = disabled",
+)
+parser.add_argument(
+    "--no-sparseprop",
+    action="store_false",
+    dest="sparseprop",
+    default=True,
+    help="disable SparseProp sparse backprop (default: SparseProp is always on)",
+)
+parser.add_argument(
+    "--sparseprop-sparsity",
+    type=float,
+    default=0.75,
+    help="sparsity level for SparseProp (fraction of weights pruned, 0.0-1.0)",
 )
 parser.add_argument(
     "--efqat-freeze-frac",
@@ -538,6 +553,16 @@ if lcqat_active is not None:
     n_lcqat = engine.apply_lcqat(lcqat_active)
     print0(f"LC-QAT retrofitted {n_lcqat} diffusion-engine Linear layers")
 
+# SparseProp: unstructured sparsity with AVX2 sparse backprop.
+# When LC-QAT is active, wrap LCQATLinear as SparsePropLinearLCQAT so the
+# codebook quantizers + sparse backprop coexist in the same module.
+if args.sparseprop:
+    n_sparse = engine.apply_sparseprop(
+        sparsity=args.sparseprop_sparsity,
+        with_lcqat=lcqat_active is not None,
+    )
+    print0(f"SparseProp injected {n_sparse} sparse Linear layers")
+
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
 
@@ -900,6 +925,10 @@ while True:
                     "sigma_min": 0.002,
                     "sigma_max": 80.0,
                     "sigma_data": 0.5,
+                },
+                "sparseprop": {
+                    "enabled": args.sparseprop,
+                    "sparsity": args.sparseprop_sparsity,
                 },
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,

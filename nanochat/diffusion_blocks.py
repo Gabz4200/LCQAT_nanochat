@@ -268,29 +268,54 @@ class DiffusionBlockEngine:
             if sub.__class__.__name__ == "LCQATLinear"
         ) + 1
 
-    def apply_sparseprop(self, sparsity: float = 0.75, target_modules: list[str] | None = None) -> int:
+    def apply_sparseprop(
+        self,
+        sparsity: float = 0.75,
+        target_modules: list[str] | None = None,
+        with_lcqat: bool = False,
+    ) -> int:
         """Retrofit the engine's Linear modules with SparseProp sparse backward.
 
         Replaces nn.Linear modules in the base transformer and denoise_head
         with SparsePropLinear (drop-in, O(nnz) backward via AVX2 kernels).
-        Module name grouping used by the DB-CPU partitioner is preserved
-        because SparsePropLinear subclasses nanochat Linear. Returns the
-        number of SparsePropLinear modules created.
+        When ``with_lcqat=True``, existing LCQATLinear modules are wrapped as
+        SparsePropLinearLCQAT so the codebook quantizers and sparse backprop
+        coexist in the same module (LC-QAT + SparseProp). Module name grouping
+        used by the DB-CPU partitioner is preserved because SparsePropLinear
+        subclasses nanochat Linear. Returns the number of SparseProp modules
+        created.
         """
-        from nanochat.lcqat.sparseprop import inject_sparseprop_layers
+        from nanochat.lcqat.sparseprop import (
+            SparsePropLinear,
+            SparsePropLinearLCQAT,
+            inject_sparseprop_layers,
+        )
 
-        inject_sparseprop_layers(self.model, sparsity=sparsity, target_modules=target_modules)
-        inject_sparseprop_layers(self.denoise_head, sparsity=sparsity, target_modules=target_modules)
+        inject_sparseprop_layers(
+            self.model, sparsity=sparsity, target_modules=target_modules,
+            with_lcqat=with_lcqat,
+        )
+        inject_sparseprop_layers(
+            self.denoise_head, sparsity=sparsity, target_modules=target_modules,
+            with_lcqat=with_lcqat,
+        )
         for i, adapter in enumerate(self.adapters):
-            self.adapters[i] = inject_sparseprop_layers(adapter, sparsity=sparsity, target_modules=target_modules)
-        return sum(
+            self.adapters[i] = inject_sparseprop_layers(
+                adapter, sparsity=sparsity, target_modules=target_modules,
+                with_lcqat=with_lcqat,
+            )
+        count = sum(
             1 for m in self.adapters
             for sub in m.modules()
-            if sub.__class__.__name__ == "SparsePropLinear"
+            if isinstance(sub, (SparsePropLinear, SparsePropLinearLCQAT))
         ) + sum(
             1 for m in self.model.modules()
-            if m.__class__.__name__ == "SparsePropLinear"
-        ) + 1
+            if isinstance(m, (SparsePropLinear, SparsePropLinearLCQAT))
+        ) + sum(
+            1 for m in self.denoise_head.modules()
+            if isinstance(m, (SparsePropLinear, SparsePropLinearLCQAT))
+        )
+        return count
 
     def kv_codebooks(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-(layer, head) K/V codebooks for the QuantizedKVCache (PRD 7.1).

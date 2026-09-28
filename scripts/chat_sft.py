@@ -42,6 +42,7 @@ from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityParti
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
 from nanochat.lcqat import lcqat_config_from_args, retrofit_summary
+from nanochat.lcqat.retrofit import LayerKConfig
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.tokenizer import get_token_bytes
 from scripts.chat_eval import run_chat_eval
@@ -78,9 +79,11 @@ parser.add_argument(
     help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)",
 )
 parser.add_argument(
-    "--lcqat",
-    action="store_true",
-    help="start LC-QAT during SFT from a float checkpoint (LC-QAT checkpoints resume without this flag)",
+    "--no-lcqat",
+    action="store_false",
+    dest="lcqat",
+    default=True,
+    help="disable LC-QAT (default: LC-QAT is always on; pass this to run plain float training)",
 )
 parser.add_argument(
     "--lcqat-preset",
@@ -157,6 +160,25 @@ parser.add_argument(
     type=float,
     default=0.5,
     help="ratio of iterations for LR warmdown",
+)
+parser.add_argument(
+    "--db-blocks",
+    type=int,
+    default=4,
+    help="number of diffusion blocks for block-wise training (default: 4)",
+)
+parser.add_argument(
+    "--no-sparseprop",
+    action="store_false",
+    dest="sparseprop",
+    default=True,
+    help="disable SparseProp sparse backprop (default: SparseProp is always on)",
+)
+parser.add_argument(
+    "--sparseprop-sparsity",
+    type=float,
+    default=0.75,
+    help="sparsity level for SparseProp (fraction of weights pruned, 0.0-1.0)",
 )
 parser.add_argument(
     "--final-lr-frac",
@@ -284,9 +306,10 @@ orig_model = model
 if isinstance(model, DiffusionBlockEngine):
     engine = model
     base_model = engine.model
+    num_db_blocks = engine.partitioner.num_blocks
 else:
     base_model = model
-    num_db_blocks = min(getattr(args, "db_blocks", 4), base_model.config.n_layer)
+    num_db_blocks = min(args.db_blocks, base_model.config.n_layer)
     partitioner = EquiProbabilityPartitioner(
         num_blocks=num_db_blocks,
         sigma_min=0.002,
@@ -294,6 +317,24 @@ else:
         sigma_data=0.5,
     )
     engine = DiffusionBlockEngine(base_model, partitioner)
+
+# LC-QAT: retrofit the engine-owned Linear layers (adapters + denoise_head)
+# so the whole training pipeline is LC-QAT. The base model was already
+# retrofitted by load_model/retrofit_model during checkpoint load.
+lcqat_active = lcqat_requested if lcqat_started_from_float else lcqat_meta
+if lcqat_active is not None and not isinstance(lcqat_active, LayerKConfig):
+    lcqat_active = LayerKConfig.from_dict(lcqat_active)
+if lcqat_active is not None:
+    n_lcqat = engine.apply_lcqat(lcqat_active)
+    print0(f"LC-QAT retrofitted {n_lcqat} diffusion-engine Linear layers")
+
+# SparseProp: unstructured sparsity with AVX2 sparse backprop.
+if args.sparseprop:
+    n_sparse = engine.apply_sparseprop(
+        sparsity=args.sparseprop_sparsity,
+        with_lcqat=lcqat_active is not None,
+    )
+    print0(f"SparseProp injected {n_sparse} sparse Linear layers")
 
 depth = base_model.config.n_layer
 num_flops_per_token = base_model.estimate_flops()
@@ -681,6 +722,16 @@ while True:
                 },
                 "user_config": user_config,  # inputs to the training script
                 "lcqat": lcqat_meta,
+                "db": {
+                    "num_blocks": num_db_blocks,
+                    "sigma_min": 0.002,
+                    "sigma_max": 80.0,
+                    "sigma_data": 0.5,
+                },
+                "sparseprop": {
+                    "enabled": args.sparseprop,
+                    "sparsity": args.sparseprop_sparsity,
+                },
             },
             rank=ddp_rank,
         )

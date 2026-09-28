@@ -229,12 +229,23 @@ class SparsePropLinear(Linear):
 
 
 class SparsePropLinearLCQAT(SparsePropLinear):
-    """SparsePropLinear that retains LCQAT codebook quantization.
+    """SparseProp layer that owns an LCQATLinear's weight/quantizer machinery.
 
-    Forward quantizes input/weight through codebooks (STE), applies the
-    sparse mask to the dequantized weight, and routes backward through
-    the sparse kernel. Gradients flow back to the codebook deltas via
-    the gather operation's STE.
+    Unlike SparsePropLinear (which owns its own plain nn.Linear), this class
+    *inherits* the weight/quantizer machinery from the LCQATLinear it wraps, so
+    the LC-QAT codebook quantizers stay live and trainable. The sparse mask
+    is applied on top of the LC-QAT forward value, and sparse backprop walks
+    the LC-QAT weight (not a separate dense weight).
+
+    The inner LCQATLinear is *flattened*: its weight/bias/quantizers are
+    re-parented into this module's own attributes, so every parameter and
+    buffer is registered exactly once. Nesting the LCQATLinear as a submodule
+    (``self._inner_lcqat = lcqat_linear``) instead would leave the codebook
+    parameters registered twice — once on the wrapper, once on the orphaned
+    inner module — producing duplicate optimizer entries and a 2x parameter
+    count. The lcqat_linear object is intentionally not retained as an
+    attribute (that would re-register it as a submodule); it is left to be
+    garbage-collected after its weight/bias/quantizers are re-parented.
     """
 
     def __init__(self, lcqat_linear, sparsity: float = 0.75):
@@ -243,7 +254,7 @@ class SparsePropLinearLCQAT(SparsePropLinear):
         assert isinstance(lcqat_linear, LCQATLinear), (
             f"Expected LCQATLinear, got {type(lcqat_linear)}"
         )
-        # Initialize SparsePropLinear first (sets up weight, bias, mask, etc.)
+        # Initialize SparsePropLinear first (sets up mask, ptr/col buffers, etc.)
         super().__init__(
             in_features=lcqat_linear.in_features,
             out_features=lcqat_linear.out_features,
@@ -251,16 +262,21 @@ class SparsePropLinearLCQAT(SparsePropLinear):
             bias=lcqat_linear.bias is not None,
             device=lcqat_linear.weight.device,
         )
-        # Share the codebook parameters so they remain trainable
-        self._inner_lcqat = lcqat_linear
-        self.weight_quantizer = lcqat_linear.weight_quantizer
-        self.act_quantizer = lcqat_linear.act_quantizer
+        # Re-parent the LCQATLinear's weight/bias into this module so the
+        # codebook quantizers stay live and trainable, and so the module tree
+        # registers every parameter exactly once (sharing the Parameter
+        # object means nn.Module registers it under this module only).
+        self.weight = lcqat_linear.weight
         if lcqat_linear.bias is not None:
             self.bias = lcqat_linear.bias
-        # Keep weight in sync with the original (non-zero until mask applied)
-        with torch.no_grad():
-            self.weight.copy_(lcqat_linear.weight)
-        # Apply static sparsity mask (Sparse Transfer)
+        self.weight_quantizer = lcqat_linear.weight_quantizer
+        self.act_quantizer = lcqat_linear.act_quantizer
+        # NOTE: do NOT keep a reference to lcqat_linear as an attribute —
+        # nn.Module.__setattr__ would register it as a submodule, re-registering
+        # its weight/bias/quantizers under a second path and recreating the
+        # orphan + duplicate-parameter bug. The weight/bias/quantizers above
+        # are the only references needed; lcqat_linear is left to be GC'd.
+        # Apply static sparsity mask (Sparse Transfer) on the shared weight.
         _init_sparsity_mask(self, sparsity)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -352,7 +368,9 @@ def inject_sparseprop_layers(
     - If with_lcqat=False (default): replaces nn.Linear (not already
       SparsePropLinear/LCQATLinear) with SparsePropLinear.
     - If with_lcqat=True: also converts LCQATLinear → SparsePropLinearLCQAT,
-      preserving the codebook quantizers.
+      preserving the codebook quantizers. SparsePropLinearLCQAT absorbs the
+      LCQATLinear's weight/quantizers in-tree (no orphan submodule remains),
+      so each LCQATLinear is wrapped exactly once.
 
     Args:
         model: the model to retrofit
@@ -371,12 +389,10 @@ def inject_sparseprop_layers(
             if isinstance(module, SparsePropLinearLCQAT):
                 continue
             if isinstance(module, LCQATLinear):
-                # Skip LCQATLinear modules that are inside a SparsePropLinearLCQAT
-                parent_name, _, _ = name.rpartition(".")
-                if parent_name:
-                    parent = model.get_submodule(parent_name)
-                    if isinstance(parent, SparsePropLinearLCQAT) and parent._inner_lcqat is module:
-                        continue
+                # SparsePropLinearLCQAT absorbs the LCQATLinear's weight/
+                # quantizers in-tree and does not retain the LCQATLinear as a
+                # submodule, so any LCQATLinear seen here is a genuine one to
+                # wrap (no orphan-skip needed).
                 kind = "lcqat"
         else:
             if isinstance(module, LCQATLinear):

@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nanochat.lcqat.linear import LCQATLinear
 from nanochat.lcqat.sparseprop import (
     SparsePropLinear,
     SparsePropLinearLCQAT,
@@ -183,7 +184,10 @@ class TestDBCPUIntegration:
 
     def test_blockwise_training_runs(self, tiny_model):
         """DB-CPU block-wise training step works with SparseProp layer."""
-        from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
+        from nanochat.diffusion_blocks import (
+            DiffusionBlockEngine,
+            EquiProbabilityPartitioner,
+        )
 
         inject_sparseprop_layers(tiny_model, sparsity=0.5)
 
@@ -208,7 +212,7 @@ class TestDBCPUIntegration:
         assert has_grad, "No gradients found on model parameters"
 
     def test_sparseprop_with_lcqat(self, tiny_model):
-        from nanochat.lcqat import retrofit_model, LayerKConfig
+        from nanochat.lcqat import LayerKConfig, retrofit_model
 
         config = LayerKConfig(min_linear_dim=1)
         model = retrofit_model(tiny_model, config)
@@ -216,9 +220,13 @@ class TestDBCPUIntegration:
         inject_sparseprop_layers(model, sparsity=0.5, with_lcqat=True)
 
         # After inject with_lcqat=True, top-level LCQATLinear modules are wrapped
-        # in SparsePropLinearLCQAT (which holds the LCQATLinear as _inner_lcqat).
+        # in SparsePropLinearLCQAT (which absorbs the LCQATLinear's weight/
+        # quantizers in-tree, so no orphan LCQATLinear remains).
         sparse_count = sum(1 for m in model.modules() if isinstance(m, SparsePropLinearLCQAT))
         assert sparse_count > 0, "LCQAT retrofit should produce SparsePropLinearLCQAT modules"
+        # No orphan LCQATLinear modules should remain after wrapping
+        orphans = sum(1 for m in model.modules() if isinstance(m, LCQATLinear))
+        assert orphans == 0, f"Expected no orphan LCQATLinear modules, got {orphans}"
         # Verify codebooks are preserved on the wrappers
         for m in model.modules():
             if isinstance(m, SparsePropLinearLCQAT):
@@ -227,7 +235,10 @@ class TestDBCPUIntegration:
 
     def test_engine_apply_sparseprop(self, tiny_model):
         """DiffusionBlockEngine.apply_sparseprop injects SparseProp into all blocks."""
-        from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
+        from nanochat.diffusion_blocks import (
+            DiffusionBlockEngine,
+            EquiProbabilityPartitioner,
+        )
 
         engine = DiffusionBlockEngine(
             model=tiny_model,
@@ -251,7 +262,7 @@ class TestDBCPUIntegration:
 class TestSparsePropLCQAT:
     def test_lcqat_backward_gradients_flow(self, tiny_model):
         """SparsePropLinearLCQAT backward produces gradients on all params."""
-        from nanochat.lcqat import retrofit_model, LayerKConfig
+        from nanochat.lcqat import LayerKConfig, retrofit_model
 
         config = LayerKConfig(min_linear_dim=1)
         model = retrofit_model(tiny_model, config)
@@ -275,7 +286,7 @@ class TestSparsePropLCQAT:
 
     def test_lcqat_sparsity_mask_stays_fixed(self, tiny_model):
         """SparsePropLinearLCQAT sparsity mask does not change during training."""
-        from nanochat.lcqat import retrofit_model, LayerKConfig
+        from nanochat.lcqat import LayerKConfig, retrofit_model
 
         config = LayerKConfig(min_linear_dim=1)
         model = retrofit_model(tiny_model, config)

@@ -288,6 +288,7 @@ for name, fallback, source in [
     ("embedding_lr", 0.3, pretrain_user_config),
     ("unembedding_lr", 0.004, pretrain_user_config),
     ("matrix_lr", 0.02, pretrain_user_config),
+    ("db_blocks", 4, pretrain_user_config),
 ]:
     arg_val = getattr(args, name)
     pretrain_val = source.get(name)
@@ -394,13 +395,62 @@ elif args.load_optimizer:
     )
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
-        optimizer.load_state_dict(optimizer_data)
+        loaded_momentum = False
+        try:
+            optimizer.load_state_dict(optimizer_data)
+            loaded_momentum = True
+        except ValueError:
+            # The saved optimizer was produced by an older code path whose
+            # parameter grouping differs from the current one (e.g. a Muon
+            # stage that has since been removed, or duplicate codebook params
+            # from a non-flattened SparsePropLinearLCQAT). load_state_dict
+            # hard-fails on group-count mismatch.
+            saved_param_count = sum(
+                len(g["params"]) for g in optimizer_data.get("param_groups", [])
+            )
+            current_param_count = sum(
+                len(g["params"]) for g in optimizer.param_groups
+            )
+            if saved_param_count != current_param_count:
+                # The saved and current models have a different number of
+                # parameters (different architecture/stage, e.g. a Muon-based
+                # pretrain checkpoint vs. the current AdamW-only model). The
+                # saved state's integer param indices map onto the old flat
+                # param list, not the current Parameter objects, so any
+                # positional copy would attach momentum to the wrong params.
+                # Warm-start is unsafe here; start fresh.
+                print0(
+                    f"Pretrained optimizer skipped: saved {saved_param_count} params "
+                    f"vs. current {current_param_count} (architecture mismatch); "
+                    f"starting with a fresh optimizer"
+                )
+            else:
+                # Same param count, different grouping: copy momentum buffers
+                # per Parameter identity and keep our fresh param groups
+                # (LRs, betas, weight decay) intact.
+                id_to_param = {
+                    id(p): p
+                    for group in optimizer.param_groups
+                    for p in group["params"]
+                }
+                copied = 0
+                for pid, state in optimizer_data.get("state", {}).items():
+                    target = id_to_param.get(pid)
+                    if target is None:
+                        continue
+                    optimizer.state[id(target)] = state
+                    copied += 1
+                print0(
+                    f"Loaded optimizer momentum for {copied}/{len(id_to_param)} params "
+                    f"from pretrained checkpoint (group layout mismatch; LRs reset)"
+                )
         del optimizer_data
         for group, base_lr in zip(optimizer.param_groups, base_lrs):
             group["lr"] = base_lr
-        print0(
-            "Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)"
-        )
+        if loaded_momentum:
+            print0(
+                "Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)"
+            )
     else:
         print0(
             "WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)"

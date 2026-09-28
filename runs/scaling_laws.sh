@@ -68,12 +68,21 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
         else
             DEVICE_BATCH_SIZE_ARG="--device-batch-size=32"
         fi
+        # DiffusionBlocks engine is on by default; scale the block count with depth.
+        if [ $d -ge 26 ]; then
+            DB_BLOCKS_ARG="--db-blocks=8"
+        elif [ $d -ge 16 ]; then
+            DB_BLOCKS_ARG="--db-blocks=6"
+        else
+            DB_BLOCKS_ARG="--db-blocks=4"
+        fi
 
         # Record start time
         START_TIME=$(date +%s)
 
-        # Train the model with fixed flops budget
-        # The script will auto-calculate num_iterations to hit target_flops
+        # Train the model with fixed flops budget.
+        # LC-QAT, SparseProp, and DiffusionBlocks are on by default in this fork;
+        # the script auto-calculates num_iterations to hit target_flops.
         # CORE eval happens once at the end (999999 ensures only final step)
         torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- \
             --depth=$d \
@@ -86,6 +95,7 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
             --core-metric-max-per-task=-1 \
             --sample-every=-1 \
             --save-every=-1 \
+            --db-blocks=${DB_BLOCKS_ARG#--db-blocks=} \
             $DEVICE_BATCH_SIZE_ARG \
             2>&1 | tee "$RESULTS_DIR/${TAG}_train.log"
 

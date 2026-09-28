@@ -15,7 +15,7 @@ if [ -z "$SKIP_SETUP" ]; then
     command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
     [ -d ".venv" ] || uv venv
     # gpu extra was dropped from pyproject; re-add it there for CUDA boxes
-uv sync --extra cpu
+    uv sync --extra cpu
     source .venv/bin/activate
 
     # Tokenizer, download 1000 shards for pretraining
@@ -66,7 +66,16 @@ for d in "${DEPTHS[@]}"; do
     else
         DEVICE_BATCH_SIZE_ARG="--device-batch-size=32"
     fi
+    # DiffusionBlocks engine is on by default; scale the block count with depth.
+    if [ $d -ge 26 ]; then
+        DB_BLOCKS_ARG="--db-blocks=8"
+    elif [ $d -ge 16 ]; then
+        DB_BLOCKS_ARG="--db-blocks=6"
+    else
+        DB_BLOCKS_ARG="--db-blocks=4"
+    fi
 
+    # LC-QAT, SparseProp, and DiffusionBlocks are on by default in this fork.
     torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- \
         --depth=$d \
         --run="${WANDB_RUN}_d${d}" \
@@ -75,6 +84,7 @@ for d in "${DEPTHS[@]}"; do
         --core-metric-max-per-task=-1 \
         --sample-every=-1 \
         --save-every=-1 \
+        --db-blocks=${DB_BLOCKS_ARG#--db-blocks=} \
         $DEVICE_BATCH_SIZE_ARG \
         2>&1 | tee "$RESULTS_DIR/${TAG}_train.log"
 

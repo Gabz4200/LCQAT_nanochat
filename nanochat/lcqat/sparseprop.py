@@ -81,7 +81,7 @@ class SparsePropLinearFunction(torch.autograd.Function):
 
         grad_y_flat = grad_y.reshape(B, out_f)
         grad_y_t = grad_y_flat.t().contiguous()  # [out_f, B]
-        x_t = x_flat.t().contiguous()            # [in_f, B]
+        x_t = x_flat.t().contiguous()  # [in_f, B]
 
         # Gather sparse weight values (CSR order for dW, CSC order for dX)
         w_val = gather_values_from_dense(weight, ctx.w_col, ctx.w_ptr, out_f)
@@ -107,7 +107,7 @@ class SparsePropLinearFunction(torch.autograd.Function):
         # Transpose gradients back to standard layout
         gX_flat = gX_t.t().contiguous()  # [B, in_f]
         # Restore original input batch shape
-        if hasattr(ctx, 'x_shape') and ctx.x_shape != gX_flat.shape:
+        if ctx.x_shape != gX_flat.shape:
             gX = gX_flat.reshape(*ctx.x_shape)
         else:
             gX = gX_flat
@@ -171,8 +171,8 @@ class SparsePropLinear(Linear):
     def _build_sparse_structure(self):
         """Rebuild CSR/CSC index buffers from current mask."""
         mask = self.sparsity_mask
-        self.w_ptr, self.w_col, self.w_ptr_csc, self.w_row = (
-            build_csr_csc_from_mask(mask)
+        self.w_ptr, self.w_col, self.w_ptr_csc, self.w_row = build_csr_csc_from_mask(
+            mask
         )
 
     def _apply_mask(self):
@@ -200,7 +200,9 @@ class SparsePropLinear(Linear):
         )
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, sparsity: float = 0.75) -> "SparsePropLinear":
+    def from_linear(
+        cls, linear: nn.Linear, sparsity: float = 0.75
+    ) -> "SparsePropLinear":
         """Convert an existing nn.Linear to SparsePropLinear.
 
         Copies weight/bias and applies a random sparsity mask. All weight
@@ -351,7 +353,11 @@ def _init_sparsity_mask(module: SparsePropLinear, sparsity: float) -> None:
         row_sums = mask.sum(dim=1)
         for i in range(mask.shape[0]):
             if row_sums[i] == 0:
-                j = int(torch.randint(mask.shape[1], (1,), device=module.weight.device).item())
+                j = int(
+                    torch.randint(
+                        mask.shape[1], (1,), device=module.weight.device
+                    ).item()
+                )
                 mask[i, j] = True
         module.sparsity_mask.copy_(mask)
         module._apply_mask()
@@ -417,10 +423,14 @@ def inject_sparseprop_layers(
             continue
 
         if kind == "linear":
-            assert isinstance(module, nn.Linear), f"Expected nn.Linear, got {type(module)}"
+            assert isinstance(module, nn.Linear), (
+                f"Expected nn.Linear, got {type(module)}"
+            )
             new_module = SparsePropLinear.from_linear(module, sparsity=sparsity)
         elif kind == "lcqat":
-            assert isinstance(module, LCQATLinear), f"Expected LCQATLinear, got {type(module)}"
+            assert isinstance(module, LCQATLinear), (
+                f"Expected LCQATLinear, got {type(module)}"
+            )
             new_module = SparsePropLinearLCQAT.from_lcqat(module, sparsity=sparsity)
         else:
             continue

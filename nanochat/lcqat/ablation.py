@@ -1064,7 +1064,70 @@ def _restore_magnitude(
     return (value32 / safe_norm) * magnitude
 
 
+def _vector_mixture_weights(
+    sim: torch.Tensor,
+    mode: str,
+    sharpness: float,
+    falloff_kind: str,
+) -> torch.Tensor:
+    """Mixture weights over codebook entries from cosine similarities."""
+    if mode == "softmax":
+        return _vector_softmax_weights(sim, sharpness)
+    if mode == "linear":
+        raw_weights = _vector_linear_weights(sim, sharpness)
+        return _normalize_vector_weights(raw_weights, sim, sharpness)
+    raw_weights = _vector_falloff_weights(sim, sharpness, falloff_kind)
+    return _normalize_vector_weights(raw_weights, sim, sharpness)
+
+
 # Vector LUTs
+
+
+def _validate_vector_lut_config(
+    n_points: int,
+    input_dim: int,
+    mode: str,
+    sharpness: float,
+    falloff_kind: str,
+    dtype: torch.dtype,
+    owner: str,
+) -> float:
+    """Validate shared vector-LUT constructor config. Returns finite sharpness."""
+    if isinstance(n_points, bool) or not isinstance(n_points, int):
+        raise ValueError(f"n_points must be an int, got {n_points!r}")
+    if n_points < 1:
+        raise ValueError(f"n_points must be at least 1, got {n_points}")
+
+    if isinstance(input_dim, bool) or not isinstance(input_dim, int):
+        raise ValueError(f"input_dim must be an int, got {input_dim!r}")
+    if input_dim < 1:
+        raise ValueError(f"input_dim must be at least 1, got {input_dim}")
+
+    if mode == "nearest":
+        raise ValueError(
+            "nearest mode is not differentiable with respect to the input. "
+            f"Use 'softmax', 'linear', or 'falloff' for {owner}."
+        )
+
+    if mode not in {"softmax", "linear", "falloff"}:
+        raise ValueError(
+            f"Unknown {owner} mode: {mode!r}. "
+            "Valid modes: 'softmax', 'linear', 'falloff'."
+        )
+
+    sharpness = _finite_float("sharpness", sharpness)
+    if sharpness <= 0.0:
+        raise ValueError(f"sharpness must be positive, got {sharpness}")
+
+    if falloff_kind not in FALLOFFS:
+        raise ValueError(
+            f"Unknown falloff_kind: {falloff_kind!r}. Valid kinds: {sorted(FALLOFFS)}"
+        )
+
+    if not dtype.is_floating_point:
+        raise ValueError(f"dtype must be floating point, got {dtype}")
+
+    return sharpness
 
 
 class LearnableVectorLut(nn.Module):
@@ -1118,40 +1181,15 @@ class LearnableVectorLut(nn.Module):
     ) -> None:
         super().__init__()
 
-        if isinstance(n_points, bool) or not isinstance(n_points, int):
-            raise ValueError(f"n_points must be an int, got {n_points!r}")
-        if n_points < 1:
-            raise ValueError(f"n_points must be at least 1, got {n_points}")
-
-        if isinstance(input_dim, bool) or not isinstance(input_dim, int):
-            raise ValueError(f"input_dim must be an int, got {input_dim!r}")
-        if input_dim < 1:
-            raise ValueError(f"input_dim must be at least 1, got {input_dim}")
-
-        if mode == "nearest":
-            raise ValueError(
-                "nearest mode is not differentiable with respect to the input. "
-                "Use 'softmax', 'linear', or 'falloff' for LearnableVectorLut."
-            )
-
-        if mode not in {"softmax", "linear", "falloff"}:
-            raise ValueError(
-                f"Unknown LearnableVectorLut mode: {mode!r}. "
-                "Valid modes: 'softmax', 'linear', 'falloff'."
-            )
-
-        sharpness = _finite_float("sharpness", sharpness)
-        if sharpness <= 0.0:
-            raise ValueError(f"sharpness must be positive, got {sharpness}")
-
-        if falloff_kind not in FALLOFFS:
-            raise ValueError(
-                f"Unknown falloff_kind: {falloff_kind!r}. "
-                f"Valid kinds: {sorted(FALLOFFS)}"
-            )
-
-        if not dtype.is_floating_point:
-            raise ValueError(f"dtype must be floating point, got {dtype}")
+        sharpness = _validate_vector_lut_config(
+            n_points,
+            input_dim,
+            mode,
+            sharpness,
+            falloff_kind,
+            dtype,
+            "LearnableVectorLut",
+        )
 
         self.input_dim = input_dim
         self.mode = mode
@@ -1175,20 +1213,9 @@ class LearnableVectorLut(nn.Module):
 
         sim, x_norm = _cosine_similarity_to_codebook(x, codebook)
 
-        if self.mode == "softmax":
-            weights = _vector_softmax_weights(sim, self.sharpness)
-
-        elif self.mode == "linear":
-            raw_weights = _vector_linear_weights(sim, self.sharpness)
-            weights = _normalize_vector_weights(raw_weights, sim, self.sharpness)
-
-        else:  # self.mode == "falloff"
-            raw_weights = _vector_falloff_weights(
-                sim,
-                self.sharpness,
-                self.falloff_kind,
-            )
-            weights = _normalize_vector_weights(raw_weights, sim, self.sharpness)
+        weights = _vector_mixture_weights(
+            sim, self.mode, self.sharpness, self.falloff_kind
+        )
 
         # weights: (B, K)
         # codebook: (K, C)
@@ -1252,41 +1279,15 @@ class LearnableVectorActivationLut(nn.Module):
     ) -> None:
         super().__init__()
 
-        if isinstance(n_points, bool) or not isinstance(n_points, int):
-            raise ValueError(f"n_points must be an int, got {n_points!r}")
-        if n_points < 1:
-            raise ValueError(f"n_points must be at least 1, got {n_points}")
-
-        if isinstance(input_dim, bool) or not isinstance(input_dim, int):
-            raise ValueError(f"input_dim must be an int, got {input_dim!r}")
-        if input_dim < 1:
-            raise ValueError(f"input_dim must be at least 1, got {input_dim}")
-
-        if mode == "nearest":
-            raise ValueError(
-                "nearest mode is not differentiable with respect to the input. "
-                "Use 'softmax', 'linear', or 'falloff' for "
-                "LearnableVectorActivationLut."
-            )
-
-        if mode not in {"softmax", "linear", "falloff"}:
-            raise ValueError(
-                f"Unknown LearnableVectorActivationLut mode: {mode!r}. "
-                "Valid modes: 'softmax', 'linear', 'falloff'."
-            )
-
-        sharpness = _finite_float("sharpness", sharpness)
-        if sharpness <= 0.0:
-            raise ValueError(f"sharpness must be positive, got {sharpness}")
-
-        if falloff_kind not in FALLOFFS:
-            raise ValueError(
-                f"Unknown falloff_kind: {falloff_kind!r}. "
-                f"Valid kinds: {sorted(FALLOFFS)}"
-            )
-
-        if not dtype.is_floating_point:
-            raise ValueError(f"dtype must be floating point, got {dtype}")
+        sharpness = _validate_vector_lut_config(
+            n_points,
+            input_dim,
+            mode,
+            sharpness,
+            falloff_kind,
+            dtype,
+            "LearnableVectorActivationLut",
+        )
 
         self.input_dim = input_dim
         self.mode = mode
@@ -1314,20 +1315,9 @@ class LearnableVectorActivationLut(nn.Module):
 
         sim, x_norm = _cosine_similarity_to_codebook(x, xs)
 
-        if self.mode == "softmax":
-            weights = _vector_softmax_weights(sim, self.sharpness)
-
-        elif self.mode == "linear":
-            raw_weights = _vector_linear_weights(sim, self.sharpness)
-            weights = _normalize_vector_weights(raw_weights, sim, self.sharpness)
-
-        else:  # self.mode == "falloff"
-            raw_weights = _vector_falloff_weights(
-                sim,
-                self.sharpness,
-                self.falloff_kind,
-            )
-            weights = _normalize_vector_weights(raw_weights, sim, self.sharpness)
+        weights = _vector_mixture_weights(
+            sim, self.mode, self.sharpness, self.falloff_kind
+        )
 
         # weights: (B, K)
         # ys: (K, C)

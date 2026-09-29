@@ -46,7 +46,7 @@ def kd_loss(
         teacher_logits: FP32 logits from the frozen teacher, shape (..., V).
         student_logits: logits from the quantized student, same shape.
         tau: softmax temperature; higher tau softens both distributions.
-        reduction: "mean" | "sum" | "none".
+        reduction: "batchmean" | "mean" | "sum" | "none".
 
     Returns:
         tau^2 * D_KL( softmax(Z_teacher/tau) || softmax(Z_student/tau) ),

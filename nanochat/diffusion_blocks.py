@@ -257,20 +257,21 @@ class DiffusionBlockEngine:
         from nanochat.lcqat import retrofit_model
 
         # The denoise_head is a plain nn.Linear; retrofit it in place.
-        self.denoise_head = retrofit_model(
-            self.denoise_head, layer_config
-        )
+        self.denoise_head = retrofit_model(self.denoise_head, layer_config)
         # Each NoiseConditionedBlockAdapter owns 2 Linear layers (c_fc, c_proj);
         # retrofit them too. retrofit_model returns a new module, so replace
         # the ModuleList slot in place.
         for i, adapter in enumerate(self.adapters):
             self.adapters[i] = retrofit_model(adapter, layer_config)
-        return sum(
-            1
-            for m in self.adapters
-            for sub in m.modules()
-            if sub.__class__.__name__ == "LCQATLinear"
-        ) + 1
+        return (
+            sum(
+                1
+                for m in self.adapters
+                for sub in m.modules()
+                if sub.__class__.__name__ == "LCQATLinear"
+            )
+            + 1
+        )
 
     def apply_sparseprop(
         self,
@@ -296,28 +297,41 @@ class DiffusionBlockEngine:
         )
 
         inject_sparseprop_layers(
-            self.model, sparsity=sparsity, target_modules=target_modules,
+            self.model,
+            sparsity=sparsity,
+            target_modules=target_modules,
             with_lcqat=with_lcqat,
         )
         inject_sparseprop_layers(
-            self.denoise_head, sparsity=sparsity, target_modules=target_modules,
+            self.denoise_head,
+            sparsity=sparsity,
+            target_modules=target_modules,
             with_lcqat=with_lcqat,
         )
         for i, adapter in enumerate(self.adapters):
             self.adapters[i] = inject_sparseprop_layers(
-                adapter, sparsity=sparsity, target_modules=target_modules,
+                adapter,
+                sparsity=sparsity,
+                target_modules=target_modules,
                 with_lcqat=with_lcqat,
             )
-        count = sum(
-            1 for m in self.adapters
-            for sub in m.modules()
-            if isinstance(sub, (SparsePropLinear, SparsePropLinearLCQAT))
-        ) + sum(
-            1 for m in self.model.modules()
-            if isinstance(m, (SparsePropLinear, SparsePropLinearLCQAT))
-        ) + sum(
-            1 for m in self.denoise_head.modules()
-            if isinstance(m, (SparsePropLinear, SparsePropLinearLCQAT))
+        count = (
+            sum(
+                1
+                for m in self.adapters
+                for sub in m.modules()
+                if isinstance(sub, (SparsePropLinear, SparsePropLinearLCQAT))
+            )
+            + sum(
+                1
+                for m in self.model.modules()
+                if isinstance(m, (SparsePropLinear, SparsePropLinearLCQAT))
+            )
+            + sum(
+                1
+                for m in self.denoise_head.modules()
+                if isinstance(m, (SparsePropLinear, SparsePropLinearLCQAT))
+            )
         )
         return count
 
@@ -371,9 +385,13 @@ class DiffusionBlockEngine:
         """
         for name, p in self.model.named_parameters("", recurse, remove_duplicate):
             yield name, p
-        for name, p in self.adapters.named_parameters("db_adapters", recurse, remove_duplicate):
+        for name, p in self.adapters.named_parameters(
+            "db_adapters", recurse, remove_duplicate
+        ):
             yield f"db_adapters.{name}", p
-        for name, p in self.denoise_head.named_parameters("db_denoise_head", recurse, remove_duplicate):
+        for name, p in self.denoise_head.named_parameters(
+            "db_denoise_head", recurse, remove_duplicate
+        ):
             yield f"db_denoise_head.{name}", p
 
     def parameters(self) -> list[torch.nn.Parameter]:
@@ -401,13 +419,7 @@ class DiffusionBlockEngine:
             out.append(out[-1] + len(g))
         return out
 
-    def train_step(
-        self,
-        idx: torch.Tensor,
-        targets: torch.Tensor,
-        block_idx: int | None = None,
-        attn_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def _activate_block(self, block_idx: int | None = None) -> None:
         groups = self.block_layers()
         b = torch.randint(len(groups), (1,)).item() if block_idx is None else block_idx
         active = set(groups[b])
@@ -420,6 +432,15 @@ class DiffusionBlockEngine:
             if not name.startswith("transformer.h."):
                 p.requires_grad_(True)
         self.model.train()
+
+    def train_step(
+        self,
+        idx: torch.Tensor,
+        targets: torch.Tensor,
+        block_idx: int | None = None,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        self._activate_block(block_idx)
         return self.model(idx, targets, attn_mask=attn_mask)
 
     def logprobs(
@@ -429,18 +450,7 @@ class DiffusionBlockEngine:
         block_idx: int | None = None,
     ) -> torch.Tensor:
         """Compute per-token cross-entropy loss without reduction, for RL / GRPO."""
-        groups = self.block_layers()
-        b = torch.randint(len(groups), (1,)).item() if block_idx is None else block_idx
-        active = set(groups[b])
-        for i, block in enumerate(self.model.transformer.h):
-            block.requires_grad_(i in active)
-            if i not in active:
-                for p in block.parameters():
-                    p.grad = None
-        for name, p in self.model.named_parameters():
-            if not name.startswith("transformer.h."):
-                p.requires_grad_(True)
-        self.model.train()
+        self._activate_block(block_idx)
         loss = self.model(idx, targets, loss_reduction="none")
         if loss.dim() == 1 and loss.numel() == idx.numel():
             loss = loss.view_as(idx)

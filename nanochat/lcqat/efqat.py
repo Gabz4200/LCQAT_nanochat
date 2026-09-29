@@ -21,18 +21,17 @@ from __future__ import annotations
 
 import torch.nn as nn
 
-
 # Module-name substrings that are always kept trainable (PRD 3.2 "critical
 # outlier layers"). Everything not matching these patterns is a candidate for
 # freezing once warmup elapses.
 CRITICAL_PATTERNS = (
-    "transformer.wte",     # input embedding projection
-    "value_embeds",        # value embeddings
-    "attn.c_q",            # attention query projection
-    "attn.c_k",            # attention key projection
-    "lm_head",             # final output (logit) projection
-    "backout",             # backout residual scalar
-    "smear",               # smear gate / scalar
+    "transformer.wte",  # input embedding projection
+    "value_embeds",  # value embeddings
+    "attn.c_q",  # attention query projection
+    "attn.c_k",  # attention key projection
+    "lm_head",  # final output (logit) projection
+    "backout",  # backout residual scalar
+    "smear",  # smear gate / scalar
     "resid_lambdas",
     "x0_lambdas",
 )
@@ -77,17 +76,14 @@ class SelectiveFreezer:
     def _layer_params(self) -> list[tuple[int, str, nn.Parameter]]:
         """Return (layer_index, param_name, param) for every transformer.h param."""
         params = []
+        prefix = "transformer.h."
         for name, p in self.model.named_parameters():
-            # Only consider params owned by transformer block layers.
-            if name.startswith("transformer.h.") and name[len("transformer.h.") :].isdigit() is False:
-                # extract layer index token
-                pass
-            prefix = "transformer.h."
-            if name.startswith(prefix):
-                rest = name[len(prefix) :]
-                layer_idx = int(rest.split(".", 1)[0]) if rest.split(".", 1)[0].isdigit() else -1
-                if layer_idx >= 0:
-                    params.append((layer_idx, name, p))
+            if not name.startswith(prefix):
+                continue
+            layer_token = name[len(prefix) :].split(".", 1)[0]
+            if not layer_token.isdigit():
+                continue
+            params.append((int(layer_token), name, p))
         return params
 
     def layer_bounds(self) -> tuple[int, int, int]:

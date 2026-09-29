@@ -22,6 +22,23 @@ requires_vulkan = pytest.mark.skipif(
 
 B, T, H, H_KV, D, K = 2, 16, 4, 2, 16, 15
 
+_BACKEND_CASES = [
+    (1, -1, 16),
+    (1, 4, 16),
+    (3, -1, 16),
+    (3, 4, 7),
+    (2, 0, 5),
+    (1, -1, 1),
+]
+_BACKEND_IDS = [
+    "decode-full",
+    "decode-win4",
+    "prefill-full",
+    "prefill-win4-partial",
+    "win0",
+    "first-token",
+]
+
 
 def make_case(tq: int, window_left: int, seqlen: int, seed: int = 0):
     torch.manual_seed(seed)
@@ -102,22 +119,8 @@ def test_when_dispatch_unknown_backend_then_value_error() -> None:
 
 @pytest.mark.parametrize(
     ("tq", "window_left", "seqlen"),
-    [
-        (1, -1, 16),
-        (1, 4, 16),
-        (3, -1, 16),
-        (3, 4, 7),
-        (2, 0, 5),
-        (1, -1, 1),
-    ],
-    ids=[
-        "decode-full",
-        "decode-win4",
-        "prefill-full",
-        "prefill-win4-partial",
-        "win0",
-        "first-token",
-    ],
+    _BACKEND_CASES,
+    ids=_BACKEND_IDS,
 )
 def test_when_cpu_backend_then_matches_naive(
     tq: int, window_left: int, seqlen: int
@@ -133,22 +136,8 @@ def test_when_cpu_backend_then_matches_naive(
 @requires_vulkan
 @pytest.mark.parametrize(
     ("tq", "window_left", "seqlen"),
-    [
-        (1, -1, 16),
-        (1, 4, 16),
-        (3, -1, 16),
-        (3, 4, 7),
-        (2, 0, 5),
-        (1, -1, 1),
-    ],
-    ids=[
-        "decode-full",
-        "decode-win4",
-        "prefill-full",
-        "prefill-win4-partial",
-        "win0",
-        "first-token",
-    ],
+    _BACKEND_CASES,
+    ids=_BACKEND_IDS,
 )
 def test_when_gpu_backend_then_matches_naive(
     tq: int, window_left: int, seqlen: int

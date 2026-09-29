@@ -17,3 +17,19 @@ repos:
         # run in the project env so it checks against uv.lock's pyrefly
         language: system
         entry: uv run --no-sync pyrefly check
+        pass_filenames: false
+        always_run: true
+  - repo: https://github.com/christophmeissner/pytest-pre-commit
+    rev: 1.0.0
+    hooks:
+      - id: pytest
+        name: pytest suite
+        # Run with the project env (plugins + package installed) via uv.
+        entry: uv run --no-sync pytest -q
+        language: system
+        pass_filenames: false
+        always_run: true
+  - repo: https://github.com/scanaislop/aislop
+    rev: v0.16.1
+    hooks:
+      - id: aislop

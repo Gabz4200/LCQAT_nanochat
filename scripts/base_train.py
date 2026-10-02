@@ -24,6 +24,7 @@ from dataclasses import asdict
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import wandb
 
 from nanochat.checkpoint_manager import load_checkpoint, save_checkpoint
@@ -56,8 +57,14 @@ from nanochat.lcqat import (
     retrofit_summary,
 )
 from nanochat.lcqat.efqat import SelectiveFreezer
-from nanochat.lcqat.kd import KDLoss
-from nanochat.lcqat.optimizer import build_qat_param_groups
+from nanochat.lcqat.kd import DenoiserDistiller, KDLoss
+from nanochat.lcqat.optimizer import build_qat_param_groups, verify_partition
+from nanochat.lcqat.w6 import (
+    build_denoiser_teacher,
+    describe_sigma_codebooks,
+    install_sigma_codebooks,
+    make_latch_freezer,
+)
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.tokenizer import get_token_bytes, get_tokenizer
 from scripts.base_eval import evaluate_core
@@ -99,9 +106,17 @@ parser.add_argument(
 parser.add_argument(
     "--lcqat-preset",
     type=str,
-    default="small",
-    choices=["small", "prd"],
-    help="per-layer K allocation: small (max compression, default) or prd (PRD table: 8-bit down_proj)",
+    default="asym",
+    choices=["asym", "small", "prd"],
+    help=(
+        "per-layer K allocation. 'asym' (default) uses the same total level "
+        "counts as 'small' but splits them by sign: m_neg=0 for the two "
+        "non-negative MLP tensors (`relu(x).square()` feeds mlp.c_proj), which "
+        "turns a symmetric 15 with 7 dead levels into 8 usable ones. 'small' is "
+        "the symmetric maximum-compression table, 'prd' is the PRD table "
+        "(8-bit down_proj). Each K also accepts an explicit split via "
+        "--lcqat-k-map, e.g. '0-7/0-7'."
+    ),
 )
 parser.add_argument(
     "--lcqat-k-map",
@@ -114,6 +129,21 @@ parser.add_argument(
     type=float,
     default=1e-3,
     help="learning rate for codebook step parameters (PRD: 10-50x network weights)",
+)
+parser.add_argument(
+    "--codebook-grad-scale",
+    type=str,
+    default="inv_sqrt_n",
+    choices=["none", "inv_sqrt_n"],
+    help=(
+        "PRD 2.4 codebook gradient scaling. 'inv_sqrt_n' (default) scales the "
+        "codebook gradient by 1/sqrt(numel) -- in a 4096x4096 layer 16.7M "
+        "elements pool into one K-entry codebook, and unscaled the step "
+        "parameters oscillate relative to the weights. 'none' uses the plain "
+        "STE. Note the two interact multiplicatively with --codebook-lr: with "
+        "N = B*T*D in the millions the activation codebook gradient is ~1000x "
+        "smaller under 'inv_sqrt_n', so this is a real trade, not a free win."
+    ),
 )
 # Knowledge Distillation (PRD 3.1)
 parser.add_argument(
@@ -131,8 +161,12 @@ parser.add_argument(
 parser.add_argument(
     "--kd-alpha",
     type=float,
-    default=0.1,
-    help="weight of the KL-distillation term (PRD 3.1): L_total = (1-a)*CE + a*KD",
+    default=0.0,
+    help=(
+        "weight of the KL-distillation term (PRD 3.1): L_total = (1-a)*CE + a*KD. "
+        "0.0 disables KD. A value > 0 requires --kd-teacher-source and "
+        "--kd-teacher-tag, and is incompatible with --db-objective edm."
+    ),
 )
 parser.add_argument(
     "--kd-temperature",
@@ -140,6 +174,9 @@ parser.add_argument(
     default=2.0,
     help="softmax temperature for KL distillation (PRD 3.1)",
 )
+# Denoiser distillation: the EDM-native form of the same anchor. --kd-alpha
+# needs logits, which the denoising objective never produces, so this is a
+# separate opt-in path rather than a reuse of it. Registered in add_w6_args.
 # EfQAT selective layer freezing (PRD 3.2)
 parser.add_argument(
     "--efqat-freeze-after",
@@ -160,12 +197,27 @@ parser.add_argument(
     default=0.75,
     help="sparsity level for SparseProp (fraction of weights pruned, 0.0-1.0)",
 )
+# Scope / gradual schedule / dense-below-threshold. Registered through the
+# shared helper so base_train, chat_sft and chat_rl cannot drift apart.
+from nanochat.lcqat.pruning import (  # noqa: E402
+    add_sparseprop_pruning_args,
+    schedule_from_args,
+)
+
+add_sparseprop_pruning_args(parser)
 parser.add_argument(
     "--efqat-freeze-frac",
     type=float,
     default=0.5,
     help="fraction of middle transformer layers to freeze (PRD 3.2)",
 )
+# W6 DiffusionBlocks features (sigma codebooks / EfQAT per-block latching /
+# denoiser KD) plus --lcqat-channel-center. Registered through the shared
+# helper so base_train, chat_sft and chat_rl cannot drift apart on the same
+# hardware knob, the same argument add_sparseprop_pruning_args makes above.
+from nanochat.lcqat.w6 import add_w6_args  # noqa: E402
+
+add_w6_args(parser)
 # Model architecture
 parser.add_argument(
     "--depth", type=int, default=20, help="depth of the Transformer model"
@@ -234,6 +286,44 @@ parser.add_argument(
     help="number of diffusion blocks for block-wise training (default: 4)",
 )
 parser.add_argument(
+    "--db-objective",
+    type=str,
+    default="edm",
+    choices=["edm", "ce"],
+    help=(
+        "block-wise training objective. 'edm' (default) is the DiffusionBlocks "
+        "method: only the active block's layers run, so activations are "
+        "O(L/B) instead of O(L), and the block is trained by score matching "
+        "against its own equi-probability noise range. 'ce' is the escape "
+        "hatch: a full-depth next-token cross-entropy with block-isolated "
+        "gradients, which saves backward memory but no forward FLOPs and gives "
+        "no noise-range specialization."
+    ),
+)
+parser.add_argument(
+    "--db-overlap",
+    type=float,
+    default=0.1,
+    help=(
+        "log-sigma overlap extension gamma between adjacent blocks "
+        "(DiffusionBlocks App. C). 0.0 = disjoint intervals, larger = smoother "
+        "transitions. Paper uses 0.05 for vision/diffusion, 0.1 for text."
+    ),
+)
+parser.add_argument(
+    "--db-block-sampling",
+    type=str,
+    default="step",
+    choices=["step", "micro"],
+    help=(
+        "when to draw the active block. 'step' (default) draws once per "
+        "optimizer step, so every micro-step in a step trains the same block. "
+        "'micro' redraws per micro-step, which degrades block-wise training "
+        "into ordinary gradient accumulation (memory saving kept, noise-range "
+        "specialization lost)."
+    ),
+)
+parser.add_argument(
     "--weight-decay",
     type=float,
     default=0.28,
@@ -250,6 +340,12 @@ parser.add_argument(
     type=float,
     default=0.5,
     help="learning rate for scalars (resid_lambdas, x0_lambdas)",
+)
+parser.add_argument(
+    "--init-lr-frac",
+    type=float,
+    default=0.01,
+    help="initial LR as a fraction of the base LR, ramped up during warmup",
 )
 parser.add_argument(
     "--warmup-steps", type=int, default=40, help="number of steps for LR warmup"
@@ -318,6 +414,10 @@ parser.add_argument(
 )
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+# The SparseProp pruning schedule: scope, gradual ramp, dense-below-threshold.
+# Built here (right after parsing) so every setup path sees the same object and
+# the training loop can call `sparse_schedule.apply(engine, step)`.
+sparse_schedule = schedule_from_args(args)
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -431,13 +531,95 @@ if resuming:
     lcqat_active = prepare_lcqat_before_load(
         model, model_data, meta_data.get("lcqat"), lcqat_requested
     )
-    model.load_state_dict(model_data, strict=True, assign=True)
+    # The diffusion engine owns db_adapters.* / db_denoise_head.* on top of the
+    # bare GPT; those keys do not belong in the base model's state_dict.
+    # checkpoint_manager.build_model does the same strip.
+    # SparseProp must be injected BEFORE the load, not after: the checkpoint
+    # carries `sparsity_mask` / `w_ptr` / `w_col` / `w_ptr_csc` / `w_row` as
+    # persistent buffers, so loading into a model that has not been injected yet
+    # fails with "unexpected key(s)". Injecting here also means the saved mask is
+    # what gets used -- previously the mask was non-persistent, so a resume
+    # silently re-rolled a random pattern while reusing the checkpoint's weights.
+    if args.sparseprop:
+        from nanochat.lcqat.sparseprop import inject_sparseprop_layers
+
+        inject_sparseprop_layers(
+            model,
+            sparsity=args.sparseprop_sparsity,
+            with_lcqat=lcqat_active is not None,
+        )
+        # No pruning here: the mask built above is a placeholder that
+        # load_state_dict immediately overwrites with the checkpoint's own. A
+        # gradual ramp resumes from its position in the global step counter, so
+        # it needs no per-layer state either.
+        resumed_sparse = True
+    else:
+        resumed_sparse = False
+    base_model_data = {
+        k: v
+        for k, v in model_data.items()
+        if not k.startswith("db_adapters.")
+        and not k.startswith("db_denoise_heads.")
+        and not k.startswith("db_denoise_head.")
+    }
+    model.load_state_dict(base_model_data, strict=True, assign=True)
     if lcqat_active is None:
         lcqat_active = finish_lcqat_after_load(model, lcqat_requested)
-    del model_data  # free up this memory after the copy
+    # The block partition is checkpoint provenance, not a fresh choice: resuming
+    # with a different --db-blocks would silently re-partition the model and
+    # change which parameters receive gradients every micro-step.
+    resumed_db_blocks = (meta_data.get("db") or {}).get("num_blocks")
+    del model_data, base_model_data  # free up this memory after the copy
 elif lcqat_requested is not None:
     retrofit_model(model, lcqat_requested)
+    # D9: attach the learned activation tables. Must run after `retrofit_model`
+    # (it walks the LCQATLinear pairs) and *unconditionally* -- gating on
+    # "are the flags non-default" would skip the table when both flags are at
+    # their defaults, which is exactly the case that needs a trainable table to
+    # exist at all. Attaching with the defaults is a value no-op: the table
+    # starts at the same bake export would have produced.
+    from nanochat.lcqat.export import attach_learnable_activation_luts
+
+    n_luts = attach_learnable_activation_luts(
+        model,
+        relaxation=lcqat_requested.lut_relaxation,
+        act_body=lcqat_requested.act_body,
+    )
+    print0(f"Learned activation LUTs attached: {n_luts}")
     lcqat_active = lcqat_requested
+    # Fresh run: inject SparseProp into the base transformer here so the two
+    # retrofit passes are symmetric with the resume branch above. Must run after
+    # the LC-QAT retrofit, since `with_lcqat=True` wraps the LCQATLinears.
+    if args.sparseprop:
+        from nanochat.lcqat.sparseprop import inject_sparseprop_layers
+
+        inject_sparseprop_layers(
+            model,
+            sparsity=args.sparseprop_sparsity,
+            with_lcqat=True,
+        )
+    resumed_sparse = False
+resumed_db_blocks = resumed_db_blocks if resuming else None
+if resuming and args.sparseprop:
+    # A checkpoint trained without sparsity has no mask buffers to load, so the
+    # freshly-injected mask is what will be used. State that rather than
+    # letting it look like a restored pattern.
+    ckpt_sparse = (meta_data or {}).get("sparseprop", {}).get("enabled")
+    if ckpt_sparse is not True:
+        print0(
+            "SparseProp resumed with a freshly-built magnitude mask: the "
+            "checkpoint did not record sparsity (this is expected on a first "
+            "resume from a pre-SparseProp run)"
+        )
+elif args.sparseprop:
+    # Fresh run: apply the schedule's initial target (one-shot at the full
+    # sparsity unless --sparseprop-start-frac ramps it in).
+    achieved = sparse_schedule.apply(model, 0)
+    if achieved is not None:
+        print0(
+            f"SparseProp pruned to {achieved:.4f} sparsity "
+            f"(scope={sparse_schedule.scope}, magnitude criterion)"
+        )
 if lcqat_active is not None:
     print0(f"LC-QAT enabled: {retrofit_summary(model)}")
 
@@ -537,31 +719,84 @@ orig_model = model  # original, uncompiled model, for saving raw model state_dic
 
 # Initialize DiffusionBlocks Engine for block-wise training
 num_db_blocks = min(args.db_blocks, args.depth)
+if resumed_db_blocks is not None and resumed_db_blocks != num_db_blocks:
+    raise SystemExit(
+        f"--db-blocks {num_db_blocks} does not match the checkpoint's "
+        f"{resumed_db_blocks} blocks; the block partition is checkpoint "
+        "provenance and cannot be changed on resume"
+    )
 partitioner = EquiProbabilityPartitioner(
     num_blocks=num_db_blocks,
     sigma_min=0.002,
     sigma_max=80.0,
     sigma_data=0.5,
 )
-engine = DiffusionBlockEngine(model, partitioner)
+# device/dtype: the engine owns adapters + denoise heads, which are created here.
+# Without them they land on CPU while their siblings are on `device`, and since
+# they are in the optimizer but never see a forward on that device, their .grad
+# stays None and AdamW silently skips them forever.
+engine = DiffusionBlockEngine(model, partitioner, device=device, dtype=COMPUTE_DTYPE)
 print0(f"Initialized DiffusionBlocks Engine with {num_db_blocks} independent blocks")
 
 # PRD: "the only training method that exists must use it" — when LC-QAT is
-# enabled, retrofit the engine-owned Linear layers (adapters + denoise_head)
+# enabled, retrofit the engine-owned Linear layers (adapters + denoise heads)
 # too, so the whole training pipeline is LC-QAT.
 if lcqat_active is not None:
     n_lcqat = engine.apply_lcqat(lcqat_active)
     print0(f"LC-QAT retrofitted {n_lcqat} diffusion-engine Linear layers")
 
-# SparseProp: unstructured sparsity with AVX2 sparse backprop.
-# When LC-QAT is active, wrap LCQATLinear as SparsePropLinearLCQAT so the
-# codebook quantizers + sparse backprop coexist in the same module.
+# Sigma-conditioned activation codebooks (PRD 3.2). Opt-in: a DiffusionBlocks
+# engine's blocks train on disjoint noise ranges, so one activation codebook has
+# to span all of them, and most of its levels are spent on values that never
+# occur. Two mechanisms with very different costs, so both are opt-in and the
+# default recipe is untouched.
+if args.db_sigma_codebook:
+    num_anchors = args.db_sigma_anchors or num_db_blocks
+    n_conditioned = install_sigma_codebooks(
+        engine, args.db_sigma_codebook, args.db_sigma_anchors, num_db_blocks
+    )
+    print0(
+        f"sigma-conditioned activation codebooks: {args.db_sigma_codebook} on "
+        f"{n_conditioned} layers"
+        + (f", {num_anchors} anchors" if num_anchors > 1 else "")
+    )
+
+# SparseProp on the engine-owned layers (adapters + per-block denoise heads).
+# The base transformer is handled separately: on a fresh run by the injection
+# below, and on a resume by the pre-load injection in the resume branch, which
+# has to happen before load_state_dict can see the checkpoint's mask buffers.
 if args.sparseprop:
     n_sparse = engine.apply_sparseprop(
         sparsity=args.sparseprop_sparsity,
         with_lcqat=lcqat_active is not None,
     )
     print0(f"SparseProp injected {n_sparse} sparse Linear layers")
+    # `inject_sparseprop_layers` places a per-layer magnitude mask as a
+    # placeholder. The base transformer's masks were already set above; this
+    # only touches the engine-owned layers (adapters + per-block denoise heads),
+    # and on a resume it is skipped so the checkpoint's masks survive.
+    if not resuming:
+        engine_achieved = sparse_schedule.apply(engine, 0)
+        if engine_achieved is not None:
+            print0(
+                f"SparseProp pruned engine layers to {engine_achieved:.4f} "
+                f"sparsity (scope={sparse_schedule.scope})"
+            )
+
+
+# Denoiser distillation teacher (PRD 3.1, EDM form). Taken *here*, before the
+# retrofits below, so on a fresh run the copy is already float: LC-QAT codebooks
+# and SparseProp sparsity are exactly what --kd-denoiser-alpha measures.
+float_twin, n_twin_stripped = (None, 0)
+if args.kd_denoiser_alpha > 0.0:
+    float_twin, n_twin_stripped = build_denoiser_teacher(
+        engine, args.kd_denoiser_alpha, args.db_objective
+    )
+    print0(
+        f"KD denoiser twin: float copy of the engine "
+        f"({n_twin_stripped} LC-QAT layers stripped)"
+    )
+
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -611,6 +846,13 @@ if total_batch_size == -1:
     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
 
 # 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
+# AdamW LRs scale with 1/sqrt(n_embd), tuned at 768 (same recipe the LC-QAT
+# optimizer port carries over).
+dmodel_lr_scale = (model_config.n_embd / 768) ** -0.5
+print0(
+    f"Scaling the AdamW LRs by 1/sqrt({model_config.n_embd}/768) = {dmodel_lr_scale:.6f}"
+)
+
 batch_lr_scale = 1.0
 batch_ratio = total_batch_size / B_REF  # B/B_ref
 if batch_ratio != 1.0:
@@ -646,6 +888,18 @@ param_groups = build_qat_param_groups(
     codebook_lr=args.codebook_lr * batch_lr_scale,
     matrix_betas=(0.8, 0.95),
     matrix_eps=1e-10,
+    embedding_lr=args.embedding_lr,
+    unembedding_lr=args.unembedding_lr,
+    scalar_lr=args.scalar_lr,
+    dmodel_lr_scale=dmodel_lr_scale,
+)
+# Fail here rather than shipping a run where a whole role silently never trains
+# (which is what happened to --embedding-lr/--unembedding-lr/--scalar-lr while
+# the group builder emitted only matrix + codebook).
+verify_partition(engine, param_groups)
+print0(
+    "Optimizer groups: "
+    + ", ".join(f"{g['role']}={len(g['params'])}" for g in param_groups)
 )
 optimizer = torch.optim.AdamW(
     param_groups,
@@ -667,9 +921,7 @@ if resuming:
         saved_param_count = sum(
             len(g["params"]) for g in optimizer_data.get("param_groups", [])
         )
-        current_param_count = sum(
-            len(g["params"]) for g in optimizer.param_groups
-        )
+        current_param_count = sum(len(g["params"]) for g in optimizer.param_groups)
         if saved_param_count != current_param_count:
             # Different param count (different architecture/stage, e.g. a
             # Muon-based pretrain checkpoint vs. the current AdamW-only
@@ -687,9 +939,7 @@ if resuming:
             # per Parameter identity and keep our fresh param groups
             # (LRs, betas, weight decay) intact.
             id_to_param = {
-                id(p): p
-                for group in optimizer.param_groups
-                for p in group["params"]
+                id(p): p for group in optimizer.param_groups for p in group["params"]
             }
             copied = 0
             for pid, state in optimizer_data.get("state", {}).items():
@@ -712,13 +962,39 @@ if resuming:
 # a separate checkpoint so it stays float (no codebook deltas).
 kd_loss_fn: KDLoss | None = None
 if args.kd_alpha > 0.0:
+    # The objective conflict is checked FIRST, before the teacher prerequisite.
+    # Both are real and both must block the run, but they are not equally
+    # informative: "kd-alpha is incompatible with edm" is a statement about the
+    # two flags the user actually typed, whereas "requires --kd-teacher-source"
+    # asks for a third flag they may not have been thinking about. Checking the
+    # prerequisite first masks the incompatibility behind an unrelated error --
+    # which is exactly what happened: `--kd-alpha 0.5 --db-objective edm`
+    # reported only the missing teacher, and a user who then supplied one was
+    # told about the objective conflict only on the next run.
+    #
+    # It also avoids a pointless checkpoint load for a configuration that is
+    # going to exit regardless.
+    if args.db_objective == "edm":
+        # Fail loudly at startup. The logit-KD loss is a cross-entropy against
+        # the teacher's softmax over tokens; the EDM objective predicts a
+        # denoised embedding and has no logits, so the two cannot be combined.
+        # Silently skipping would look like KD "not helping" rather than "never
+        # applied".
+        raise SystemExit(
+            "--kd-alpha > 0 (logit KL against an FP teacher) is incompatible with "
+            "--db-objective edm, which predicts denoised embeddings rather than "
+            "next-token logits. Use --db-objective ce with KD, or drop --kd-alpha "
+            "to use the EDM objective. For an anchor under the EDM objective, use "
+            "--kd-denoiser-alpha, which distills the float denoiser instead."
+        )
     if args.kd_teacher_source is None or args.kd_teacher_tag is None:
         raise SystemExit(
             "--kd-alpha > 0 requires --kd-teacher-source and --kd-teacher-tag"
         )
     if lcqat_active is None:
         raise SystemExit(
-            "KD anchoring (PRD 3.1) requires LC-QAT; pass --lcqat"
+            "KD anchoring (PRD 3.1) requires LC-QAT; LC-QAT is on by default -- "
+            "drop --no-lcqat to enable it"
         )
     teacher_checkpoint_dir = os.path.join(
         get_base_dir(), "checkpoints", args.kd_teacher_source
@@ -735,13 +1011,18 @@ if args.kd_alpha > 0.0:
     teacher = GPT(teacher_config)
     # Teacher is float; load raw weights (strip compiled _orig_mod prefix).
     with torch.no_grad():
-        clean_state = {k.removeprefix("_orig_mod."): v for k, v in teacher_state.items()}
+        clean_state = {
+            k.removeprefix("_orig_mod."): v for k, v in teacher_state.items()
+        }
         teacher.load_state_dict(clean_state, strict=False)
     teacher.to(device=device, dtype=COMPUTE_DTYPE)
     teacher.eval()
     kd_loss_fn = KDLoss(teacher, alpha=args.kd_alpha, tau=args.kd_temperature)
     del teacher_state
     print0(f"KD teacher loaded: alpha={args.kd_alpha}, tau={args.kd_temperature}")
+
+# The `--kd-alpha` / `--db-objective edm` incompatibility is checked at the top of
+# the `kd_alpha > 0` block above, before the teacher is loaded.
 
 # -----------------------------------------------------------------------------
 # EfQAT selective layer freezing (PRD 3.2): freeze middle-layer codebook +
@@ -758,6 +1039,48 @@ if lcqat_active is not None and args.efqat_freeze_after >= 0:
         f"EfQAT selective freezing enabled: freezing after {args.efqat_freeze_after} steps "
         f"(middle {args.efqat_freeze_frac:.0%} of {len(efqat_freezer.model.transformer.h)} layers)"
     )
+    # The engine consults the freezer before enabling a block, so the freeze
+    # survives; previously `_activate_block` re-enabled everything each step.
+    engine.set_freezer(efqat_freezer)
+
+# -----------------------------------------------------------------------------
+# Denoiser distillation (PRD 3.1, EDM form): hand the frozen float twin to the
+# engine, which adds the KD term to the EDM objective inside `denoise_step`.
+# Defined unconditionally because the per-step logging reads it on every step,
+# not only on the ones where the anchor is installed.
+kd_denoiser = None
+if float_twin is not None:
+    kd_denoiser = DenoiserDistiller(float_twin, alpha=args.kd_denoiser_alpha)
+    engine.set_distiller(kd_denoiser)
+    print0(
+        f"KD denoiser distillation enabled: alpha={args.kd_denoiser_alpha}, "
+        f"anchor = w(sigma)*||D_quant - D_float||^2 on the same noisy input"
+    )
+
+# -----------------------------------------------------------------------------
+# EfQAT per-block permanent latching (PRD 3.2). The middle-band freezer above
+# is global and one-shot; this one is per diffusion block and, crucially,
+# *permanent*: once a block's noise range is specialized, its quantization
+# parameters must never move again, however many later steps resample it. That
+# only holds if the veto runs inside `_requires_grad_for`, i.e. before
+# `_activate_block` re-enables the block -- which `set_freezer` arranges.
+block_latch_freezer = None
+efqat_latch_targets: list[int] = []
+if lcqat_active is not None:
+    block_latch_freezer, efqat_latch_targets = make_latch_freezer(
+        engine, args.efqat_latch_blocks, num_db_blocks
+    )
+if block_latch_freezer is not None:
+    print0(
+        f"EfQAT per-block latch enabled: blocks {efqat_latch_targets} freeze "
+        f"permanently at step {max(args.efqat_latch_after, 0)}"
+    )
+    # Latches are not recoverable from the state_dict -- a frozen parameter
+    # looks exactly like a converged one -- so a resumed run would silently
+    # start training a block the previous run had retired.
+    if resuming and meta_data:
+        block_latch_freezer.load_metadata(meta_data.get("efqat_latch"))
+    engine.set_freezer(block_latch_freezer)
 
 # -----------------------------------------------------------------------------
 # GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
@@ -867,6 +1190,23 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(
     f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}"
 )
+if args.db_block_sampling == "micro" and grad_accum_steps > 1:
+    print0(
+        "WARNING: --db-block-sampling micro with gradient accumulation is LOSSY, "
+        "not just a different sampling strategy. `_apply_requires_grad` clears "
+        "p.grad for parameters the active block does not own, so each micro-step "
+        "erases the previous one's gradients and only the last block sampled "
+        "contributes to the optimizer step. Use the default 'step' unless you "
+        "are reproducing the ablation."
+    )
+
+# Packed batches arrive as document boundaries; `block_diagonal_mask` turns them
+# into a causal + same-document mask so a document cannot attend across a
+# neighbour's tokens. `denoise_step` calls the transformer blocks directly, so
+# the mask has to be handed to it explicitly (the CE path threads it through
+# GPT.forward). None means "no packing": the model's attention is already
+# causal, so a full causal mask would be a no-op.
+train_attn_mask: torch.Tensor | None = None
 
 # Go!
 while True:
@@ -940,11 +1280,13 @@ while True:
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        engine = Engine(orig_model, tokenizer)  # use orig_model to avoid recompilation
+        # `ar_engine` is the autoregressive sampler; it must not shadow the
+        # DiffusionBlockEngine bound to `engine`, which is what train_step runs on.
+        ar_engine = Engine(orig_model, tokenizer)  # orig_model avoids recompilation
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(
+                sample, _ = ar_engine.generate_batch(
                     tokens, num_samples=1, max_tokens=16, temperature=0
                 )
             print0(tokenizer.decode(sample[0]))
@@ -960,23 +1302,51 @@ while True:
         save_checkpoint(
             checkpoint_dir,
             step,
-            orig_model.state_dict(),  # model parameters
+            # engine.state_dict(), not orig_model.state_dict(): the engine owns
+            # db_adapters.* / db_denoise_heads.* on top of the bare GPT, and meta
+            # below declares meta["db"]. Saving the bare model writes a
+            # checkpoint that claims a diffusion engine but carries none of its
+            # parameters, so every resume silently reloads zero adapters/heads.
+            engine.state_dict(),
             optimizer.state_dict(),  # optimizer state
             {  # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb,  # loss at last step
                 "model_config": model_config_kwargs,
                 "user_config": user_config,  # inputs to the training script
-                "lcqat": asdict(lcqat_active) if lcqat_active is not None else None,
+                "lcqat": lcqat_active.as_dict() if lcqat_active is not None else None,
+                # KD anchoring state. Two independent, incompatible-in-practice
+                # anchors: `alpha` is the logit KL (CE objective), `denoiser_alpha`
+                # is the float-twin denoiser anchor (EDM objective). Both default
+                # to 0.0 = off, and both are recorded so a resume can see that a
+                # run's objective differs from the default rather than silently
+                # changing it.
+                "kd": {
+                    "alpha": args.kd_alpha,
+                    "tau": args.kd_temperature,
+                    "denoiser_alpha": args.kd_denoiser_alpha,
+                },
                 "db": {
                     "num_blocks": num_db_blocks,
                     "sigma_min": 0.002,
                     "sigma_max": 80.0,
                     "sigma_data": 0.5,
                 },
+                # EfQAT per-block latch: which blocks have been permanently
+                # retired. Metadata only -- the tensors themselves are already
+                # in engine.state_dict() -- but the freeze decision is not
+                # recoverable from tensor values, so it has to be written out
+                # or a resume silently restarts training a converged block.
+                "efqat_latch": engine.freezer_metadata(),
+                "sigma_codebook": describe_sigma_codebooks(args),
                 "sparseprop": {
                     "enabled": args.sparseprop,
                     "sparsity": args.sparseprop_sparsity,
+                    "scope": sparse_schedule.scope,
+                    "start_frac": sparse_schedule.start_frac,
+                    "every": sparse_schedule.every,
+                    "ramp_steps": sparse_schedule.ramp_steps,
+                    "dense_threshold": sparse_schedule.dense_threshold,
                 },
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
@@ -1000,20 +1370,93 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
-    # EfQAT: drive the selective freezer from the global step (PRD 3.2).
+    # EfQAT: drive the selective freezer from the global step (PRD 3.2), then
+    # hand it to the engine as the single `requires_grad` arbiter. Without the
+    # handoff the engine re-enables every transformer parameter on the next
+    # block activation, silently undoing the freeze.
     if efqat_freezer is not None:
-        efqat_freezer.update(step)
+        if efqat_freezer.update(step):
+            n_frozen = sum(1 for p in engine.parameters() if not p.requires_grad)
+            print0(f"EfQAT froze {n_frozen} parameters at step {step}")
+    # EfQAT per-block latch (PRD 3.2). Fires before the forward, so the retired
+    # block is already frozen in the very step the latch lands; latching after
+    # the forward would let one more update through. `>=` rather than `==` so a
+    # resumed run (which starts above the threshold) still latches, and
+    # `latch_blocks` is idempotent so the re-fire is free.
+    if block_latch_freezer is not None and step >= max(args.efqat_latch_after, 0):
+        n_new = block_latch_freezer.latch_blocks(efqat_latch_targets)
+        if n_new:
+            print0(
+                f"EfQAT latched blocks {efqat_latch_targets} permanently at step "
+                f"{step} ({n_new} parameters frozen; total latched: "
+                f"{block_latch_freezer.latched_blocks()})"
+            )
+    # Gradual magnitude pruning. Runs BEFORE the forward so the mask and the
+    # forward agree in the same step, and so the weights it prunes are the ones
+    # the optimizer is about to write into. Mask changes are monotone (a pruned
+    # weight is exactly 0.0, so |W| == 0 and it can never be re-selected), which
+    # is what makes a resumed ramp safe.
+    if args.sparseprop:
+        pruned = sparse_schedule.apply(engine, step)
+        if pruned is not None:
+            n_sparse_above = len(sparse_schedule.layers_above_threshold(engine))
+            print0(
+                f"Step {step:05d} | SparseProp pruned to {pruned:.4f} sparsity; "
+                f"{n_sparse_above} layers past the "
+                f"{sparse_schedule.dense_threshold:.0%} sparse-kernel threshold"
+            )
+    # The block is drawn ONCE per optimizer step, not once per micro-step.
+    # Accumulating gradients from several blocks into one update would preserve
+    # the memory saving but destroy the noise-range specialization that
+    # DiffusionBlocks depends on.
+    block_idx = (
+        engine.sample_block()
+        if args.db_objective == "edm" and args.db_block_sampling == "step"
+        else None
+    )
+    # Hoisted out of the micro-step loop: denoise_step reuses the same (x, y)
+    # across grad_accum_steps, so the embedding lookup + L2 normalization would
+    # otherwise be redone once per micro-step.
+    clean = None
+    if args.db_objective == "edm":
+        with torch.no_grad():
+            clean = F.normalize(engine.model.transformer.wte(x).float(), dim=-1)
+
+    # Reported alongside the total so an enabled anchor is observable in the
+    # log: a KD term that stays at 0.0 for a whole run means the twin is not
+    # actually being compared against, not that the gap vanished.
+    step_kd_logged = 0.0
+
     for micro_step in range(grad_accum_steps):
-        loss = engine.train_step(x, y)
-        # Knowledge Distillation anchoring (PRD 3.1): blend an extra KL term
-        # against the frozen FP32 teacher so the quantized student follows the
-        # smooth FP32 loss manifold instead of the sharp QAT minimum.
-        if kd_loss_fn is not None:
-            with torch.no_grad():
-                teacher_logits = kd_loss_fn.teacher(x)
-            student_logits = engine.model(x, targets=None, attn_mask=None)
-            loss_kd = kd_loss_fn(student_logits, teacher_logits, y)
-            loss = (1.0 - kd_loss_fn.alpha) * loss + kd_loss_fn.alpha * loss_kd
+        if args.db_objective == "edm":
+            # `block_idx=None` under --db-block-sampling micro, which redraws
+            # per micro-step (the ablation arm).
+            loss, sigma = engine.denoise_step(
+                x,
+                block_idx=block_idx,
+                overlap=args.db_overlap,
+                attn_mask=train_attn_mask,
+                clean=clean,
+            )
+            if engine.distiller is not None:
+                step_kd_logged = step_kd_logged + float(engine.last_kd_loss)
+        elif kd_loss_fn is not None:
+            # KD anchoring needs logits, so the CE objective asks for them
+            # explicitly (targets=None) and computes the CE term here.
+            student_logits = engine.model(x, targets=None, attn_mask=train_attn_mask)
+            # Mirror GPT.forward's loss exactly: the dataloader already shifted
+            # y, so no extra shift here.
+            loss_ce = F.cross_entropy(
+                student_logits.reshape(-1, student_logits.size(-1)),
+                y.reshape(-1),
+                ignore_index=-1,
+            )
+            loss_kd = kd_loss_fn(student_logits, x)
+            loss = (1.0 - kd_loss_fn.alpha) * loss_ce + kd_loss_fn.alpha * loss_kd
+        else:
+            loss = engine.train_step(
+                x, y, block_idx=block_idx, attn_mask=train_attn_mask
+            )
         train_loss = loss.detach()  # for logging
         loss = (
             loss / grad_accum_steps
@@ -1072,8 +1515,10 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    kd_mean = step_kd_logged / max(grad_accum_steps, 1)
+    kd_str = f" | kd: {kd_mean:.6f}" if kd_denoiser else ""
     print0(
-        f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time / 60:.2f}m{eta_str}"
+        f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{kd_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time / 60:.2f}m{eta_str}"
     )
     if step % 100 == 0:
         log_data = {
@@ -1087,6 +1532,18 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        # The float-vs-quantized denoiser gap this step's anchor actually saw.
+        # Logged separately from `train/loss` because the returned loss mixes it
+        # with the data term, so a silently-dead anchor is otherwise invisible.
+        if kd_denoiser is not None:
+            log_data["train/kd_denoiser"] = kd_mean
+        # EfQAT latch progress: how many diffusion blocks have been permanently
+        # retired. Plateaus at `num_db_blocks` once all of them have finished
+        # specializing to their noise range.
+        if block_latch_freezer is not None:
+            log_data["train/efqat_latched_blocks"] = float(
+                len(block_latch_freezer.latched_blocks())
+            )
         wandb_run.log(log_data)
 
     # state update

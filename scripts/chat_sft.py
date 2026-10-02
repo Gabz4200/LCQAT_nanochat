@@ -15,10 +15,10 @@ import os
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
-from dataclasses import asdict
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 import wandb
 
 from nanochat.checkpoint_manager import (
@@ -88,9 +88,14 @@ parser.add_argument(
 parser.add_argument(
     "--lcqat-preset",
     type=str,
-    default="small",
-    choices=["small", "prd"],
-    help="per-layer K allocation: small (max compression, default) or prd (PRD table)",
+    default="asym",
+    choices=["asym", "small", "prd"],
+    help=(
+        "per-layer K allocation. 'asym' (default) splits each codebook by sign, "
+        "giving m_neg=0 to the two non-negative MLP tensors so no level is spent "
+        "on a sign they never take. 'small' is the symmetric max-compression "
+        "table, 'prd' the PRD table."
+    ),
 )
 parser.add_argument(
     "--lcqat-k-map",
@@ -103,6 +108,21 @@ parser.add_argument(
     type=float,
     default=1e-3,
     help="learning rate for codebook step parameters (PRD: 10-50x network weights)",
+)
+parser.add_argument(
+    "--codebook-grad-scale",
+    type=str,
+    default="inv_sqrt_n",
+    choices=["none", "inv_sqrt_n"],
+    help=(
+        "PRD 2.4 codebook gradient scaling. 'inv_sqrt_n' (default) scales the "
+        "codebook gradient by 1/sqrt(numel) -- in a 4096x4096 layer 16.7M "
+        "elements pool into one K-entry codebook, and unscaled the step "
+        "parameters oscillate relative to the weights. 'none' uses the plain "
+        "STE. Note the two interact multiplicatively with --codebook-lr: with "
+        "N = B*T*D in the millions the activation codebook gradient is ~1000x "
+        "smaller under 'inv_sqrt_n', so this is a real trade, not a free win."
+    ),
 )
 # Training horizon
 parser.add_argument(
@@ -162,6 +182,32 @@ parser.add_argument(
     help="ratio of iterations for LR warmdown",
 )
 parser.add_argument(
+    "--db-objective",
+    type=str,
+    default="edm",
+    choices=["edm", "ce"],
+    help=(
+        "block-wise training objective. 'edm' (default) is the DiffusionBlocks "
+        "method: only the active block's layers run, so activations are "
+        "O(L/B). 'ce' is the escape hatch (full-depth next-token cross-entropy "
+        "with block-isolated gradients). Should match the pretraining "
+        "objective -- switching mid-pipeline changes what is being optimized."
+    ),
+)
+parser.add_argument(
+    "--db-overlap",
+    type=float,
+    default=0.1,
+    help="log-sigma overlap between adjacent blocks (DiffusionBlocks App. C)",
+)
+parser.add_argument(
+    "--db-block-sampling",
+    type=str,
+    default="step",
+    choices=["step", "micro"],
+    help="draw the active block once per optimizer step (default) or per micro-step",
+)
+parser.add_argument(
     "--db-blocks",
     type=int,
     default=4,
@@ -180,6 +226,24 @@ parser.add_argument(
     default=0.75,
     help="sparsity level for SparseProp (fraction of weights pruned, 0.0-1.0)",
 )
+from nanochat.lcqat.pruning import (  # noqa: E402
+    add_sparseprop_pruning_args,
+    schedule_from_args,
+)
+
+add_sparseprop_pruning_args(parser)
+# W6 DiffusionBlocks features (sigma codebooks / EfQAT per-block latching /
+# denoiser KD) plus --lcqat-channel-center, registered through the same shared
+# helper base_train uses so the three entry points cannot drift apart.
+from nanochat.lcqat.w6 import (  # noqa: E402
+    add_w6_args,
+    build_denoiser_teacher,
+    describe_sigma_codebooks,
+    install_sigma_codebooks,
+    make_latch_freezer,
+)
+
+add_w6_args(parser)
 parser.add_argument(
     "--final-lr-frac",
     type=float,
@@ -232,6 +296,8 @@ parser.add_argument(
 )
 args = parser.parse_args()
 user_config = vars(args).copy()
+# Shared SparseProp pruning schedule (scope / gradual ramp / dense threshold).
+sparse_schedule = schedule_from_args(args)
 # -----------------------------------------------------------------------------
 
 # Compute init
@@ -275,7 +341,7 @@ model, tokenizer, meta = load_model(
 lcqat_started_from_float = lcqat_requested is not None and meta.get("lcqat") is None
 lcqat_meta = meta.get("lcqat")
 if lcqat_meta is None and lcqat_requested is not None:
-    lcqat_meta = asdict(lcqat_requested)
+    lcqat_meta = lcqat_requested.as_dict()
 if lcqat_requested is not None:
     print0(f"LC-QAT SFT: {retrofit_summary(model)}")
 
@@ -319,7 +385,7 @@ else:
     )
     engine = DiffusionBlockEngine(base_model, partitioner)
 
-# LC-QAT: retrofit the engine-owned Linear layers (adapters + denoise_head)
+# LC-QAT: retrofit the engine-owned Linear layers (adapters + denoise heads)
 # so the whole training pipeline is LC-QAT. The base model was already
 # retrofitted by load_model/retrofit_model during checkpoint load.
 lcqat_active = lcqat_requested if lcqat_started_from_float else lcqat_meta
@@ -329,6 +395,20 @@ if lcqat_active is not None:
     n_lcqat = engine.apply_lcqat(lcqat_active)
     print0(f"LC-QAT retrofitted {n_lcqat} diffusion-engine Linear layers")
 
+# Sigma-conditioned activation codebooks (PRD 3.2). Must follow apply_lcqat --
+# that is what creates the act quantizers to replace -- and precede SparseProp,
+# which rewraps the same modules.
+if args.db_sigma_codebook:
+    num_anchors = args.db_sigma_anchors or num_db_blocks
+    n_conditioned = install_sigma_codebooks(
+        engine, args.db_sigma_codebook, args.db_sigma_anchors, num_db_blocks
+    )
+    print0(
+        f"sigma-conditioned activation codebooks: {args.db_sigma_codebook} on "
+        f"{n_conditioned} layers"
+        + (f", {num_anchors} anchors" if num_anchors > 1 else "")
+    )
+
 # SparseProp: unstructured sparsity with AVX2 sparse backprop.
 if args.sparseprop:
     n_sparse = engine.apply_sparseprop(
@@ -336,6 +416,57 @@ if args.sparseprop:
         with_lcqat=lcqat_active is not None,
     )
     print0(f"SparseProp injected {n_sparse} sparse Linear layers")
+    engine_achieved = sparse_schedule.apply(engine, 0)
+    if engine_achieved is not None:
+        print0(
+            f"SparseProp pruned engine layers to {engine_achieved:.4f} sparsity "
+            f"(scope={sparse_schedule.scope})"
+        )
+
+# Denoiser-distillation teacher (PRD 3.1, EDM form). Taken *here*, after the
+# engine load but before the training loop, so the twin inherits the checkpoint's
+# trained weights and `build_float_twin` strips the LC-QAT layers the retrofits
+# above installed. On a fresh run the base model was never retrofitted either.
+float_twin, n_twin_stripped = (None, 0)
+if args.kd_denoiser_alpha > 0.0:
+    float_twin, n_twin_stripped = build_denoiser_teacher(
+        engine, args.kd_denoiser_alpha, args.db_objective
+    )
+    print0(
+        f"KD denoiser twin: float copy of the engine "
+        f"({n_twin_stripped} LC-QAT layers stripped)"
+    )
+
+# Denoiser distillation (PRD 3.1, EDM form): hand the frozen float twin to the
+# engine, which adds the KD term to the EDM objective inside `denoise_step`.
+# Defined unconditionally because the per-step logging reads it on every step,
+# not only on the ones where the anchor is installed.
+kd_denoiser = None
+if float_twin is not None:
+    from nanochat.lcqat.kd import DenoiserDistiller
+
+    kd_denoiser = DenoiserDistiller(float_twin, alpha=args.kd_denoiser_alpha)
+    engine.set_distiller(kd_denoiser)
+    print0(
+        f"KD denoiser distillation enabled: alpha={args.kd_denoiser_alpha}, "
+        f"anchor = w(sigma)*||D_quant - D_float||^2 on the same noisy input"
+    )
+
+# EfQAT per-block permanent latching (PRD 3.2). `>=` at the latch site so a
+# resumed run (which starts above the threshold) still latches; `latch_blocks`
+# is idempotent so the re-fire is free.
+block_latch_freezer = None
+efqat_latch_targets: list[int] = []
+if lcqat_active is not None:
+    block_latch_freezer, efqat_latch_targets = make_latch_freezer(
+        engine, args.efqat_latch_blocks, num_db_blocks
+    )
+if block_latch_freezer is not None:
+    print0(
+        f"EfQAT per-block latch enabled: blocks {efqat_latch_targets} freeze "
+        f"permanently at step {max(args.efqat_latch_after, 0)}"
+    )
+    engine.set_freezer(block_latch_freezer)
 
 depth = base_model.config.n_layer
 num_flops_per_token = base_model.estimate_flops()
@@ -356,12 +487,19 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(
     f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}"
 )
+if args.db_block_sampling == "micro" and grad_accum_steps > 1:
+    print0(
+        "WARNING: --db-block-sampling micro with gradient accumulation is LOSSY. "
+        "`_apply_requires_grad` clears p.grad for parameters the active block "
+        "does not own, so each micro-step erases the previous one's gradients. "
+        "Use the default 'step' unless reproducing the ablation."
+    )
 token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (AdamW-only for DiffusionBlocks engine)
 # PRD section 5: codebook delta params get their own AdamW group with a
 # dedicated LR and zero weight decay, distinct from the matrix-weight group.
-from nanochat.lcqat.optimizer import build_qat_param_groups
+from nanochat.lcqat.optimizer import build_qat_param_groups, verify_partition
 
 param_groups = build_qat_param_groups(
     engine,
@@ -370,6 +508,12 @@ param_groups = build_qat_param_groups(
     codebook_lr=args.codebook_lr if args.codebook_lr is not None else 1e-3,
     matrix_betas=(0.8, 0.95),
     matrix_eps=1e-10,
+)
+# Fail here rather than shipping a run where a whole role silently never trains.
+verify_partition(engine, param_groups)
+print0(
+    "Optimizer groups: "
+    + ", ".join(f"{g['role']}={len(g['params'])}" for g in param_groups)
 )
 optimizer = torch.optim.AdamW(
     param_groups,
@@ -408,9 +552,7 @@ elif args.load_optimizer:
             saved_param_count = sum(
                 len(g["params"]) for g in optimizer_data.get("param_groups", [])
             )
-            current_param_count = sum(
-                len(g["params"]) for g in optimizer.param_groups
-            )
+            current_param_count = sum(len(g["params"]) for g in optimizer.param_groups)
             if saved_param_count != current_param_count:
                 # The saved and current models have a different number of
                 # parameters (different architecture/stage, e.g. a Muon-based
@@ -693,7 +835,9 @@ while True:
         last_step or (step > 0 and step % args.chatcore_every == 0)
     ):
         model.eval()
-        engine = Engine(orig_model, tokenizer)
+        # ar_engine is the autoregressive sampler; it must not shadow the
+        # DiffusionBlockEngine bound to `engine`, which train_step runs on.
+        ar_engine = Engine(orig_model, tokenizer)
         all_tasks = ["ARC-Easy", "ARC-Challenge", "MMLU", "GSM8K", "HumanEval"]
         categorical_tasks = {"ARC-Easy", "ARC-Challenge", "MMLU"}
         baseline_accuracies = {
@@ -715,7 +859,7 @@ while True:
                 task_name,
                 orig_model,
                 tokenizer,
-                engine,
+                ar_engine,
                 batch_size=args.device_batch_size,
                 max_problems=max_problems,
             )
@@ -756,7 +900,11 @@ while True:
         save_checkpoint(
             checkpoint_dir,
             step,
-            orig_model.state_dict(),
+            # engine.state_dict(), not orig_model.state_dict(): the engine owns
+            # db_adapters.* / db_denoise_heads.*, and this checkpoint declares
+            # meta["db"] below. Saving the bare model would write a checkpoint
+            # that claims a diffusion engine but carries none of its parameters.
+            engine.state_dict(),
             optimizer.state_dict(),
             {
                 "step": step,
@@ -777,10 +925,16 @@ while True:
                     "sigma_min": 0.002,
                     "sigma_max": 80.0,
                     "sigma_data": 0.5,
+                    "sigma_codebook": describe_sigma_codebooks(args),
                 },
                 "sparseprop": {
                     "enabled": args.sparseprop,
                     "sparsity": args.sparseprop_sparsity,
+                    "scope": sparse_schedule.scope,
+                    "start_frac": sparse_schedule.start_frac,
+                    "every": sparse_schedule.every,
+                    "ramp_steps": sparse_schedule.ramp_steps,
+                    "dense_threshold": sparse_schedule.dense_threshold,
                 },
             },
             rank=ddp_rank,
@@ -794,8 +948,55 @@ while True:
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    # EfQAT per-block latch (PRD 3.2). Fires before the forward, so the retired
+    # block is already frozen in the very step the latch lands; latching after
+    # the forward would let one more update through.
+    if block_latch_freezer is not None and step >= max(args.efqat_latch_after, 0):
+        n_new = block_latch_freezer.latch_blocks(efqat_latch_targets)
+        if n_new:
+            print0(
+                f"EfQAT latched blocks {efqat_latch_targets} permanently at step "
+                f"{step} ({n_new} parameters frozen; total latched: "
+                f"{block_latch_freezer.latched_blocks()})"
+            )
+    # Gradual magnitude pruning, before the forward so the mask and the values
+    # agree in the same step. Monotone: a pruned weight is exactly 0.0 and can
+    # never win the |W| ranking again.
+    if args.sparseprop:
+        pruned = sparse_schedule.apply(engine, step)
+        if pruned is not None:
+            print0(
+                f"Step {step:05d} | SparseProp pruned to {pruned:.4f} sparsity; "
+                f"{len(sparse_schedule.layers_above_threshold(engine))} layers "
+                f"past the {sparse_schedule.dense_threshold:.0%} threshold"
+            )
+    # Block drawn once per optimizer step (see base_train: per-micro-step
+    # sampling would turn block-wise training into ordinary gradient
+    # accumulation). The diffusion target is hoisted for the same reason.
+    block_idx = (
+        engine.sample_block()
+        if args.db_objective == "edm" and args.db_block_sampling == "step"
+        else None
+    )
+    clean = None
+    if args.db_objective == "edm":
+        with torch.no_grad():
+            clean = F.normalize(engine.model.transformer.wte(x).float(), dim=-1)
+
+    # Reported alongside the total so an enabled anchor is observable in the
+    # log: a KD term that stays at 0.0 for a whole run means the twin is not
+    # actually being compared against, not that the gap vanished.
+    step_kd_logged = 0.0
+
     for micro_step in range(grad_accum_steps):
-        loss = engine.train_step(x, y)
+        if args.db_objective == "edm":
+            loss, _ = engine.denoise_step(
+                x, block_idx=block_idx, overlap=args.db_overlap, clean=clean
+            )
+            if engine.distiller is not None:
+                step_kd_logged = step_kd_logged + float(engine.last_kd_loss)
+        else:
+            loss = engine.train_step(x, y)
         train_loss = loss.detach()  # for logging
         loss = (
             loss / grad_accum_steps

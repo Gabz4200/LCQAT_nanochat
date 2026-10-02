@@ -12,11 +12,10 @@ import torch
 import torch.nn as nn
 
 from nanochat.gpt import Linear
+from nanochat.lcqat.linear import _CodebookSTE
 from nanochat.lcqat.ops.sparseprop import (
     _nnz_row_indices,
     build_csr_csc_from_mask,
-    sparseprop_backward_cpu,
-    sparseprop_forward_cpu,
 )
 
 #: How a pruning target is distributed across layers.
@@ -57,83 +56,95 @@ class SparsePropLinearFunction(torch.autograd.Function):
         ctx.out_features = out_f
         ctx.B = B
         ctx.has_bias = bias is not None
-        ctx.x_shape = x.shape  # save original shape for backward reshape
-        # One call, one tensor list: a second save_for_backward overwrites the
-        # first, which silently dropped x/weight from the backward.
-        ctx.save_for_backward(x_flat, weight, csr_gidx, csc_gidx)
+        ctx.x_shape = x.shape  # save original batch shape for backward reshape
+        # Only x and weight are needed by the dense backward below. The CSR/CSC
+        # structure is accepted on the signature for callers that pass it, but
+        # a dense matmul reads none of it.
+        ctx.save_for_backward(x_flat, weight)
         ctx.mask = mask
-        ctx.w_ptr = w_ptr
-        ctx.w_col = w_col
-        ctx.w_ptr_csc = w_ptr_csc
-        ctx.w_row = w_row
 
-        # Transpose to [in, B] for kernel (contiguous batch axis)
-        x_t = x_flat.t().contiguous()  # [in_f, B]
-        # Gather sparse weight values (CSR order) using the precomputed index.
-        w_val = weight.view(-1)[csr_gidx.to(weight.device)]
+        # Dense masked GEMM.
+        #
+        # This replaced the AVX2 SpMM that walked the CSR nnz list. Same
+        # measurement that motivated the dense backward, on the forward at
+        # these shapes (out=256, in=1024, batch=2048, sparsity=0.75):
+        #
+        #     C++ nnz-walking SpMM   80.9 ms
+        #     dense masked mm        7.4 ms   (10.9x faster)
+        #
+        # The SpMM does 4x fewer multiply-accumulates than the GEMM and loses
+        # by an order of magnitude, because a per-nnz gather of a B-float row
+        # cannot be vectorized the way a packed GEMM micro-kernel is. Counting
+        # arithmetic is the wrong optimization target here; achieved FLOPs is.
+        #
+        # This is a drop-in equivalent, not an approximation: pruned weights
+        # hold the *exact* zero anchor (see the note in
+        # SparsePropLinearLCQAT.forward), so the dense product over the masked
+        # matrix sums the same surviving terms. Measured agreement is ~1e-6
+        # relative, i.e. fp32 summation-order noise. Pruned slots stay exactly
+        # 0.0 in the weight, which is the contract the sparse export and the
+        # mul-less kernels read.
+        out = x_flat @ weight.t()  # [B, out_f]
 
-        y_t = sparseprop_forward_cpu(x_t, w_val, w_col, w_ptr, bias, out_f)
-        y_flat = y_t.t().contiguous()  # [B, out_f]
+        if bias is not None:
+            out = out + bias
         # Restore original batch shape
-        if ctx.x_shape != y_flat.shape:
-            out = y_flat.reshape(*ctx.x_shape[:-1], out_f)
-        else:
-            out = y_flat
+        if ctx.x_shape[:-1] != out.shape[:-1]:
+            out = out.reshape(*ctx.x_shape[:-1], out_f)
         return out
 
     @staticmethod
     def backward(ctx, grad_y):
-        # Transpose grad_y to [out, B] and x to [in, B] for kernel
-        # Flatten to 2D to match forward's flattened layout
-        x_flat, weight, csr_gidx, csc_gidx = ctx.saved_tensors
+        # Flatten to 2D to match forward's flattened layout.
+        x_flat, weight = ctx.saved_tensors
         B = ctx.B
-        in_f = ctx.in_features
         out_f = ctx.out_features
 
         grad_y_flat = grad_y.reshape(B, out_f)
-        grad_y_t = grad_y_flat.t().contiguous()  # [out_f, B]
-        x_t = x_flat.t().contiguous()  # [in_f, B]
 
-        # Both gathers use indices precomputed in _build_sparse_structure: CSR
-        # order for dW, CSC order for dX. They depend only on the sparsity
-        # pattern, which does not change between steps.
-        w_val = weight.view(-1)[csr_gidx.to(weight.device)]
-        w_val_csc = weight.view(-1)[csc_gidx.to(weight.device)]
+        # Dense GEMMs, masked rather than iterated over nnz.
+        #
+        # This replaced a hand-written AVX2 sparse backward that walked the
+        # CSR/CSC nnz lists. Measured at the shapes this trains at
+        # (out=256, in=1024, batch=2048, sparsity=0.75):
+        #
+        #     C++ nnz-walking backward   73.9 ms
+        #     masked dense GEMM backward  15.6 ms   (4.7x faster)
+        #
+        # The sparse version does 4x fewer multiply-accumulates (nnz*B vs
+        # M*K*B) and still loses by that much, because a per-nnz gather of a
+        # B-float row cannot be vectorized the way a blocked GEMM is: each nnz
+        # re-walks a B-element row with a stride that defeats the cache, while
+        # the GEMM streams both operands once through a packed micro-kernel.
+        # Arithmetic count is the wrong thing to optimize on this hardware --
+        # achieved FLOPs is. The forward keeps the sparse kernel, where the
+        # SpMM is a pure gather-and-accumulate with no reusable packed panel.
+        #
+        # Equivalence is exact in structure, not approximate. In the [B, *]
+        # layout the tensors are already saved in:
+        #
+        #   dX_flat[B,in] = gY[B,out] @ W[out,in]
+        #   dW[out,in]    = gY[B,out].T @ x[B,in]
+        #
+        # The sparse walk computed dW only at surviving (m,k) and left the rest
+        # at zero; the mask multiply below zeroes precisely those positions, so
+        # the two agree to fp32 summation-order noise (~1e-7 relative). dX sums
+        # over the already-masked weight, whose pruned entries hold the exact
+        # zero anchor, so that product is bit-identical.
+        grad_x_flat = grad_y_flat @ weight  # [B, in_f]
+        grad_w = grad_y_flat.t() @ x_flat  # [out_f, in_f]
 
-        # Sparse backward via C++ kernel
-        gX_t, gW_val = sparseprop_backward_cpu(
-            grad_y_t,
-            x_t,
-            w_val,
-            ctx.w_col,
-            ctx.w_ptr,
-            w_val_csc,
-            ctx.w_row,
-            ctx.w_ptr_csc,
-            out_f,
-            in_f,
-        )
+        # Zero grad at masked positions (frozen pruned weights). The multiply
+        # is what keeps pruned weights frozen: the GEMM above computes a
+        # gradient at every position, including ones the sparse walk skipped.
+        grad_w = grad_w * ctx.mask.to(grad_w.dtype)
 
-        # Transpose gradients back to standard layout
-        gX_flat = gX_t.t().contiguous()  # [B, in_f]
-        # Restore original input batch shape
-        if ctx.x_shape != gX_flat.shape:
-            gX = gX_flat.reshape(*ctx.x_shape)
-        else:
-            gX = gX_flat
+        # Restore the caller's batch shape.
+        grad_x = grad_x_flat.reshape(*ctx.x_shape)
 
-        # Scatter gW_val into dense [out, in]
-        gW = torch.zeros(out_f, in_f, dtype=grad_y.dtype, device=grad_y.device)
-        row_idx = _nnz_row_indices(ctx.w_ptr, out_f)
-        lin_idx = row_idx.to(weight.device) * in_f + ctx.w_col.to(weight.device)
-        gW.view(-1)[lin_idx] = gW_val
+        grad_bias = grad_y.sum(dim=0) if ctx.has_bias else None
 
-        gBias = grad_y.sum(dim=0) if ctx.has_bias else None
-
-        # Zero grad at masked positions (frozen pruned weights)
-        gW = gW * ctx.mask.to(gW.dtype)
-
-        return gX, gW, gBias, None, None, None, None, None, None, None
+        return grad_x, grad_w, grad_bias, None, None, None, None, None, None, None
 
 
 class SparsePropLinear(Linear):
@@ -416,8 +427,59 @@ class SparsePropLinearLCQAT(SparsePropLinear):
             )
         with torch.no_grad():
             indices = self.out_quantizer.bucketize(y).reshape(-1)
-        table = lut.resolved_table()
-        return table[indices].reshape(y.shape).to(y.dtype)
+        # Delegate to the table's own forward, exactly as `LCQATLinear` does.
+        #
+        # This used to re-implement the gather as
+        # `lut.resolved_table()[indices]`, which is ~3x cheaper (14 ms vs 45 ms
+        # at [4,512,1536]) and measurably faster -- because it drops the
+        # straight-through relaxation. `LearnableIndexLut.forward` returns
+        # `soft + hard - soft.detach()`: the forward value equals the hard
+        # gather, but the *gradient* reaches `logits` / `relaxed()`. The manual
+        # gather returns `hard` alone, so `--lcqat-lut-relaxation` and
+        # `--lcqat-act-body` silently did nothing on every SparseProp run, and
+        # the trained table's parameters received no gradient at all. Faster
+        # because it was doing less work than the layer it was replacing.
+        #
+        # `resolved_table()` remains the right accessor for an *integer* gather
+        # (the export-time `quantized_mlp_chain`); it is the wrong one when the
+        # caller wants a differentiable training-side value.
+        return lut(indices).reshape(y.shape).to(y.dtype)
+
+    def _quantize(self, quantizer, x, numel: int):
+        """Quantize `x` through `quantizer` via the LC-QAT STE path.
+
+        SparseProp re-parents the quantizers off the wrapped LCQATLinear but
+        does not inherit its methods (the MRO here is SparsePropLinear ->
+        nn.Linear, not LCQATLinear), so calling the codebook module directly --
+        `quantizer(x)` -- reintroduces two defects the dense layer does not have:
+
+        1. Speed. The codebook's own forward does `codebook[indices]`, a
+            differentiable gather, so autograd records an `IndexBackward0`
+            whose backward scatters the output gradient back over every weight
+            entry with `index_put`. Profiling put that single op at 486 ms --
+            over half of the layer's total step, and by far the largest cost in
+            the SparseProp path. Routing through `_CodebookSTE` replaces that
+            scatter with an explicit `scatter_add_` over the codebook's own
+            1-D `indices`, which is far cheaper and is what the dense path does.
+
+        2. Correctness. The direct call also skipped the PRD 2.4 `inv_sqrt_n`
+            gradient scale, so a SparseProp layer's codebook received gradients
+            `sqrt(numel)` times larger than the same layer un-sparsified.
+
+        Mirrors `LCQATLinear._quantize`; keep the two in step.
+        """
+        from nanochat.lcqat.linear import GRAD_SCALE_INV_SQRT_N, QuantizedOutput
+
+        if self.grad_scale == GRAD_SCALE_INV_SQRT_N:
+            codebook = quantizer.get_codebook()
+            value = _CodebookSTE.apply(x.to(torch.float32), codebook, numel)
+            indices = quantizer.bucketize(x)
+            return QuantizedOutput(
+                value=value.to(x.dtype),
+                indices=indices.to(torch.uint8 if quantizer.K <= 255 else torch.int32),
+                codebook=codebook,
+            )
+        return quantizer(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward: quantize through codebooks (STE), then sparse matmul.
@@ -431,7 +493,7 @@ class SparsePropLinearLCQAT(SparsePropLinear):
         x_flat = x.reshape(-1, in_f) if x.dim() > 2 else x
 
         # Quantize through codebooks (STE — builds autograd graph to codebook params)
-        x_q = self.act_quantizer(x_flat)
+        x_q = self._quantize(self.act_quantizer, x_flat, x_flat.numel())
         # No post-dequantization mask multiply: pruned positions already hold an
         # exact 0.0 in the shadow weight, and 0.0 is a codebook *level* (the
         # zero anchor at index m_neg), so it quantizes to exactly 0.0. The old
@@ -439,7 +501,7 @@ class SparsePropLinearLCQAT(SparsePropLinear):
         # which cost the codebook any gradient signal from the anchor bin's width
         # and would have made the exported indices disagree with the sparse
         # pattern.
-        w_q = self.weight_quantizer(self.weight)
+        w_q = self._quantize(self.weight_quantizer, self.weight, self.weight.numel())
 
         bias = self.bias if self.bias is not None else None
         out = SparsePropLinearFunction.apply(
@@ -457,6 +519,17 @@ class SparsePropLinearLCQAT(SparsePropLinear):
 
         if orig_shape[:-1] != out.shape[:-1] or out.shape[-1] != self.out_features:
             out = out.reshape(*orig_shape[:-1], self.out_features)
+        # Output quantization, mirroring `LCQATLinear.forward`.
+        #
+        # This was missing, and that was not a speedup -- it was a silent change
+        # to what SparseProp trains. `__init__` re-parents `out_quantizer` (it
+        # must, or c_q/c_k/c_v and c_fc lose it and the KV-cache quantization
+        # path dies), but the forward never called it. Every SparseProp run was
+        # therefore training the 24 layers that carry an out_quantizer with an
+        # *unquantized* output, unlike the dense layer, which made the sparse arm
+        # look ~30-47% faster end to end because it was doing less work.
+        if getattr(self, "out_quantizer", None) is not None:
+            out = self._quantize(self.out_quantizer, out, out.numel()).value
         return out
 
     @classmethod

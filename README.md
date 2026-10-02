@@ -158,8 +158,8 @@ python -m scripts.chat_rl --no-lcqat --no-sparseprop          # plain RL
 | `--lcqat-k-map substr:KW/KA,...` | Per-module overrides. Each K is a total level count (`15`) or an explicit split (`0-7`), e.g. `mlp.c_proj:0-7/0-7` |
 | `--codebook-lr` | Codebook AdamW LR (PRD: 10–50× network weights), no weight decay |
 | `--codebook-grad-scale {inv_sqrt_n,none}` | PRD 2.4 codebook gradient scaling. `inv_sqrt_n` (default) scales the codebook gradient by `1/sqrt(numel)`; with `N = B·T·D` in the millions this is ~1000× smaller, so it interacts multiplicatively with `--codebook-lr` |
-| `--db-objective {edm,ce}` | DiffusionBlocks objective. `edm` (default) trains each block as a denoiser over its own noise range, so only L/B layers run and activations are `O(L/B)`. `ce` is full-depth next-token cross-entropy with block-isolated gradients (saves backward memory, no forward FLOPs) |
-| `--db-blocks` | Number of independent diffusion blocks (checkpoint provenance: cannot change on resume) |
+| `--db-objective {edm,ce}` | DiffusionBlocks objective. `edm` (default) trains each block as a denoiser over its own noise range, so only L/B layers run and activations are `O(L/B)`. `ce` is full-depth next-token cross-entropy with block-isolated gradients (saves backward memory, no forward FLOPs). **`ce` is not the same as turning DiffusionBlocks off** — it still runs through the engine and still gradients one block per step. Use `--db-blocks=0` for a conventional baseline |
+| `--db-blocks` | Number of independent diffusion blocks (checkpoint provenance: cannot change on resume). **`0` disables DiffusionBlocks entirely** and trains a plain autoregressive LM: no partitioner, no denoise heads, no block isolation, every layer trains every step |
 | `--db-overlap` | Log-σ overlap between adjacent blocks (DiffusionBlocks App. C). 0.1 for text, 0.05 for vision |
 | `--db-block-sampling {step,micro}` | Draw the active block once per optimizer step (default) or per micro-step. `micro` is **lossy** with gradient accumulation: `_apply_requires_grad` clears gradients the active block does not own, so each micro-step erases the previous one and only the last block sampled reaches the optimizer |
 | `--fp8` | FP8 training for the float path. **Mutually exclusive with LC-QAT** (both convert `Linear`) |
@@ -250,11 +250,94 @@ SparseProp is **always-on by default** alongside LC-QAT. When LC-QAT is active, 
 
 Parity (`naive == cpu`) and integration with the full training pipeline are in `tests/test_sparseprop.py` and `tests/test_sparseprop_integration.py`; pruning behaviour in `tests/test_sparseprop_pruning.py`.
 
-**Where the SparseProp speedup actually applies.** The AVX2 kernels loop over `nnz` in the inner dimension and vectorize over the *time/batch* axis `T` (`sparseprop.cpp`). In training `T` is large, so the inner loop is tight and the win is real. At autoregressive decode `T == 1`, so there is nothing to vectorize and the kernel reduces to a scalar walk over `nnz` — still `O(nnz)`, but no longer the vectorized speedup. The paper's 3.6× is a *training* number; the *inference* speedup in this repo comes from the fused index-linear kernel and the 2-D product LUT below, not from SparseProp's backward pass. Do not read the two as the same result.
+**SparseProp's training path is a masked dense GEMM, not an nnz walk.** The `AVX2` CSR/CSC kernels in `sparseprop.cpp` are retained for parity tests and as the reference oracle, but they are no longer on the training hot path. Both the forward and the backward of `SparsePropLinearFunction` now compute a dense matmul over the pruned weight:
+
+```python
+out    = x_flat @ weight.t()          # forward
+grad_x = grad_y @ weight              # backward, weight already holds exact zeros
+grad_w = (grad_y.t() @ x_flat) * mask # backward, masked back onto the sparse pattern
+```
+
+This is exact, not an approximation: pruned slots hold the *exact* zero anchor, so the dense product sums the same surviving terms as the SpMM. Measured agreement is ~1e-6 relative — fp32 summation-order noise. Pruned slots stay exactly `0.0`, which is the contract the sparse export and the mul-less kernels read.
+
+The reason is arithmetic intensity, not arithmetic count. At `out=256, in=1024, batch=2048, sparsity=0.75` the nnz-walking kernel does **4x fewer** multiply-accumulates than the GEMM and still lost by an order of magnitude, because a per-nnz gather of a `batch`-float row cannot be vectorized the way a packed GEMM micro-kernel is:
+
+| | forward | backward |
+|---|---|---|
+| AVX2 `nnz` walk | 80.9 ms | 73.9 ms |
+| masked dense GEMM | 7.4 ms | 15.6 ms |
+| speedup | **10.9x** | **4.7x** |
+
+Pruning still removes the memory, not the FLOPs: the win is in the exported/packed artifact and the inference kernels, not in the training step.
+
+**The training step is now essentially free.** Three defects were found and fixed; end-to-end layer timing (dense LC-QAT vs LC-QAT + SparseProp at 75% sparsity) went from **4.27x slower to 1.01x — parity**:
+
+1. The `nnz`-walking forward and backward kernels (above).
+2. `weight.detach().view(-1)[csr_gidx]` — a *differentiable* gather, so autograd recorded an `IndexBackward0` whose backward scattered gradients back over the whole dense buffer via `index_put`, at 301 ms of a 532 ms step.
+3. **A real correctness bug, not just a slowdown.** `SparsePropLinearLCQAT` re-parents the LC-QAT quantizers but does not inherit `LCQATLinear`'s methods, so calling `weight_quantizer(self.weight)` directly bypassed `_quantize`. That (a) reintroduced the same `IndexBackward0` `index_put`, this time at 486 ms — over half the step — and (b) silently skipped the PRD 2.4 `inv_sqrt_n` gradient scale, so a SparseProp layer's codebook received gradients `sqrt(numel)` larger than the same layer un-sparsified. Both are fixed by giving the wrapper the same `_quantize` helper the dense layer has.
+
+**A fourth bug: `out_quantizer` was never applied.** `__init__` re-parents `out_quantizer` (it must, or `c_q`/`c_k`/`c_v` and `c_fc` lose it and the KV-cache quantization path dies), but the forward never called it. Every SparseProp run trained the 24 layers that carry an `out_quantizer` with an **unquantized** output, unlike the dense layer. `SparsePropLinearLCQAT.forward` now mirrors `LCQATLinear.forward` and quantizes its output. This is guarded by tests that assert the output values lie on the codebook's levels and that the codebook receives a gradient — an idempotence check would *not* have caught it.
+
+### Measured: SparseProp's end-to-end cost
+
+The four-combination comparison (LC-QAT, LC-QAT+DiffusionBlocks, LC-QAT+SparseProp,
+and all three) is written up in [`dev/STACK_COMPARE.md`](dev/STACK_COMPARE.md),
+generated by [`runs/stackcompare.sh`](runs/stackcompare.sh). That file also states
+which of the four pairwise comparisons isolate a single mechanism and which do not,
+and what these runs cannot establish.
+
+`runs/stackcompare.sh`, four arms, depth 6, identical FLOP estimate and parameter count across arms:
+
+| pair | before | after |
+|---|---|---|
+| plain LM, +/- SparseProp | **+34.7%** (17791 -> 23974 ms) | **-9.8%** (17600 -> 15874 ms) |
+| DiffusionBlocks, +/- SparseProp | **+59.0%** (5750 -> 9145 ms) | **-14.7%** (5719 -> 4876 ms) |
+
+**On the residual: in-process micro-benchmarks say parity, the full trainer says
+SparseProp is faster.** Both were run; the gap between them is documented rather
+than smoothed over. Measured on this host, all at the sweep's own shapes
+(depth 6, n_embd 384, vocab 32768, device-batch 4, seq 512, 2 grad-accum
+micro-steps):
+
+| scope | dense | sparse | delta |
+|---|---|---|---|
+| `base_train` step, 6 samples each | 17352-17949 ms | 15904-16348 ms | **-10%** |
+| in-process fwd+bwd, one micro-step | 7534 ms | 7592 ms | +0.8% |
+| in-process `AdamW(fused=True)` step alone | 251 ms | 245 ms | -2.4% |
+| in-process backward onto existing grads | 7424 ms | 7733 ms | +4.2% |
+| full step, 2 micro-steps, no dataloader | 17591 ms | 15839 ms | **-10%** |
+
+The optimizer's parameter list is byte-identical between arms (same roles, same
+shapes, same tensor count), so this is not the optimizer doing less work, and the
+profiler agrees the op counts match (`mm` 111/111, `bucketize` 198/198, `index`
+114/114) — SparseProp is not skipping work. The last row reproduces the trainer's
+gap outside the trainer, which points at per-step host effects (allocator state,
+thread scheduling) rather than at the kernels. It is not attributed to a mechanism
+here, because attributing it to one would be a guess.
+
+Whatever the cause, the claim this section has to support is the negative one:
+SparseProp is **not** slower than not having it, on either pair. Removal is not
+justified.
+
+Validation bpb is unchanged by the optimization, as expected — these were performance and gradient-scale fixes, not modelling changes (plain LM: 2.365218 dense vs 2.364602 sparse).
+
+**A fifth bug, found by chasing an anomaly: the learned activation LUT was dead on the SparseProp path.** After the four fixes above, the four-arm sweep showed SparseProp *faster* end to end (-20% plain LM, -37% denoiser) while every isolated measurement showed parity. The cause was `SparsePropLinearLCQAT.apply_trained_activation`, which re-implemented the gather as
+
+```python
+lut.resolved_table()[indices]     # wrong: hard values only
+```
+
+instead of calling the table's own forward. `LearnableIndexLut.forward` returns `soft + hard - soft.detach()` — the same forward value, but with the straight-through relaxation attached, so the gradient reaches `logits` / `relaxed()`. The manual gather returns `hard` alone, so **`--lcqat-lut-relaxation` and `--lcqat-act-body` silently did nothing on every SparseProp run** and the trained table received no gradient. It was also ~3x cheaper (14 ms vs 45 ms at `[4,512,1536]`), which is exactly why the sparse arm looked faster: it was skipping the `bucketize` plus relaxation work that `c_fc` legitimately owes.
+
+Isolating one layer made it unambiguous: `c_fc` alone measured 164 ms dense vs 120 ms sparse, with identical op counts except two extra `aten::index` gathers in the dense arm. After the fix, the arms match within float32 noise, and reverting the fix makes **100% of activation elements differ** (max abs 12.0) rather than by rounding.
+
+The lesson generalizes: a path can be *faster than the thing it replaces* precisely because it is not doing the work. Measured speedups are only trustworthy once both arms are shown to compute the same function.
+
+Guarded by tests asserting the sparse and dense activations agree, that the LUT receives a gradient, and that injection does not drop the table.
 
 Pruning is **magnitude-based per row**, not random: a keep-mask (`True` = retained) is built by taking the top-`k` by magnitude in each row, with all-zero rows fully pruned. Gradual pruning intersects each new mask with the previous one, so a slot that has been pruned is never revived. Pruned slots hold the *exact* zero anchor rather than a mask multiply, which is what the CSR kernels and the sparse export rely on.
 
-**Gather indices are precomputed, not rebuilt per step.** The AVX2 kernels consume the weight in CSR/CSC nnz order, so the dense weight has to be gathered into that order on every forward and backward. The index mapping depends only on the sparsity pattern, so it is built once in `_build_sparse_structure` (where the mask actually changes) and cached in two non-persistent buffers, `_csr_gather_index` and `_csc_gather_index`. Recomputing it per call cost a `repeat_interleave` over the full row dimension three times per step per layer. `persistent=False` keeps them out of the checkpoint — they are fully derivable from `w_ptr`/`w_col`.
+**Gather indices are precomputed, not rebuilt per step.** The AVX2 kernels consume the weight in CSR/CSC nnz order, so the dense weight has to be gathered into that order on every forward and backward. The index mapping depends only on the sparsity pattern, so it is built once in `_build_sparse_structure` (where the mask actually changes) and cached in two non-persistent buffers, `_csr_gather_index` and `_csc_gather_index`. Recomputing it per call cost a `repeat_interleave` over the full row dimension three times per step per layer. `persistent=False` keeps them out of the checkpoint — they are fully derivable from `w_ptr`/`w_col`. Since the training path is now a dense GEMM, the gather itself happens only when the AVX2 kernels or the sparse export read it.
 
 ### Ablation harness
 
@@ -302,6 +385,10 @@ The `DiffusionBlockEngine` is the **default training engine** for `base_train`, 
 # DiffusionBlocks on CPU (toy, d4/256-wide, seq 64, batch 2)
 python -m scripts.base_train --depth=4 --db-blocks=4 --no-lcqat --no-sparseprop --num-iterations=500
 ```
+
+**Turning it off.** `--db-blocks=0` trains a plain autoregressive LM: no partitioner, no adapters, no denoise heads, no block isolation. Every transformer layer trains on every step by next-token cross-entropy, and the checkpoint records `meta["db"] = None` so `base_eval` loads it as a bare `GPT` with a strict load rather than building a zero-initialized engine.
+
+This is the switch to reach for when you want a conventional LM baseline, and it is *not* equivalent to `--db-objective ce`: `ce` keeps the engine, the block partition and the block-isolated gradients, so only one block is trained per step. `runs/stackcompare.sh` uses `--db-blocks=0` for exactly that reason. The denoiser-only flags (`--db-sigma-codebook`, `--kd-denoiser-alpha`, `--efqat-latch-blocks`) are rejected at startup in this mode rather than silently ignored.
 
 ### Running on CPU / MPS
 

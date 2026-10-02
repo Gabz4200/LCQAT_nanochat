@@ -1,3 +1,5 @@
+# todo: Split into many different files because this file is too big.
+
 """
 Quantization-range ablation primitives: symmetric falloff windows and learnable
 grid positions.
@@ -705,6 +707,29 @@ class LearnableLinearLut(nn.Module):
         return out.to(codebook.dtype)
 
 
+def _linear_interpolation_basis(x: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
+    """Hat-function basis of the linear interpolant on the knot grid `xs`.
+
+    Returns `[x.numel(), xs.numel()]` with `basis[i, k]` equal to the weight of
+    knot `k` in the piecewise-linear interpolant at `x[i]`. Every row sums to 1,
+    so `lstsq(basis @ ys)` is a partition-of-unity least-squares fit rather than
+    an unconstrained regression.
+    """
+    n = x.numel()
+    k = xs.numel()
+    flat_x = x.reshape(-1, 1)
+    left = torch.searchsorted(xs, flat_x.contiguous()).clamp(1, k - 1) - 1
+    x0 = xs[left]
+    x1 = xs[left + 1]
+    span = (x1 - x0).clamp_min(torch.finfo(xs.dtype).tiny)
+    t = ((flat_x - x0) / span).clamp(0.0, 1.0)
+    basis = torch.zeros(n, k, dtype=xs.dtype, device=xs.device)
+    rows = torch.arange(n, device=xs.device)
+    basis[rows, left.reshape(-1)] = 1.0 - t.reshape(-1)
+    basis[rows, (left + 1).reshape(-1)] += t.reshape(-1)
+    return basis
+
+
 class LearnableActivationLut(nn.Module):
     """Differentiable learnable activation LUT.
 
@@ -834,6 +859,88 @@ class LearnableActivationLut(nn.Module):
             torch.linspace(y_low, y_high, n_points, dtype=dtype_y)
         )
 
+    @classmethod
+    def from_callable(
+        cls,
+        act_fn: Callable[[torch.Tensor], torch.Tensor],
+        low: float,
+        high: float,
+        n_points: int = 16,
+        min_spacing: float | None = None,
+        mode: Literal["linear", "softmax", "falloff"] = "linear",
+        sharpness: float = 1.0,
+        falloff_kind: Literal["gaussian", "cosine", "quartic"] = "cosine",
+        fit: Literal["exact", "lsq"] = "exact",
+    ) -> "LearnableActivationLut":
+        """Build a LUT that reproduces `act_fn` at its knots.
+
+        The x-grid is a `StrictLearnableGrid` spanning `[low, high]`; `y_i` is
+        seeded with `act_fn(x_i)`, so in `fit="exact"` + `mode="linear"` the
+        piecewise-linear interpolant **equals** `act_fn` at every knot and only
+        approximates it between them. `fit="lsq"` instead fits `y` to `act_fn`
+        sampled on a dense grid, which is the better choice for a coarse
+        `n_points`: it minimises the error *between* knots rather than only
+        preserving the knot values.
+
+        Honest framing: with `K=8` knots this is a piecewise-linear function,
+        not `relu^2`. It is exact at the knots and approximate between them,
+        and because it is a free `nn.Parameter` it can train past the closed
+        form within the step budget. It is a strict superset of the baked
+        table, not an exact drop-in for the closed form.
+
+        Args:
+            act_fn: elementwise activation on a 1-D floating-point tensor.
+            low, high: domain endpoints of the x-grid.
+            n_points: number of knots.
+            min_spacing: minimum x spacing. Defaults to `(high-low)/(n-1)` times
+                a small factor, i.e. just below uniform so the grid starts
+                strictly increasing without wasting the domain.
+            fit: `"exact"` seeds `y` from `act_fn` at the knots; `"lsq"` solves a
+                least-squares fit over a dense sample of the same `act_fn`.
+        """
+        low = _finite_float("low", low)
+        high = _finite_float("high", high)
+        if not low < high:
+            raise ValueError(f"require low < high, got low={low}, high={high}")
+        if isinstance(n_points, bool) or not isinstance(n_points, int) or n_points < 2:
+            raise ValueError(f"n_points must be an integer >= 2, got {n_points!r}")
+        if fit not in ("exact", "lsq"):
+            raise ValueError(f"fit must be 'exact' or 'lsq', got {fit!r}")
+
+        if min_spacing is None:
+            # Strictly below uniform so the grid is initially strictly
+            # increasing without letting the slack swallow the domain.
+            min_spacing = (high - low) / (n_points - 1) * 0.5
+        min_spacing = _finite_float("min_spacing", min_spacing)
+        if min_spacing <= 0.0:
+            raise ValueError(f"min_spacing must be positive, got {min_spacing}")
+
+        module = cls(
+            n_points=n_points,
+            low_init=low,
+            high_init=high,
+            min_spacing=min_spacing,
+            mode=mode,
+            sharpness=sharpness,
+            falloff_kind=falloff_kind,
+        )
+
+        with torch.no_grad():
+            xs = module.codebook_x().to(torch.float32)
+            if fit == "exact":
+                ys = act_fn(xs).to(torch.float32)
+            else:
+                # Least squares against a dense sample: the interpolant matches
+                # the function in a least-squares sense over the whole domain,
+                # not just at the knots, which is what a coarse grid needs.
+                dense = torch.linspace(low, high, max(256, n_points * 32))
+                target = act_fn(dense.to(torch.float32))
+                basis = _linear_interpolation_basis(dense, xs)
+                solution = torch.linalg.lstsq(basis, target.unsqueeze(-1)).solution
+                ys = solution.squeeze(-1)
+            module.codebook_y.copy_(ys.to(module.codebook_y.dtype))
+        return module
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Evaluate the learned activation LUT with the same shape as `x`."""
         _validate_float_tensor("x", x)
@@ -874,457 +981,6 @@ class LearnableActivationLut(nn.Module):
         )
 
         out = (weights * ys.to(torch.float32)).sum(dim=-1)
-
-        return out.to(ys.dtype)
-
-
-# Vector LUT helpers
-
-
-def _validate_vector_input(
-    name: str,
-    value: torch.Tensor,
-    expected_dim: int,
-) -> None:
-    """Validate that `value` is a floating-point `(B, C)` tensor."""
-    _validate_float_tensor(name, value)
-
-    if value.ndim != 2:
-        raise ValueError(
-            f"{name} must have shape (batch, channels), got {tuple(value.shape)}"
-        )
-
-    if value.shape[-1] != expected_dim:
-        raise ValueError(
-            f"{name} must have last dimension {expected_dim}, got {value.shape[-1]}"
-        )
-
-
-def _safe_l2_unit_and_norm(
-    value: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return `(unit_vector, raw_norm)` in float32.
-
-    The unit vector is safe for zero-length inputs: zero vectors produce zero
-    unit vectors instead of NaNs.
-    """
-    value32 = value.to(torch.float32)
-    norm = value32.norm(dim=-1, keepdim=True)
-
-    eps = torch.finfo(torch.float32).eps
-    safe_norm = torch.clamp_min(norm, eps)
-
-    return value32 / safe_norm, norm
-
-
-def _cosine_similarity_to_codebook(
-    x: torch.Tensor,
-    codebook: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return cosine similarity between each input vector and each codebook vector.
-
-    Args:
-        x: input tensor shaped `(B, C)`.
-        codebook: codebook tensor shaped `(K, C)`.
-
-    Returns:
-        `(sim, x_norm)` where:
-          - `sim` has shape `(B, K)` and contains cosine similarities.
-          - `x_norm` has shape `(B, 1)` and contains raw input L2 norms.
-    """
-    x_unit, x_norm = _safe_l2_unit_and_norm(x)
-    c_unit, _ = _safe_l2_unit_and_norm(codebook)
-
-    # (B, C) @ (C, K) -> (B, K)
-    sim = torch.matmul(x_unit, c_unit.t())
-
-    # Numerical safety: cosine similarity should be in [-1, 1].
-    sim = sim.clamp(-1.0, 1.0)
-
-    return sim, x_norm
-
-
-def _vector_radius_from_sharpness(sharpness: float) -> float:
-    """Convert a positive sharpness value into a cosine-space radius.
-
-    Cosine similarity lives in [-1, 1]. A radius of 1.0 covers similarities
-    down to 0.0. Larger radii cover more negative similarities. Smaller radii
-    make the kernel more local.
-    """
-    radius = 1.0 / sharpness
-
-    if not math.isfinite(radius):
-        radius = 1e4
-
-    eps = torch.finfo(torch.float32).eps
-    return float(min(max(radius, eps), 1e4))
-
-
-def _vector_softmax_weights(
-    sim: torch.Tensor,
-    sharpness: float,
-) -> torch.Tensor:
-    """Normalized softmax weights from cosine similarities."""
-    # Cosine similarity is bounded, but large sharpness values can still create
-    # large logits. Clamping keeps the softmax numerically tame.
-    logits = torch.clamp(sharpness * sim, min=-1e4, max=1e4)
-    return F.softmax(logits, dim=-1)
-
-
-def _vector_linear_weights(
-    sim: torch.Tensor,
-    sharpness: float,
-) -> torch.Tensor:
-    """Unnormalized linear cosine-distance weights.
-
-    weight = max(0, 1 - distance / radius)
-
-    where distance = 1 - cosine_similarity.
-    """
-    radius = _vector_radius_from_sharpness(sharpness)
-
-    distance = 1.0 - sim
-    weights = (1.0 - distance / radius).clamp_min(0.0)
-
-    return weights
-
-
-def _vector_falloff_weights(
-    sim: torch.Tensor,
-    sharpness: float,
-    kind: str,
-) -> torch.Tensor:
-    """Unnormalized falloff weights over cosine similarity.
-
-    The kernel is centered at perfect similarity:
-
-        center = 1.0
-
-    and has radius:
-
-        radius = 1 / sharpness
-
-    so larger sharpness gives a narrower kernel.
-    """
-    if kind not in FALLOFFS:
-        raise ValueError(
-            f"Unknown falloff_kind: {kind!r}. Valid kinds: {sorted(FALLOFFS)}"
-        )
-
-    radius = _vector_radius_from_sharpness(sharpness)
-
-    sim_flat = sim.reshape(-1)
-
-    if sim_flat.numel() == 0:
-        return torch.empty_like(sim, dtype=torch.float32)
-
-    weights_flat = falloff(
-        sim_flat,
-        center=1.0,
-        radius=radius,
-        kind=kind,
-    )
-
-    return weights_flat.reshape(sim.shape)
-
-
-def _normalize_vector_weights(
-    weights: torch.Tensor,
-    sim: torch.Tensor,
-    sharpness: float,
-) -> torch.Tensor:
-    """Normalize weights, falling back to softmax if the weight mass is zero.
-
-    This is especially useful for compact-support falloffs, which can produce
-    zero mass when the input is far from every codebook vector.
-    """
-    denom = weights.sum(dim=-1, keepdim=True)
-    eps = torch.finfo(weights.dtype).eps
-
-    normalized = weights / denom.clamp_min(eps)
-    fallback = _vector_softmax_weights(sim, sharpness)
-
-    return torch.where(denom > eps, normalized, fallback)
-
-
-def _restore_magnitude(
-    value: torch.Tensor,
-    magnitude: torch.Tensor,
-) -> torch.Tensor:
-    """Normalize `value` and rescale it to `magnitude`.
-
-    `magnitude` is expected to be shaped `(B, 1)`.
-    """
-    value32 = value.to(torch.float32)
-    value_norm = value32.norm(dim=-1, keepdim=True)
-
-    eps = torch.finfo(torch.float32).eps
-    safe_norm = torch.clamp_min(value_norm, eps)
-
-    return (value32 / safe_norm) * magnitude
-
-
-def _vector_mixture_weights(
-    sim: torch.Tensor,
-    mode: str,
-    sharpness: float,
-    falloff_kind: str,
-) -> torch.Tensor:
-    """Mixture weights over codebook entries from cosine similarities."""
-    if mode == "softmax":
-        return _vector_softmax_weights(sim, sharpness)
-    if mode == "linear":
-        raw_weights = _vector_linear_weights(sim, sharpness)
-        return _normalize_vector_weights(raw_weights, sim, sharpness)
-    raw_weights = _vector_falloff_weights(sim, sharpness, falloff_kind)
-    return _normalize_vector_weights(raw_weights, sim, sharpness)
-
-
-# Vector LUTs
-
-
-def _validate_vector_lut_config(
-    n_points: int,
-    input_dim: int,
-    mode: str,
-    sharpness: float,
-    falloff_kind: str,
-    dtype: torch.dtype,
-    owner: str,
-) -> float:
-    """Validate shared vector-LUT constructor config. Returns finite sharpness."""
-    if isinstance(n_points, bool) or not isinstance(n_points, int):
-        raise ValueError(f"n_points must be an int, got {n_points!r}")
-    if n_points < 1:
-        raise ValueError(f"n_points must be at least 1, got {n_points}")
-
-    if isinstance(input_dim, bool) or not isinstance(input_dim, int):
-        raise ValueError(f"input_dim must be an int, got {input_dim!r}")
-    if input_dim < 1:
-        raise ValueError(f"input_dim must be at least 1, got {input_dim}")
-
-    if mode == "nearest":
-        raise ValueError(
-            "nearest mode is not differentiable with respect to the input. "
-            f"Use 'softmax', 'linear', or 'falloff' for {owner}."
-        )
-
-    if mode not in {"softmax", "linear", "falloff"}:
-        raise ValueError(
-            f"Unknown {owner} mode: {mode!r}. "
-            "Valid modes: 'softmax', 'linear', 'falloff'."
-        )
-
-    sharpness = _finite_float("sharpness", sharpness)
-    if sharpness <= 0.0:
-        raise ValueError(f"sharpness must be positive, got {sharpness}")
-
-    if falloff_kind not in FALLOFFS:
-        raise ValueError(
-            f"Unknown falloff_kind: {falloff_kind!r}. Valid kinds: {sorted(FALLOFFS)}"
-        )
-
-    if not dtype.is_floating_point:
-        raise ValueError(f"dtype must be floating point, got {dtype}")
-
-    return sharpness
-
-
-class LearnableVectorLut(nn.Module):
-    """Differentiable vector codebook lookup.
-
-    This learns a codebook of vectors and interpolates between codebook entries
-    using weights derived from cosine similarity between the input vector and
-    each codebook vector.
-
-    Input shape:
-        `(B, C)`
-
-    Output shape:
-        `(B, C)`
-
-    Modes:
-        "softmax":
-            Weights are `softmax(sharpness * cosine_similarity)`.
-
-        "linear":
-            Weights are linear cosine-distance weights:
-
-                max(0, 1 - (1 - sim) / radius)
-
-            then normalized.
-
-        "falloff":
-            Weights are generated by one of the falloff kernels centered at
-            `sim == 1.0`, then normalized with a softmax fallback.
-
-    Args:
-        n_points: number of codebook vectors.
-        input_dim: vector dimensionality, i.e. input `C`.
-        dtype: dtype of the learned codebook and returned output.
-        mode: one of `"softmax"`, `"linear"`, or `"falloff"`.
-        sharpness: positive sharpness/locality control. Larger means sharper.
-        falloff_kind: falloff kernel used when `mode == "falloff"`.
-        preserve_magnitude: if True, output direction is normalized and then
-            rescaled to match the input L2 norm.
-    """
-
-    def __init__(
-        self,
-        n_points: int,
-        input_dim: int,
-        dtype: torch.dtype = torch.float32,
-        mode: Literal["softmax", "linear", "falloff"] = "softmax",
-        sharpness: float = 1.0,
-        falloff_kind: Literal["gaussian", "cosine", "quartic"] = "cosine",
-        preserve_magnitude: bool = False,
-    ) -> None:
-        super().__init__()
-
-        sharpness = _validate_vector_lut_config(
-            n_points,
-            input_dim,
-            mode,
-            sharpness,
-            falloff_kind,
-            dtype,
-            "LearnableVectorLut",
-        )
-
-        self.input_dim = input_dim
-        self.mode = mode
-        self.sharpness = sharpness
-        self.falloff_kind = falloff_kind
-        self.preserve_magnitude = preserve_magnitude
-
-        # Initialize codebook vectors on the unit sphere. They remain fully
-        # learnable; the cosine similarity path normalizes them anyway.
-        codebook = torch.randn(n_points, input_dim, dtype=torch.float32)
-        codebook = F.normalize(codebook, dim=-1).to(dtype)
-
-        self.codebook = nn.Parameter(codebook)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return a soft vector-codebook lookup with shape `(B, C)`."""
-        _validate_vector_input("x", x, self.input_dim)
-
-        x = x.to(self.codebook.device)
-        codebook = self.codebook
-
-        sim, x_norm = _cosine_similarity_to_codebook(x, codebook)
-
-        weights = _vector_mixture_weights(
-            sim, self.mode, self.sharpness, self.falloff_kind
-        )
-
-        # weights: (B, K)
-        # codebook: (K, C)
-        out = torch.matmul(weights, codebook.to(torch.float32))
-
-        if self.preserve_magnitude:
-            out = _restore_magnitude(out, x_norm)
-
-        return out.to(codebook.dtype)
-
-
-class LearnableVectorActivationLut(nn.Module):
-    """Differentiable vector-valued activation LUT.
-
-    This learns two codebooks:
-
-      - `codebook_x`: input anchor vectors.
-      - `codebook_y`: output anchor vectors.
-
-    For an input vector `x`, weights are computed from cosine similarity
-    between `x` and every `codebook_x` entry. The output is then the weighted
-    sum of the matching `codebook_y` entries.
-
-    Input shape:
-        `(B, C)`
-
-    Output shape:
-        `(B, C)`
-
-    Modes:
-        "softmax":
-            Weights are `softmax(sharpness * cosine_similarity)`.
-
-        "linear":
-            Weights are linear cosine-distance weights, then normalized.
-
-        "falloff":
-            Weights are generated by one of the falloff kernels centered at
-            perfect cosine similarity, then normalized with a softmax fallback.
-
-    Args:
-        n_points: number of `(x, y)` vector pairs.
-        input_dim: vector dimensionality, i.e. input `C`.
-        dtype: dtype of learned codebooks and returned output.
-        mode: one of `"softmax"`, `"linear"`, or `"falloff"`.
-        sharpness: positive sharpness/locality control. Larger means sharper.
-        falloff_kind: falloff kernel used when `mode == "falloff"`.
-        preserve_magnitude: if True, output direction is normalized and then
-            rescaled to match the input L2 norm.
-    """
-
-    def __init__(
-        self,
-        n_points: int,
-        input_dim: int,
-        dtype: torch.dtype = torch.float32,
-        mode: Literal["softmax", "linear", "falloff"] = "softmax",
-        sharpness: float = 1.0,
-        falloff_kind: Literal["gaussian", "cosine", "quartic"] = "cosine",
-        preserve_magnitude: bool = False,
-    ) -> None:
-        super().__init__()
-
-        sharpness = _validate_vector_lut_config(
-            n_points,
-            input_dim,
-            mode,
-            sharpness,
-            falloff_kind,
-            dtype,
-            "LearnableVectorActivationLut",
-        )
-
-        self.input_dim = input_dim
-        self.mode = mode
-        self.sharpness = sharpness
-        self.falloff_kind = falloff_kind
-        self.preserve_magnitude = preserve_magnitude
-
-        # Initialize input anchors on the unit sphere.
-        codebook_x = torch.randn(n_points, input_dim, dtype=torch.float32)
-        codebook_x = F.normalize(codebook_x, dim=-1).to(dtype)
-
-        # Initialize output anchors as a copy of the input anchors so the
-        # initial mapping is close to an identity-like vector function.
-        self.codebook_x = nn.Parameter(codebook_x.clone())
-        self.codebook_y = nn.Parameter(codebook_x.clone())
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Evaluate the learned vector activation LUT with shape `(B, C)`."""
-        _validate_vector_input("x", x, self.input_dim)
-
-        x = x.to(self.codebook_x.device)
-
-        xs = self.codebook_x
-        ys = self.codebook_y
-
-        sim, x_norm = _cosine_similarity_to_codebook(x, xs)
-
-        weights = _vector_mixture_weights(
-            sim, self.mode, self.sharpness, self.falloff_kind
-        )
-
-        # weights: (B, K)
-        # ys: (K, C)
-        out = torch.matmul(weights, ys.to(torch.float32))
-
-        if self.preserve_magnitude:
-            out = _restore_magnitude(out, x_norm)
 
         return out.to(ys.dtype)
 

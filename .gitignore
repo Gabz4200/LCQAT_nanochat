@@ -16,6 +16,15 @@ wandb/
 # Local working notes (not for the repo)
 TODO_LCQAT.md
 
+# Research papers and internal write-ups (kept locally, not in the repo).
+# dev/LEADERBOARD.md and dev/LOG.md stay tracked: the leaderboard is generated
+# by scripts/lcqat_ablation.py and the log is the run history.
+dev/2302.04852v1.pdf
+dev/2506.14202v4.pdf
+dev/HANDOFF_symbiosis.md
+dev/lc_qat_pseudoPaper.md
+dev/combination.md
+
 # Aislop session state
 .aislop/*.jsonl
 

@@ -117,8 +117,8 @@ def test_when_db_blocks_zero_then_every_layer_trains():
     inspecting the training loop, so it fails if the isolation ever leaks back
     in through the shared code path.
     """
-    from nanochat.gpt import GPT, GPTConfig
-    from nanochat.lcqat.retrofit import PRESETS, retrofit_model
+    from nanochat.models.backbone import GPT, GPTConfig
+    from nanochat.models.quant.retrofit import PRESETS, retrofit_model
 
     config = GPTConfig(
         sequence_len=64,
@@ -156,8 +156,8 @@ def test_when_db_blocks_zero_then_checkpoint_meta_db_is_none():
     proc = _run(["--db-blocks=0", "--no-sparseprop"], tag)
     _assert_ok(proc)
 
-    from nanochat.checkpoint_manager import load_checkpoint
-    from nanochat.common import get_base_dir
+    from nanochat.modules.checkpoint_manager import load_checkpoint
+    from nanochat.utils.common import get_base_dir
 
     ckpt_dir = os.path.join(get_base_dir(), "base_checkpoints", tag)
     assert os.path.isdir(ckpt_dir), f"no checkpoint directory at {ckpt_dir}"

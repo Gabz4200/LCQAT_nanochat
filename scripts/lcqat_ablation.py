@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+
 """
 Ablation driver for the LC-QAT claims.
 
@@ -141,7 +142,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
+import math  # noqa: F401
 import sys
 import time
 from pathlib import Path
@@ -156,11 +157,7 @@ PUBLISHED_LEADERBOARD = REPO_ROOT / "dev" / "LEADERBOARD.md"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from nanochat.diffusion_blocks import (  # noqa: E402
-    EquiProbabilityPartitioner,
-    edm_preconditioning,
-)
-from nanochat.lcqat.ablation_metrics import (  # noqa: E402
+from nanochat.models.quant.ablation_metrics import (  # noqa: E402
     AblationRow,
     GradScaleObservation,
     measure_reconstruction,
@@ -171,86 +168,215 @@ from nanochat.lcqat.ablation_metrics import (  # noqa: E402
     row_to_dict,
     select_quantizer,
 )
-from nanochat.lcqat.activation import (  # noqa: E402
+from nanochat.models.quant.activation import (  # noqa: E402
     ACT_BODIES,
     ACT_BODY_PWL,
     ACT_BODY_SMOOTHPWL,
     SmoothPWL,
     get_activation,
 )
-from nanochat.lcqat.bias_quant import DEFAULT_K_BIAS  # noqa: E402
-from nanochat.lcqat.learnable_lut import (  # noqa: E402
+from nanochat.models.quant.bias_quant import DEFAULT_K_BIAS  # noqa: E402
+from nanochat.models.quant.learnable_lut import (  # noqa: E402
     RELAXATION_LOGITS,
     RELAXATION_PROXIMITY,
     RELAXATIONS,
     LearnableIndexLut,
 )
-from nanochat.lcqat.linear import (  # noqa: E402
+from nanochat.models.quant.linear import (  # noqa: E402
     GRAD_SCALE_INV_SQRT_N,
     GRAD_SCALE_NONE,
     LCQATLinear,
 )
-from nanochat.lcqat.pruning import (  # noqa: E402
+from nanochat.models.quant.pruning import (  # noqa: E402
     add_sparseprop_pruning_args,
     schedule_from_args,
 )
-from nanochat.lcqat.retrofit import (  # noqa: E402
+from nanochat.models.quant.retrofit import (  # noqa: E402
     PRESETS,
     CodebookSpec,
     retrofit_model,
 )
-from nanochat.lcqat.sigma_codebook import SigmaConditionedCodebook  # noqa: E402
-from nanochat.lcqat.sparseprop import (  # noqa: E402
+from nanochat.models.quant.sigma_codebook import SigmaConditionedCodebook  # noqa: E402
+from nanochat.models.quant.sparseprop import (  # noqa: E402
     SCOPE_GLOBAL,
     SCOPE_LAYER,
     inject_sparseprop_layers,
 )
+
+# The measurements live in `nanochat.modules.experiments`, one module per
+# experiment. Every name below was defined in this file before the split and is
+# re-imported from that implementation, so any caller that did
+# `from scripts.lcqat_ablation import X` still resolves to the same object.
+from nanochat.modules.experiments import (  # noqa: E402
+    BASELINE_PRESET,
+    BIAS_CODEBOOK_DEAD,
+    BIAS_CODEBOOK_LIVE,
+    K_MATCHED_BUDGET,
+    OBJECTIVE_CE,
+    OBJECTIVE_EDM,
+    OVERLAP_FLOORS,
+    SAMPLING_FAMILIES,
+    SAMPLING_MICRO,
+    SAMPLING_STEP,
+    SCOPES,
+    SMOOTHPWL_DEFAULT_INIT_RANGE,
+    SPARSITY_FLOORS,
+    STEP_ARM_BLOCK,
+    VARIANT_PRESET,
+    _accumulate_one_step,
+    _act_kwargs,
+    _length_only_idx,
+    _per_block_reference,
+    _run_objective_arm,
+    _spread,
+    _weight_kwargs,
+    bias_probe,
+    block_probe_tensors,
+    build_activation_lut,
+    build_probe_engine,
+    codebook_of,
+    count_codebook_cost,
+    engine_named_parameters,
+    expected_1_over_sqrt_n,
+    grad_retained_fraction,
+    matched_budget_codebooks,
+    measure_overlap_out_of_band,
+    measure_sparsity_nmse,
+    non_negative_probe,
+    piecewise_linear,
+    probe_layer,
+    pruned_lcqat_layers,
+    run_act_lut,
+    run_asym_vs_small,
+    run_bias_quant,
+    run_block_sampling,
+    run_grad_scale,
+    run_objective,
+    run_overlap,
+    run_sigma_cond,
+    run_sparsity,
+    scope_mask_disagreement,
+    sorted_overlap_sweep,
+    sparsity_sweep,
+)
+from nanochat.training.diffusion_blocks import (  # noqa: E402
+    EquiProbabilityPartitioner,
+    edm_preconditioning,
+)
 from tests.conftest import build_active_tiny_gpt  # noqa: E402
 from tests.test_dbcpu_engine import make_engine  # noqa: E402
 
-#: Preset the `asym` experiment treats as the improvement, and the one it beats.
-BASELINE_PRESET = "small"
-VARIANT_PRESET = "asym"
-
-#: The two objectives `--db-objective` selects between.
-OBJECTIVE_CE = "ce"
-OBJECTIVE_EDM = "edm"
-
-#: The two block-sampling modes `--db-block-sampling` selects between.
-SAMPLING_STEP = "step"
-SAMPLING_MICRO = "micro"
-
-#: Overlap settings the `overlap` experiment sweeps. The disjoint partition
-#: (0.0) is the baseline; the rest are the values DiffusionBlocks App. C quotes
-#: for text (0.1) rounded up, plus `--db-overlap` so the operator's choice is
-#: swept too. Deduped and sorted by `sorted_overlap_sweep`.
-OVERLAP_FLOORS = (0.0, 0.125)
-
-#: Sparsity levels the `sparsity` experiment sweeps, below and at the target.
-#: The dense 0.0 arm is not swept: at zero sparsity `layer` and `global` are
-#: the same mask by construction, so the pair would be a tautology.
-SPARSITY_FLOORS = (0.5,)
-
-#: The two pruning scopes the `sparsity` experiment sweeps.
-SCOPES = (SCOPE_LAYER, SCOPE_GLOBAL)
-
-#: `SmoothPWL`'s default knot-grid half-width. The class does not retain its
-#: `init_range` argument as an attribute, so the default is restated here for the
-#: `act_lut` fit grid, which has to score both bodies over the domain the RBF fit
-#: is actually run on.
-SMOOTHPWL_DEFAULT_INIT_RANGE = 1.0
-
-#: Parameter families the `block_sampling` metric is reported over, counted
-#: separately and never pooled. The engine's denoise heads and the GPT's own
-#: transformer layers are different parameters with different owners; a pooled
-#: fraction hides whichever of the two a change broke.
-SAMPLING_FAMILIES = ("transformer.h.", "db_denoise_heads.")
-
-#: The block the `step` arm holds for a whole optimizer step. It is block 0,
-#: because `_per_block_reference` also runs block 0 in isolation: the two arms
-#: are then comparable against the same reference, and the `micro` arm differs
-#: from the reference only in that it redraws the block each micro-step.
-STEP_ARM_BLOCK = 0
+__all__ = [
+    # CLI surface.
+    "PUBLISHED_LEADERBOARD",
+    "REPO_ROOT",
+    "check_claims",
+    "main",
+    "register_args",
+    "validate_args",
+    "write_leaderboard",
+    # Every name this module binds. The measurements moved to
+    # nanochat.modules.experiments but are re-exported here, so this list
+    # documents the module's whole surface rather than only the CLI.
+    "ACT_BODIES",
+    "ACT_BODY_PWL",
+    "ACT_BODY_SMOOTHPWL",
+    "AblationRow",
+    "BASELINE_PRESET",
+    "BIAS_CODEBOOK_DEAD",
+    "BIAS_CODEBOOK_LIVE",
+    "CodebookSpec",
+    "DEFAULT_K_BIAS",
+    "EquiProbabilityPartitioner",
+    "GRAD_SCALE_INV_SQRT_N",
+    "GRAD_SCALE_NONE",
+    "GradScaleObservation",
+    "K_MATCHED_BUDGET",
+    "LCQATLinear",
+    "LearnableIndexLut",
+    "OBJECTIVE_CE",
+    "OBJECTIVE_EDM",
+    "OVERLAP_FLOORS",
+    "PRESETS",
+    "Path",
+    "RELAXATIONS",
+    "RELAXATION_LOGITS",
+    "RELAXATION_PROXIMITY",
+    "SAMPLING_FAMILIES",
+    "SAMPLING_MICRO",
+    "SAMPLING_STEP",
+    "SCOPES",
+    "SCOPE_GLOBAL",
+    "SCOPE_LAYER",
+    "SMOOTHPWL_DEFAULT_INIT_RANGE",
+    "SPARSITY_FLOORS",
+    "STEP_ARM_BLOCK",
+    "SigmaConditionedCodebook",
+    "SmoothPWL",
+    "VARIANT_PRESET",
+    "_accumulate_one_step",
+    "_act_kwargs",
+    "_length_only_idx",
+    "_per_block_reference",
+    "_run_objective_arm",
+    "_spread",
+    "_weight_kwargs",
+    "add_sparseprop_pruning_args",
+    "annotations",
+    "argparse",
+    "bias_probe",
+    "block_probe_tensors",
+    "build_activation_lut",
+    "build_active_tiny_gpt",
+    "build_probe_engine",
+    "check_claims",
+    "codebook_of",
+    "count_codebook_cost",
+    "edm_preconditioning",
+    "engine_named_parameters",
+    "expected_1_over_sqrt_n",
+    "get_activation",
+    "grad_retained_fraction",
+    "inject_sparseprop_layers",
+    "json",
+    "main",
+    "make_engine",
+    "matched_budget_codebooks",
+    "math",
+    "measure_overlap_out_of_band",
+    "measure_reconstruction",
+    "measure_sparsity_nmse",
+    "non_negative_probe",
+    "observe_grad_scale",
+    "piecewise_linear",
+    "probe_layer",
+    "pruned_lcqat_layers",
+    "quantization_error",
+    "reconstruct_layer",
+    "register_args",
+    "render_leaderboard",
+    "retrofit_model",
+    "row_to_dict",
+    "run_act_lut",
+    "run_asym_vs_small",
+    "run_bias_quant",
+    "run_block_sampling",
+    "run_grad_scale",
+    "run_objective",
+    "run_overlap",
+    "run_sigma_cond",
+    "run_sparsity",
+    "schedule_from_args",
+    "scope_mask_disagreement",
+    "select_quantizer",
+    "sorted_overlap_sweep",
+    "sparsity_sweep",
+    "sys",
+    "time",
+    "torch",
+    "validate_args",
+    "write_leaderboard",
+]
 
 
 def register_args(parser: argparse.ArgumentParser) -> None:
@@ -632,1627 +758,6 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(
                 f"preset {preset!r} is not registered; available: {sorted(PRESETS)}"
             )
-
-
-def probe_layer(preset: str):
-    """Retrofit a fresh tiny model and return the MLP down-projection.
-
-    `c_proj` is chosen because it is the layer whose *activation* input is
-    `relu^2` and therefore non-negative -- the tensor `asym` exists to serve.
-    A model that shares no state with other arms is required, since retrofitting
-    mutates in place.
-    """
-    model = build_active_tiny_gpt()
-    retrofit_model(model, PRESETS[preset])
-    return model.transformer.h[0].mlp.c_proj
-
-
-def non_negative_probe(in_features: int, rows: int, seed: int) -> torch.Tensor:
-    """A probe with the shape of the real `relu^2` input: non-negative.
-
-    `asym`'s justification is that `mlp.forward` computes `F.relu(x).square()`,
-    so the tensor `c_proj` actually quantizes never goes below zero. Measuring
-    a symmetric signed probe would test the opposite of what the preset is for,
-    and would report a loss that says nothing about the claim.
-    """
-    gen = torch.Generator().manual_seed(seed)
-    return torch.randn(rows, in_features, generator=gen).relu().square()
-
-
-def run_asym_vs_small(args: argparse.Namespace) -> AblationRow:
-    """Measure the paired effect of the `asym` split on a `relu^2` activation.
-
-    Probes the **activation** quantizer of `c_proj`, not its weights. That
-    distinction is the whole measurement, and getting it wrong inverts the
-    result:
-
-    * On the real non-negative `relu^2` input, `small` (a symmetric 15-level
-      codebook) can only place 8 of its levels where the tensor actually lives,
-      so it wastes half its alphabet. `asym` (one-sided, 8 levels) puts every
-      level in range.
-    * On signed weights, `asym` is measurably *worse*, because the split gives up
-      half the range for no benefit.
-
-    So on a `relu^2` probe the NMSE is a tie -- both arms spend the same 8
-    effective levels -- and the claim is confirmed by **effective level count**,
-    which is the quantity the split was designed to raise. Reporting NMSE alone
-    would show a flat result and hide the improvement.
-    """
-    measurements = []
-    for seed in range(args.seeds):
-        # Same seed for both arms: the only difference is the preset.
-        torch.manual_seed(seed)
-        layer_base = probe_layer(BASELINE_PRESET)
-        layer_var = probe_layer(VARIANT_PRESET)
-
-        # One probe tensor, shared: the input is held fixed across arms so the
-        # measurement isolates the codebook, not the data.
-        probe = non_negative_probe(layer_base.in_features, args.n, seed)
-
-        base = measure_reconstruction(layer_base, probe, BASELINE_PRESET, which="act")
-        variant = measure_reconstruction(layer_var, probe, VARIANT_PRESET, which="act")
-        measurements.append((base, variant))
-
-    # The deciding metric is the fraction of the alphabet actually used.
-    # Absolute level count *ties* at 8 for both arms -- the difference is that
-    # `small` spends 15 levels to do it (8 used, 7 stranded below the data's
-    # minimum) while `asym` spends 8. So the win is headroom, not resolution.
-    base_eff = sum(b.level_utilization for b, _ in measurements) / len(measurements)
-    var_eff = sum(v.level_utilization for _, v in measurements) / len(measurements)
-    return AblationRow(
-        experiment="asym_vs_small_levels",
-        metric="level_utilization",
-        baseline=BASELINE_PRESET,
-        variant=VARIANT_PRESET,
-        value_baseline=base_eff,
-        value_variant=var_eff,
-        delta=var_eff - base_eff,
-        better="variant" if var_eff > base_eff else "baseline",
-        seeds=list(range(args.seeds)),
-        n_seeds=args.seeds,
-        notes=(
-            "fraction of codebook levels actually hit on a non-negative relu^2 "
-            "probe; absolute level count ties at 8 for both arms, so the gain is "
-            "headroom (asym spends 8 levels, small spends 15 for the same 8)"
-        ),
-    )
-
-
-def run_grad_scale(
-    args: argparse.Namespace,
-) -> tuple[AblationRow, list[GradScaleObservation]]:
-    """Measure the `1/sqrt(N)` codebook gradient scale directly."""
-    rows = []
-    observations: list[GradScaleObservation] = []
-    n_elements = 0
-    base_norm = 0.0
-    inv_norm = 0.0
-    for seed in range(args.seeds):
-        torch.manual_seed(seed)
-        layer = probe_layer(VARIANT_PRESET)
-        gen = torch.Generator().manual_seed(seed)
-        probe = torch.randn(args.n, layer.in_features, generator=gen)
-
-        none_obs = observe_grad_scale(
-            layer,
-            probe,
-            GRAD_SCALE_NONE,
-            steps=args.grad_scale_steps,
-            lr=args.grad_scale_lr,
-        )
-        inv_obs = observe_grad_scale(
-            layer,
-            probe,
-            GRAD_SCALE_INV_SQRT_N,
-            steps=args.grad_scale_steps,
-            lr=args.grad_scale_lr,
-        )
-        observations.extend([none_obs, inv_obs])
-        base_norm += none_obs.grad_norm
-        inv_norm += inv_obs.grad_norm
-        n_elements = layer.weight.numel()
-
-    base_avg = base_norm / args.seeds
-    inv_avg = inv_norm / args.seeds
-    ratio = inv_avg / base_avg if base_avg else float("nan")
-    rows.append(
-        AblationRow(
-            experiment="grad_scale",
-            metric="codebook_grad_ratio",
-            baseline=GRAD_SCALE_NONE,
-            variant=GRAD_SCALE_INV_SQRT_N,
-            value_baseline=base_avg,
-            value_variant=inv_avg,
-            delta=inv_avg - base_avg,
-            # Lower codebook gradient is the point of the scaling, so the
-            # variant "wins" when it is strictly smaller.
-            better="variant" if inv_avg < base_avg else "baseline",
-            seeds=list(range(args.seeds)),
-            n_seeds=args.seeds,
-            notes=(
-                f"observed ratio {ratio:.6g} vs predicted 1/sqrt(N) = "
-                f"{1.0 / (n_elements**0.5):.6g} for N={n_elements}"
-            ),
-        )
-    )
-    return rows[0], observations
-
-
-def expected_1_over_sqrt_n(n_elements: int) -> float:
-    """The `1/sqrt(N)` factor the PRD 2.4 scaling applies."""
-    return 1.0 / (n_elements**0.5)
-
-
-# ---------------------------------------------------------------------------
-# Shared probe helpers for the six DiffusionBlocks / D9 experiments
-# ---------------------------------------------------------------------------
-
-
-def build_probe_engine(args: argparse.Namespace, seed: int = 0):
-    """A tiny DiffusionBlocks engine, depth-configurable and with live zero-inits.
-
-    `make_engine(active=True)` is what makes the gradient-reachability
-    measurements meaningful: the denoise heads and the adapter output layer are
-    zero-initialized by design, and a zero tensor transmits no gradient, so
-    every "did the gradient arrive" assertion would pass vacuously against a
-    fresh engine.
-
-    Depth is threaded through `make_engine`'s own `n_layer` argument rather than
-    done here. `make_engine` builds its own model, so resizing a model built in
-    this function and then handing `n_layer=None` to `make_engine` would build a
-    *second* model at the default depth and silently discard the first -- the
-    knob would appear to work while measuring the wrong depth.
-
-    `seed` does the same job: `make_engine` re-seeds internally, so a seed set
-    here would be overwritten. It is used to seed the *probes*, which are built
-    separately, and the engine itself is deterministic across arms -- which is
-    what pairing requires. Both arms at a given seed therefore see a
-    byte-identical engine, and a per-seed difference in the result is a
-    difference in the probe, not in the model.
-    """
-    return make_engine(
-        num_blocks=args.ablation_blocks, n_layer=args.ablation_n_layer, active=True
-    )
-
-
-def block_probe_tensors(
-    args: argparse.Namespace, seed: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """`(value probe, token ids, CE targets)` for the block-level probes.
-
-    The value tensor is the `relu^2`-shaped one the driver already uses for the
-    activation quantizers: `mlp.forward` computes `F.relu(x).square()`, so the
-    tensors the real blocks see at their input are non-negative. It is the
-    *clean* target the block's residual identity reconstructs.
-
-    Token ids and CE targets both exist because the two objectives take
-    different arguments. `denoise_step(idx, ...)` reads `idx` for its sequence
-    length only, and `train_step(idx, targets, ...)` needs real targets to
-    return a scalar cross-entropy: `GPT.forward` returns *logits* when
-    `targets is None`, and backpropagating through logits makes
-    `float(loss.detach())` raise rather than measure anything. All three come
-    from one generator so both arms see identical tokens.
-    """
-    model = build_active_tiny_gpt()
-    n_embd = int(model.config.n_embd)
-    vocab = int(model.config.vocab_size)
-    gen = torch.Generator().manual_seed(seed)
-    idx = torch.randint(
-        0, vocab, (args.ablation_batch, args.ablation_seq), generator=gen
-    )
-    targets = torch.randint(
-        0, vocab, (args.ablation_batch, args.ablation_seq), generator=gen
-    )
-    probe = non_negative_probe(
-        n_embd, args.ablation_batch * args.ablation_seq, seed
-    ).view(args.ablation_batch, args.ablation_seq, n_embd)
-    return probe, idx, targets
-
-
-def engine_named_parameters(engine) -> list[tuple[str, torch.nn.Parameter]]:
-    """The engine's parameters, as `(name, param)` in one deterministic order."""
-    return list(engine.named_parameters())
-
-
-def grad_retained_fraction(
-    grads: dict[str, torch.Tensor | None],
-    names: list[str],
-    prefix: str,
-    reference: dict[str, torch.Tensor | None],
-) -> float:
-    """Gradient signal retained, as a fraction of the isolated reference's.
-
-    Returns `||grad_family|| / ||reference_family||` over the parameters the
-    *reference* (the isolated single-block run) gave a gradient to. Two earlier
-    formulations were wrong; both are recorded so they are not reintroduced:
-
-    * Counting non-`None` gradients over every parameter in the family put the
-      same zeros in both arms' numerator and denominator, so both arms scored
-      identically and the comparison reported nothing while the behaviour
-      differed sharply.
-    * Restricting that count to the reference's live parameters still flipped
-      with the sampler: `micro` retains everything whenever its *last* draw
-      happens to be the reference's block, and nothing otherwise. That is a coin
-      flip per seed, which is why `--seeds 1` tied or reversed at random.
-
-    The magnitude ratio is stable under both. `step` holds the block, so it
-    retains one reference's worth of signal. `micro` ends on whichever block the
-    sampler drew last, so it retains on average one micro-step's share, and the
-    block owning the reference's gradients is erased regardless of the draw.
-    Normalizing by the reference keeps the row dimensionless and comparable to
-    the other experiments.
-
-    Scored per *parameter tensor*, summed in float64. An empty reference family
-    scores 0.0 rather than dividing by zero, so a renamed prefix shows up as a
-    collapse instead of a `nan` that formats as a pass.
-    """
-    live = [n for n in names if n.startswith(prefix) and reference.get(n) is not None]
-    if not live:
-        return 0.0
-    retained = torch.zeros((), dtype=torch.float64)
-    expected = torch.zeros((), dtype=torch.float64)
-    for name in live:
-        grad = grads.get(name)
-        if grad is not None:
-            retained += grad.detach().double().square().sum()
-        expected += reference[name].detach().double().square().sum()
-    if float(expected) <= 0.0:
-        return 0.0
-    return float((retained / expected).sqrt())
-
-
-def sorted_overlap_sweep(args: argparse.Namespace) -> list[float]:
-    """The overlap settings to sweep, ascending, with the 0.0 baseline first."""
-    return sorted({*OVERLAP_FLOORS, float(args.db_overlap)})
-
-
-def sparsity_sweep(args: argparse.Namespace) -> list[float]:
-    """The sparsity settings to sweep, ascending, target last."""
-    return sorted({*SPARSITY_FLOORS, float(args.sparseprop_sparsity)})
-
-
-def codebook_of(layer, which: str = "out") -> torch.Tensor:
-    """A quantizer's codebook as an FP32 tensor.
-
-    `which` follows `select_quantizer`'s roles: `"act"` is the layer's
-    activation (input) quantizer, `"out"` its output quantizer, and `"weight"`
-    its weight quantizer. Read off the layer rather than rebuilt, so the table
-    measured is the one the model actually uses -- and so a layer that lacks the
-    requested quantizer raises here instead of silently falling back to the
-    weight quantizer, which would measure something else entirely.
-    """
-    quantizer = select_quantizer(layer, which)
-    return quantizer.get_codebook().detach().to(torch.float32)
-
-
-# ---------------------------------------------------------------------------
-# objective
-# ---------------------------------------------------------------------------
-
-
-def _run_objective_arm(
-    args: argparse.Namespace, objective: str, seed: int
-) -> tuple[float, float]:
-    """One objective arm: return `(mean loss, block-output NMSE)`.
-
-    The NMSE is the metric; the loss is a diagnostic, not a claim. The EDM loss
-    is jittery **by design** -- it is `w(sigma) * ||D_q - clean||^2` with a
-    fresh sigma and fresh noise on every step -- so neither arm is monotone, and
-    comparing final loss values measures which sampler happened to draw a kinder
-    noise level. The reconstruction error of the block's output against a
-    held-fixed non-negative probe is the quantity that is comparable.
-
-    No `lm_head` assertion is made anywhere in this function. The EDM objective
-    predicts an embedding rather than tokens, so `lm_head` legitimately receives
-    no gradient under it; that is a property of the objective (handoff §5.1a),
-    not a wiring defect, and asserting it either way would assert an accident.
-    """
-    engine = build_probe_engine(args, seed=seed)
-    probe, idx, targets = block_probe_tensors(args, seed)
-    params = [p for _, p in engine_named_parameters(engine) if p.requires_grad]
-    optimizer = torch.optim.SGD(params, lr=args.objective_lr)
-    losses: list[float] = []
-
-    for step in range(args.objective_steps):
-        block = step % args.ablation_blocks
-        if objective == OBJECTIVE_EDM:
-            # `denoise_step` returns `(loss, sigma)`; sigma is a 0-dim tensor
-            # (`sample_sigma` draws one per call, not one per batch row), and is
-            # not used here -- only the loss is.
-            loss, _sigma = engine.denoise_step(
-                idx,
-                block_idx=block,
-                generator=torch.Generator().manual_seed(seed * 1000 + step),
-            )
-        else:
-            # `train_step` returns the CE loss directly, not a `(loss, sigma)`
-            # pair, and requires real targets: `GPT.forward` returns logits when
-            # `targets is None`, which has no scalar to read.
-            loss = engine.train_step(idx, targets, block_idx=block)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
-        losses.append(float(loss.detach()))
-
-    with torch.no_grad():
-        # The block-output measurement. `probe` is the block's clean target; the
-        # residual identity is what makes it the right reference for both arms.
-        # Under EDM the input is the preconditioned clean stream, and the
-        # preconditioner is applied to the sigma *tensor* rather than a Python
-        # float, so the scaling matches what `denoise_step` did. Under CE there
-        # is no noise level at all, so the probe is fed directly.
-        sigma = torch.ones(())
-        c_in, _c_out, _w = edm_preconditioning(sigma, engine.partitioner.sigma_data)
-        block_input = probe if objective == OBJECTIVE_CE else c_in * probe
-        out = engine._run_block_denoiser(0, block_input, sigma, probe.size(1))
-        mse = float((out - probe).square().mean())
-        power = float(probe.square().mean())
-    return sum(losses) / len(losses), (mse / power if power > 0 else float("inf"))
-
-
-def run_objective(args: argparse.Namespace) -> list[AblationRow]:
-    """`--db-objective ce` vs `edm`: block-output reconstruction under each.
-
-    Baseline is the whole-depth next-token escape hatch (`train_step`), variant
-    is the real DiffusionBlocks objective (`denoise_step`). The row reports the
-    paired mean block-output NMSE, and the per-arm losses go in the note as a
-    diagnostic. The *sign* of the delta is not a quality claim in either
-    direction: the two objectives optimize different functions, so neither
-    "wins" and `better` only records which arm reconstructed its probe more
-    closely.
-    """
-    base_nmse = 0.0
-    var_nmse = 0.0
-    base_loss = 0.0
-    var_loss = 0.0
-    for seed in range(args.seeds):
-        # Same seed, same probe, same tokens, same engine for both arms.
-        b_loss, b_nmse = _run_objective_arm(args, OBJECTIVE_CE, seed)
-        v_loss, v_nmse = _run_objective_arm(args, OBJECTIVE_EDM, seed)
-        base_nmse += b_nmse
-        var_nmse += v_nmse
-        base_loss += b_loss
-        var_loss += v_loss
-
-    base_nmse /= args.seeds
-    var_nmse /= args.seeds
-    return [
-        AblationRow(
-            experiment="objective",
-            metric="block_out_nmse",
-            baseline=OBJECTIVE_CE,
-            variant=OBJECTIVE_EDM,
-            value_baseline=base_nmse,
-            value_variant=var_nmse,
-            delta=var_nmse - base_nmse,
-            better="variant" if var_nmse < base_nmse else "baseline",
-            seeds=list(range(args.seeds)),
-            n_seeds=args.seeds,
-            notes=(
-                f"mean block-output NMSE over {args.objective_steps} SGD steps on a "
-                f"{args.ablation_n_layer}-layer random model with "
-                f"{args.ablation_blocks} diffusion blocks; mean train loss ce "
-                f"{base_loss / args.seeds:.6g} vs edm {var_loss / args.seeds:.6g}, "
-                "reported as a diagnostic only: the edm loss is jittery by design, "
-                "so neither arm is monotone and no quality claim is made from it. "
-                "No lm_head gradient assertion is made -- the edm objective "
-                "predicts an embedding, not tokens."
-            ),
-        )
-    ]
-
-
-# ---------------------------------------------------------------------------
-# block_sampling
-# ---------------------------------------------------------------------------
-
-
-def _accumulate_one_step(
-    engine,
-    args: argparse.Namespace,
-    micro_steps: int,
-    mode: str,
-    seed: int,
-    clean: torch.Tensor,
-) -> dict[str, torch.Tensor | None]:
-    """Accumulate one optimizer step's gradients, emulating `mode`.
-
-    Three of the four traps in handoff §12.3 are enforced here:
-
-    1. **Gradients accumulate.** `zero_grad` is called once, before the
-       micro-step loop, and never inside it. The real loop adds each micro-step's
-       contribution to the running gradient; re-zeroing per micro-step would
-       measure the *last* micro-step alone, which is the bug §5.1b found and not a
-       faithful emulation of the loop being criticized.
-    2. **Sigma varies per sample.** `denoise_step` draws a fresh sigma from the
-       active block's band on every call, with a per-micro-step generator seed.
-       Holding sigma fixed makes every block tie on the metric and the mode
-       comparison stops discriminating.
-    3. **`db_denoise_heads.*` and `transformer.h.*` are kept apart.** The
-       denominator is the reference run's parameter list, partitioned by family
-       and reported as separate rows, so a change that erases one family's
-       gradients cannot be masked by the other still reaching the optimizer.
-
-    The fourth trap -- building the reference from already-erased states -- is
-    handled by the caller: `ref` comes from `_per_block_reference`, which is
-    computed from its own engine before any accumulation runs.
-
-    Each micro-step's loss is divided by `micro_steps` so the accumulated
-    gradient is the *mean* over micro-steps, matching what an optimizer step
-    built from that loss would apply.
-    """
-    engine.zero_grad(set_to_none=True)
-    for micro in range(micro_steps):
-        if mode == SAMPLING_STEP:
-            # One block held for the whole optimizer step -- the same block the
-            # reference ran. Rotating `micro % n_blocks` here instead would
-            # reproduce exactly what the `micro` arm does and make the two arms
-            # indistinguishable by construction. The noise generator is still
-            # re-seeded per micro-step, so both arms draw the same sigma
-            # sequence; only the *block* is held, not the sigma.
-            block = STEP_ARM_BLOCK
-        else:
-            # The engine's own sampler, so the arm uses the real draw rather
-            # than a reimplementation of it.
-            block = engine.sample_block(
-                generator=torch.Generator().manual_seed(seed * 7919 + micro)
-            )
-        loss, _sigma = engine.denoise_step(
-            # `clean` is supplied, so `idx` is read only for its sequence
-            # length; the values are never used.
-            _length_only_idx(probe_seq_len=clean.size(1)),
-            block_idx=block,
-            generator=torch.Generator().manual_seed(seed * 104729 + micro),
-            clean=clean,
-        )
-        (loss / micro_steps).backward()
-    return {name: p.grad for name, p in engine_named_parameters(engine)}
-
-
-def _length_only_idx(probe_seq_len: int) -> torch.Tensor:
-    """A `(1, seq_len)` long tensor used only for its `.size(1)`.
-
-    `denoise_step` reads `idx` for the sequence length once `clean` is given, so
-    the values are irrelevant -- but passing `None` fails on `idx.size(1)`. Kept
-    at width 1 and named for its only real use so that contract is visible at
-    the call site instead of being a mystery argument.
-    """
-    return torch.zeros(1, probe_seq_len, dtype=torch.long)
-
-
-def _per_block_reference(
-    args: argparse.Namespace, seed: int
-) -> tuple[dict[str, torch.Tensor | None], list[str]]:
-    """The isolated single-block run: one block, one micro-step, no history.
-
-    This is the *reference*, so it must be built from a clean engine of its own.
-    Reading it off a post-step state -- where a previous accumulation has already
-    zeroed or restored gradients -- would compare the two modes against a
-    reference that had already been through the process being measured.
-    """
-    engine = build_probe_engine(args, seed=seed)
-    _probe, idx, _targets = block_probe_tensors(args, seed)
-    clean = torch.nn.functional.normalize(
-        engine.model.transformer.wte(idx).float(), dim=-1
-    ).detach()
-    engine.zero_grad(set_to_none=True)
-    loss, _sigma = engine.denoise_step(
-        _length_only_idx(clean.size(1)),
-        block_idx=0,
-        generator=torch.Generator().manual_seed(seed),
-        clean=clean,
-    )
-    loss.backward()
-    grads = {name: p.grad for name, p in engine_named_parameters(engine)}
-    return grads, list(grads)
-
-
-def run_block_sampling(args: argparse.Namespace) -> list[AblationRow]:
-    """`--db-block-sampling step` vs `micro`: gradient retention after one step.
-
-    Metric: the fraction of the isolated per-block reference gradient that
-    survives to the end of one accumulated optimizer step, per parameter family.
-    `step` sampling holds one block for the whole step, so micro-steps reinforce
-    the same gradients. `micro` redraws the block every micro-step, and
-    `_apply_requires_grad` sets `p.grad = None` for whatever the newly activated
-    block does not own -- so each micro-step erases the previous one's
-    contribution and only the last block sampled reaches the optimizer
-    (handoff §5.1b, §12.3).
-
-    That difference is measured, not asserted. The claim check requires only
-    that the reference is non-empty and that the two arms are distinguishable --
-    a tie means the metric stopped discriminating, which is the §12.3 failure
-    and is reported as a problem whichever direction it came out.
-    """
-    per_family: dict[tuple[str, str], list[float]] = {
-        (mode, family): []
-        for mode in (SAMPLING_STEP, SAMPLING_MICRO)
-        for family in SAMPLING_FAMILIES
-    }
-    for seed in range(args.seeds):
-        # Built from its own engine, before any accumulation runs.
-        ref_grads, names = _per_block_reference(args, seed)
-        for mode in (SAMPLING_STEP, SAMPLING_MICRO):
-            engine = build_probe_engine(args, seed=seed)
-            _probe, idx, _targets = block_probe_tensors(args, seed)
-            clean = torch.nn.functional.normalize(
-                engine.model.transformer.wte(idx).float(), dim=-1
-            ).detach()
-            grads = _accumulate_one_step(
-                engine, args, args.block_sampling_micro_steps, mode, seed, clean
-            )
-            for family in SAMPLING_FAMILIES:
-                per_family[(mode, family)].append(
-                    grad_retained_fraction(grads, names, family, ref_grads)
-                )
-
-    rows: list[AblationRow] = []
-    for family in SAMPLING_FAMILIES:
-        step_vals = per_family[(SAMPLING_STEP, family)]
-        micro_vals = per_family[(SAMPLING_MICRO, family)]
-        base = sum(step_vals) / len(step_vals)
-        var = sum(micro_vals) / len(micro_vals)
-        # The seed spread is reported because this metric is strongly
-        # seed-dependent, and hiding that would let a reader mistake one
-        # seed's ratio for a stable constant. It varies with the sigma lottery
-        # more than with the sampling mode: the same configuration measured
-        # 42.7 at one seed and 11.9 at eight.
-        step_spread = _spread(step_vals)
-        micro_spread = _spread(micro_vals)
-        rows.append(
-            AblationRow(
-                experiment=f"block_sampling_{family.rstrip('.')}",
-                metric="grad_magnitude_ratio",
-                baseline=SAMPLING_STEP,
-                variant=SAMPLING_MICRO,
-                value_baseline=base,
-                value_variant=var,
-                delta=var - base,
-                better="variant" if var > base else "baseline",
-                seeds=list(range(args.seeds)),
-                n_seeds=args.seeds,
-                notes=(
-                    f"||accumulated gradient|| / ||isolated single-block reference "
-                    f"gradient|| over {family}* parameters after one optimizer step "
-                    f"of {args.block_sampling_micro_steps} accumulated micro-steps; "
-                    f"the two families are never pooled. step {base:.6g} "
-                    f"(spread {step_spread:.3g}), micro {var:.6g} "
-                    f"(spread {micro_spread:.3g}), micro/step "
-                    f"{(var / base if base else float('nan')):.4g}. NOT a fraction "
-                    "in [0,1] and NOT calibrated to 1: the reference is a single "
-                    "micro-step while both arms accumulate "
-                    f"{args.block_sampling_micro_steps} of them, so the absolute "
-                    "scale is set by how much the micro-steps' gradients agree, "
-                    "which is a property of the sigma draw rather than of the "
-                    "sampling mode. Only the micro/step ratio carries the claim. "
-                    "That ratio is strongly seed-dependent -- the same step "
-                    "configuration read 42.7 at --seeds 1 and 11.9 at --seeds 8 "
-                    "-- because sigma is resampled per seed and the step arm's "
-                    "magnitudes follow that lottery. Treat the ratio as "
-                    "directional evidence at a fixed seed count, not as a "
-                    "constant; re-running at a different seed count will move "
-                    "both arms. The finding the ratio supports: `micro` retains "
-                    "strictly LESS signal than `step` for the same wall-clock "
-                    "step, because the block drawn last displaces the one the "
-                    "reference owns. Gradients accumulate across micro-steps "
-                    "(zero_grad once, not per micro-step), each loss is divided "
-                    "by the micro-step count, sigma is redrawn per sample, and "
-                    "the reference is built from a separate engine before any "
-                    "accumulation runs."
-                ),
-            )
-        )
-    return rows
-
-
-def _spread(values: list[float]) -> float:
-    """Relative spread of `values`: stdev divided by the mean, 0.0 if undefined.
-
-    Reported alongside a seed-averaged metric so a reader can see whether the
-    mean is representative or an artifact of one draw. Relative rather than
-    absolute so it is comparable across the experiments' different scales.
-    """
-    if len(values) < 2:
-        return 0.0
-    mean = sum(values) / len(values)
-    if mean == 0.0:
-        return 0.0
-    variance = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
-    return math.sqrt(variance) / abs(mean)
-
-
-# ---------------------------------------------------------------------------
-# overlap
-# ---------------------------------------------------------------------------
-
-
-def measure_overlap_out_of_band(
-    args: argparse.Namespace, overlap: float, seed: int
-) -> float:
-    """Fraction of sampled `(sigma, block)` pairs outside the *nominal* band.
-
-    The band is the partitioner's own `boundaries()[b], boundaries()[b + 1]` --
-    the disjoint equi-probability partition. `sample_sigma(b, overlap=g)` draws
-    from `[lo/alpha, hi*alpha]` with `alpha = (hi/lo) ** g`, so this fraction is
-    expected to *rise* with `g`: overlap deliberately widens the sampling
-    interval past the nominal band, which is the mechanism by which it absorbs
-    the mass that would otherwise be misrouted (§12.1).
-
-    That is exactly why the handoff's "strictly decreases" framing is not the
-    assertion made here. Measuring against the *widened* interval instead would
-    be circular -- `overlap` defines that interval, so the measured fraction
-    would fall by construction and test nothing (§10.3).
-    """
-    partitioner = EquiProbabilityPartitioner(num_blocks=args.ablation_blocks)
-    bounds = partitioner.boundaries()
-    generator = torch.Generator().manual_seed(seed)
-    out_of_band = 0
-    total = 0
-    for block in range(args.ablation_blocks):
-        lo = float(bounds[block].item())
-        hi = float(bounds[block + 1].item())
-        for _ in range(args.overlap_samples):
-            sigma = float(
-                partitioner.sample_sigma(
-                    block, generator=generator, overlap=overlap
-                ).item()
-            )
-            total += 1
-            if not lo <= sigma <= hi:
-                out_of_band += 1
-    return out_of_band / total if total else 0.0
-
-
-def run_overlap(args: argparse.Namespace) -> list[AblationRow]:
-    """`--db-overlap` sweep: how much of each draw leaves its nominal band.
-
-    One row per swept setting, so the trend is readable down the leaderboard
-    rather than collapsed into a single delta. The disjoint partition is the
-    baseline every setting is compared against.
-    """
-    settings = sorted_overlap_sweep(args)
-    out_of_band: dict[float, list[float]] = {g: [] for g in settings}
-    for g in settings:
-        for seed in range(args.seeds):
-            out_of_band[g].append(measure_overlap_out_of_band(args, g, seed))
-    rows: list[AblationRow] = []
-    baseline = settings[0]
-    base_val = sum(out_of_band[baseline]) / len(out_of_band[baseline])
-    for g in settings:
-        vals = out_of_band[g]
-        mean = sum(vals) / len(vals)
-        rows.append(
-            AblationRow(
-                experiment=f"overlap_g{g:g}",
-                metric="sigma_out_of_nominal_band",
-                baseline=f"g={baseline:g}",
-                variant=f"g={g:g}",
-                value_baseline=base_val,
-                value_variant=mean,
-                delta=mean - base_val,
-                better="variant" if mean < base_val else "baseline",
-                seeds=list(range(args.seeds)),
-                n_seeds=args.seeds,
-                notes=(
-                    f"overlap g={g:g} over {args.overlap_samples * args.ablation_blocks} "
-                    "draws per seed; the band is the partitioner's nominal "
-                    "equi-probability range, not the widened draw interval. CONTRADICTS "
-                    "the 'strictly decreases with overlap' framing: this fraction "
-                    "RISES with g, because sample_sigma draws from [lo/alpha, "
-                    "hi*alpha] and alpha widens the interval by construction -- that "
-                    "widening IS the mechanism by which overlap absorbs out-of-range "
-                    "mass (handoff 12.1). Measuring against the widened interval "
-                    "would be circular (10.3). No model runs for this row."
-                ),
-            )
-        )
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# sparsity
-# ---------------------------------------------------------------------------
-
-
-def pruned_lcqat_layers(
-    args: argparse.Namespace, preset: str, sparsity: float, scope: str
-) -> list:
-    """Retrofitted LC-QAT Linears, pruned to `sparsity` under `scope`.
-
-    Two properties of this path are load-bearing and easy to get wrong:
-
-    * **Masks are KEEP-masks** (`True` = retained). `magnitude_mask` returns
-      exactly that, and GMP intersects against the previous mask so pruning stays
-      monotone -- a pruned position holds an exact `0.0`, so its `|W|` is 0 and
-      it can never re-enter a magnitude-selected mask.
-    * **Structural sparsity requires exact LC-QAT zero dequantization.** A pruned
-      position holds an exact `0.0` in the shadow weight, and 0.0 is a codebook
-      *level* (the zero anchor at `m_neg`), so `bucketize(0.0)` returns `m_neg`
-      in any regime and the pruned position dequantizes back to exactly 0.0,
-      with no post-hoc mask multiply. The exact-zero check in
-      `measure_sparsity_nmse` verifies that contract survived the prune; it is
-      not a formality.
-
-    **Both scopes prune two layers jointly, and that is not incidental.**
-    `apply_global_pruning` ranks `|W|` across *all* modules it is handed, so a
-    global sweep over a single layer is the same mask as a layer sweep by
-    construction -- the two arms would tie and the comparison would be a
-    tautology. Passing both the attention and MLP projections is what gives
-    global scope something to rank across, and it is the pairing SparseProp
-    Fig. 6 actually compares.
-
-    The schedule is driven to its final target rather than to whatever the ramp
-    would have produced at an arbitrary step, so the sweep compares sparsities
-    rather than cadence. Gradual pruning is still the path that applies the mask.
-    """
-    model = build_active_tiny_gpt()
-    retrofit_model(model, PRESETS[preset])
-    inject_sparseprop_layers(
-        model, sparsity=sparsity, target_modules=["c_proj", "c_fc"], with_lcqat=True
-    )
-    layers = [
-        model.transformer.h[0].attn.c_proj,
-        model.transformer.h[0].mlp.c_fc,
-    ]
-    schedule = schedule_from_args(args)
-    schedule.target_sparsity = sparsity
-    schedule.scope = scope
-    # `apply` returns None off a prune event, and `enabled` is False whenever
-    # `every == 0` -- which is `--sparseprop-every`'s default. `every = 1` makes
-    # every step an event so the ramp actually runs; the step passed is the last
-    # one, so the ramp completes to its target instead of leaving the model at
-    # the start fraction. Skipping this would prune nothing and the whole sweep
-    # would report the NMSE of an unpruned layer.
-    schedule.every = 1
-    schedule.apply(model, schedule.ramp_steps, layers=layers)
-    return layers
-
-
-def scope_mask_disagreement(
-    args: argparse.Namespace, preset: str, sparsity: float
-) -> tuple[float, float]:
-    """How far the two scopes' masks disagree, pooled and per layer.
-
-    Returns `(pooled_disagreement, largest_per_layer_disagreement)`.
-
-    The per-layer *sparsity* of the two scopes came out identical at every
-    setting measured here, and that is a real property of these two layers
-    rather than a bug: their magnitude distributions overlap enough that one
-    global threshold prunes both to the same fraction. What the scopes actually
-    disagree about is *which* weights they keep -- the global threshold falls
-    between the two layers' medians, so it selects differently within each
-    layer even though the counts match. Counting the differing positions is
-    what makes the comparison non-tautological; reporting the NMSE of each
-    scope separately cannot, because equal counts give equal NMSE.
-
-    Disagreement is the fraction of positions at which the two masks differ, so
-    0.0 means identical masks and 0.5 means the scopes are as different as two
-    masks of the same sparsity can be.
-    """
-    torch.manual_seed(0)
-    layer_masks = pruned_lcqat_layers(args, preset, sparsity, SCOPE_LAYER)
-    global_masks = pruned_lcqat_layers(args, preset, sparsity, SCOPE_GLOBAL)
-    pooled = 0.0
-    total = 0
-    worst = 0.0
-    for layer_mask, global_mask in zip(layer_masks, global_masks, strict=True):
-        differing = int((layer_mask.sparsity_mask ^ global_mask.sparsity_mask).sum())
-        pooled += differing
-        total += int(layer_mask.sparsity_mask.numel())
-        worst = max(worst, differing / layer_mask.sparsity_mask.numel())
-    return (pooled / total if total else 0.0), worst
-
-
-def measure_sparsity_nmse(
-    args: argparse.Namespace, preset: str, sparsity: float, scope: str
-) -> tuple[float, bool]:
-    """Dequantized NMSE summed over the pruned layers, plus whether zeros hold.
-
-    NMSE is pooled over both layers as `total_squared_error / total_signal_power`
-    rather than averaged per layer, so a layer with more parameters contributes
-    in proportion to its size instead of being counted once regardless.
-    """
-    total_mse = 0.0
-    total_signal = 0.0
-    exact = True
-    for layer in pruned_lcqat_layers(args, preset, sparsity, scope):
-        with torch.no_grad():
-            original = layer.weight.detach().clone()
-            pruned = ~layer.sparsity_mask
-            # Round-trip through the quantizer, which is what the exported
-            # artifact does. Recomputed once, used for both the error and the
-            # zero check.
-            dequantized = reconstruct_layer(layer, original, "weight")
-            if bool(pruned.any()):
-                exact = exact and bool(
-                    torch.equal(
-                        dequantized[pruned], torch.zeros_like(dequantized[pruned])
-                    )
-                )
-            total_mse += float((original - dequantized).square().sum())
-            total_signal += float(original.square().sum())
-    return (total_mse / total_signal if total_signal > 0 else float("inf")), exact
-
-
-def run_sparsity(args: argparse.Namespace) -> list[AblationRow]:
-    """Sparsity x scope sweep: dequantized NMSE after pruning.
-
-    SparseProp Fig. 6 compares Uniform-GMP against Global-GMP at equal average
-    sparsity and finds Global better, so the two scopes are not interchangeable
-    and neither is the default by construction. Both are swept here, at the
-    floors and at the target, on a retrofitted `attn.c_proj` -- the first
-    non-negative activated layer in the model. No training runs: this measures
-    the mask, not what a trained model would do with it.
-    """
-    levels = sparsity_sweep(args)
-    nmse: dict[tuple[float, str], list[float]] = {
-        (level, scope): [] for level in levels for scope in SCOPES
-    }
-    exact: dict[tuple[float, str], bool] = {}
-    for level in levels:
-        for scope in SCOPES:
-            for seed in range(args.seeds):
-                torch.manual_seed(seed)
-                value, is_exact = measure_sparsity_nmse(
-                    args, VARIANT_PRESET, level, scope
-                )
-                nmse[(level, scope)].append(value)
-                exact[(level, scope)] = exact.get((level, scope), True) and is_exact
-
-    rows: list[AblationRow] = []
-    low, target = levels[0], levels[-1]
-    for scope in SCOPES:
-        base = sum(nmse[(low, scope)]) / len(nmse[(low, scope)])
-        var = sum(nmse[(target, scope)]) / len(nmse[(target, scope)])
-        rows.append(
-            AblationRow(
-                experiment=f"sparsity_{scope}",
-                metric="dequant_nmse",
-                baseline=f"{scope}@{low:g}",
-                variant=f"{scope}@{target:g}",
-                value_baseline=base,
-                value_variant=var,
-                delta=var - base,
-                better="variant" if var < base else "baseline",
-                seeds=list(range(args.seeds)),
-                n_seeds=args.seeds,
-                notes=(
-                    f"dequantized NMSE of a retrofitted attn.c_proj, {scope} scope, "
-                    f"sparsity {low:g} -> {target:g}, reached by the gradual schedule "
-                    "at its last ramp event. Masks are KEEP-masks (True = retained) "
-                    "and structural zeros dequantize to exactly 0.0 "
-                    f"({'verified' if exact[(target, scope)] else 'FAILED'} at the "
-                    f"target; {'verified' if exact[(low, scope)] else 'FAILED'} at the "
-                    "floor). NMSE rising with sparsity is expected -- pruning removes "
-                    "weight magnitude -- so this row records the mask's cost, not a "
-                    "quality win. No training runs."
-                ),
-            )
-        )
-    # The two scopes prune the two layers to the same *fraction* at every
-    # setting, so the NMSE rows above cannot separate them. This row reports
-    # the thing that does differ -- which weights each scope keeps -- so the
-    # `layer` vs `global` claim rests on a measurement rather than on a
-    # tautology.
-    pooled_disagreement, worst_layer = scope_mask_disagreement(
-        args, VARIANT_PRESET, target
-    )
-    rows.append(
-        AblationRow(
-            experiment="sparsity_scope_mask_disagreement",
-            metric="scope_mask_disagreement",
-            baseline=SCOPE_LAYER,
-            variant=SCOPE_GLOBAL,
-            value_baseline=0.0,
-            value_variant=pooled_disagreement,
-            delta=pooled_disagreement,
-            better="variant",
-            seeds=[0],
-            n_seeds=1,
-            notes=(
-                f"fraction of positions where the layer-scope and global-scope masks "
-                f"disagree at sparsity {target:g}, pooled over attn.c_proj and "
-                f"mlp.c_fc ({worst_layer:.4g} in the worse of the two layers). "
-                "Both scopes prune to the SAME per-layer fraction at every setting "
-                "measured here -- these two layers' magnitude distributions overlap "
-                "enough that one global threshold cuts both equally -- so the "
-                "per-scope NMSE rows above cannot distinguish them and would tie by "
-                "construction. The scopes disagree about WHICH weights survive, and "
-                "that is what this row measures. Whether global's selection is "
-                "better after training is NOT measured here: no training runs. "
-                "Single seed, because the two masks are a deterministic function of "
-                "the weight tensor, not a stochastic draw."
-            ),
-        )
-    )
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# act_lut
-# ---------------------------------------------------------------------------
-
-
-def build_activation_lut(
-    input_codebook: torch.Tensor,
-    output_codebook: torch.Tensor,
-    relaxation: str,
-    act_body: str,
-) -> LearnableIndexLut:
-    """One `LearnableIndexLut` at the requested relaxation and body.
-
-    The `smoothpwl` body is fitted here rather than reused, so each preset is
-    measured against its own freshly fitted body instead of a fit produced by
-    some earlier run.
-    """
-    body = None
-    if act_body == ACT_BODY_SMOOTHPWL:
-        body = SmoothPWL(
-            knots=int(input_codebook.numel()),
-            zero_pin=True,
-            act_name="relu2",
-        ).fit_from_callable()
-    return LearnableIndexLut(
-        input_codebook,
-        output_codebook,
-        act_name="relu2",
-        relaxation=relaxation,
-        smooth_body=body,
-    )
-
-
-#: The matched-budget K the handoff's parameter-reduction claim is stated at
-#: (HANDOFF §10.2.1, "at a matched 15 floats"). Measured separately from the
-#: model's own codebooks, whose K_in and K_out are not equal, so the
-#: K_in x K_out vs K_in + K_out comparison has to be posed at a K where both
-#: sides are stated on the same budget.
-K_MATCHED_BUDGET = 15
-
-
-def matched_budget_codebooks(k: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """A `k`-level input/output codebook pair for the matched-budget count.
-
-    The input codebook is non-negative, which is what this activation's domain
-    actually is: `mlp.forward` computes `F.relu(x).square()`, so every tensor
-    entering `attn.c_proj` is `>= 0`. That is what makes the pair satisfy the
-    contract `LearnableIndexLut` enforces on the proximity relaxation -- the
-    input level `0.0` must bake to an output codebook value of exactly `0.0`, or
-    the zero anchor cannot be pinned without disagreeing with the bake, and the
-    class refuses to build such a table rather than apply the pin silently.
-
-    The output codebook is the activation's own values, which is both sorted
-    (so the `bucketize` the proximity init performs is well defined) and
-    contains an exact `0.0`. The parameter *count* depends only on K, not on the
-    level values, so this is the right basis for the structural claim whatever
-    the specific values are.
-    """
-    input_codebook = torch.linspace(0.0, 4.0, k, dtype=torch.float32).contiguous()
-    output_codebook = get_activation("relu2")(input_codebook).contiguous()
-    return input_codebook, output_codebook
-
-
-def piecewise_linear(
-    xs: torch.Tensor, ys: torch.Tensor, query: torch.Tensor
-) -> torch.Tensor:
-    """Linear interpolation of the polyline through `(xs, ys)` at `query`.
-
-    This is what the frozen PWL body *is*: between knots the operation is a
-    linear map, and the value at a knot is its own `y`. Endpoints are clamped
-    rather than extrapolated, so a query outside the knot span takes the nearest
-    end value instead of being scored against a line that does not exist there.
-
-    `searchsorted` locates the segment and the two neighbours are lerped by
-    weight. Interpolating the `x` values alone (the obvious shortcut) would
-    reconstruct the *knot positions* rather than the function, and would score
-    the wrong curve entirely.
-    """
-    idx = torch.searchsorted(xs, query, right=True).clamp(1, xs.numel() - 1)
-    x0, x1 = xs[idx - 1], xs[idx]
-    y0, y1 = ys[idx - 1], ys[idx]
-    weight = torch.where(x1 > x0, (query - x0) / (x1 - x0), torch.zeros_like(query))
-    return y0 + weight * (y1 - y0)
-
-
-def run_act_lut(args: argparse.Namespace) -> list[AblationRow]:
-    """Activation-LUT relaxation x body: parameter count, fp8 identity, fit.
-
-    The table is the one compiled between two *quantized-inference* layers: the
-    `mlp.c_fc` output codebook indexes it and the `attn.c_proj` input codebook
-    is its value domain. Both are read off the retrofitted layer rather than
-    synthesized, so the measured K is the K the model uses.
-
-    Two of the three claims are exact and free:
-
-    * **Parameter count.** At K_in = K_out = 15 the free-logit matrix is 225
-      parameters and the proximity parameterization is K_in + K_out = 30. That
-      is a structural count, not a fit result.
-    * **fp8 knot identity.** `resolved_table()` reads `levels` only, so knots
-      round-tripped through `float8_e4m3fn` resolve to a *bit-identical* index
-      table. The saving is 1 byte per knot instead of 4 at zero behavioural
-      cost. Checked by swapping the stored knots for their fp8 round trip and
-      re-resolving.
-
-    The third -- that `smoothpwl` fits `relu^2` better than `pwl` -- was measured
-    in the handoff at **one** setting. It is re-measured here per preset rather
-    than copied, because a number this run did not produce does not belong in a
-    leaderboard meant to be auditable. If `smoothpwl` does not win at the setting
-    measured, the note says so; a probe finding is a result, not a failure, and
-    is not gated.
-    """
-    model = build_active_tiny_gpt()
-    retrofit_model(model, PRESETS[VARIANT_PRESET])
-    proj = model.transformer.h[0].attn.c_proj
-    fc = model.transformer.h[0].mlp.c_fc
-    # `mlp.c_fc`'s *output* quantizer feeds the activation between the two
-    # layers, so its codebook is the table's index domain; `attn.c_proj`'s
-    # activation (input) quantizer supplies the table's value range. Both are
-    # the roles the quantized-inference path actually uses.
-    input_codebook = codebook_of(fc, "out")
-    output_codebook = codebook_of(proj, "act")
-    k_in, k_out = int(input_codebook.numel()), int(output_codebook.numel())
-    act = get_activation("relu2")
-    # Both bodies are scored on one common grid over the `SmoothPWL` body's own
-    # init span, because that is the domain the RBF fit is actually run over.
-    # `SmoothPWL` does not retain `init_range` as an attribute, so the default
-    # is restated here; it is the same constant the handoff's 1.02 / 0.48 /
-    # 0.67 figures were measured on ("relu^2 over [-1, 1]", activation.py's
-    # module docstring). Scoring the PWL body over the *codebook's* span instead
-    # would put the two bodies on different ranges, and a `relu^2` probe over a
-    # one-sided codebook scores an artefact of that range rather than a fit.
-    body_range = SMOOTHPWL_DEFAULT_INIT_RANGE
-    grid = torch.linspace(-body_range, body_range, 400)
-
-    rows: list[AblationRow] = []
-
-    # The parameter-reduction claim is stated at a *matched* budget, where
-    # K_in == K_out so both relaxations are compared on the same number of
-    # floats. The model's own codebooks have K_in != K_out, so that comparison is
-    # posed on a matched pair instead of being asserted from the real one.
-    matched_in, matched_out = matched_budget_codebooks(K_MATCHED_BUDGET)
-    matched_logits = build_activation_lut(
-        matched_in, matched_out, RELAXATION_LOGITS, ACT_BODY_PWL
-    )
-    matched_proximity = build_activation_lut(
-        matched_in, matched_out, RELAXATION_PROXIMITY, ACT_BODY_PWL
-    )
-    matched_logits_params = sum(p.numel() for p in matched_logits.parameters())
-    matched_proximity_params = sum(p.numel() for p in matched_proximity.parameters())
-    # The fp8 identity is re-checked on the matched pair too, so the row
-    # carries both of the exact claims it is the natural home for rather than
-    # leaving one of them to be read off a per-preset row with a different K.
-    with torch.no_grad():
-        table_before = matched_proximity.resolved_table()
-        live_knots = matched_proximity.knots.detach().clone()
-        matched_proximity.knots.copy_(matched_proximity.fp8_knots())
-        table_after = matched_proximity.resolved_table()
-        matched_proximity.knots.copy_(live_knots)
-    matched_fp8_note = (
-        "fp8 knot export bit-identical to fp32: "
-        f"{bool(torch.equal(table_before, table_after))}"
-    )
-    rows.append(
-        AblationRow(
-            experiment="act_lut_matched_budget",
-            metric="lut_params",
-            baseline=f"{RELAXATION_LOGITS}_{ACT_BODY_PWL}",
-            variant=f"{RELAXATION_PROXIMITY}_{ACT_BODY_PWL}",
-            value_baseline=float(matched_logits_params),
-            value_variant=float(matched_proximity_params),
-            delta=float(matched_proximity_params - matched_logits_params),
-            better="variant"
-            if matched_proximity_params < matched_logits_params
-            else "baseline",
-            seeds=list(range(args.seeds)),
-            n_seeds=args.seeds,
-            notes=(
-                f"matched-budget parameter count at K_in=K_out={K_MATCHED_BUDGET}: "
-                f"{matched_proximity_params} proximity parameters (K_in + K_out) vs "
-                f"{matched_logits_params} for a free K_in x K_out logit matrix, a "
-                f"{matched_logits_params / matched_proximity_params:.2f}x reduction. "
-                f"{matched_fp8_note}. "
-                "This is a structural count that depends only on K, so it is exact "
-                "rather than a fit result. The model's own codebooks have "
-                f"K_in={k_in} != K_out={k_out}, so this row is the matched-budget "
-                "statement and the per-preset rows below are the real codebooks."
-            ),
-        )
-    )
-
-    for relaxation in RELAXATIONS:
-        for act_body in ACT_BODIES:
-            lut = build_activation_lut(
-                input_codebook, output_codebook, relaxation, act_body
-            )
-            n_params = sum(p.numel() for p in lut.parameters())
-
-            # fp8 identity: resolve, then swap in the fp8 round trip of the
-            # stored knots and resolve again. `resolved_table()` reads levels
-            # only, so the two must be bit-identical for any knot dtype.
-            #
-            # Only the proximity relaxation *has* knots -- the free-logit matrix
-            # stores no knot positions at all, so there is nothing to export and
-            # the claim does not apply to it. That is reported as such rather
-            # than skipped silently, because a blanket "bit-identical: True" on
-            # an arm that exported nothing would be asserting a result the run
-            # never produced.
-            has_knots = hasattr(lut, "knots")
-            if has_knots:
-                with torch.no_grad():
-                    table_fp32 = lut.resolved_table()
-                    live_knots = lut.knots.detach().clone()
-                    lut.knots.copy_(lut.fp8_knots())
-                    table_fp8 = lut.resolved_table()
-                    lut.knots.copy_(live_knots)
-                fp8_identical = bool(torch.equal(table_fp32, table_fp8))
-                fp8_note = f"fp8 knot export bit-identical to fp32: {fp8_identical}"
-            else:
-                table_fp32 = lut.resolved_table()
-                fp8_note = (
-                    "no fp8 export: the free-logit relaxation stores no knot "
-                    "positions, so the fp8 knot saving does not apply to this "
-                    "preset"
-                )
-
-            # The fit is measured on the *table's* (x, y) pairs: the input
-            # codebook entries are the knots, and the resolved table picks the
-            # output level each knot lands on. Scoring `act(table_values)` would
-            # be circular -- it would compare relu^2 against itself at the output
-            # codebook -- so the curve is reconstructed from those pairs and
-            # compared to the true activation over the knot span.
-            knots, _order = torch.sort(input_codebook)
-            y_at_knots = output_codebook[table_fp32]
-            with torch.no_grad():
-                table_error = float(
-                    (piecewise_linear(knots, y_at_knots, grid) - act(grid)).abs().max()
-                )
-                if act_body == ACT_BODY_SMOOTHPWL:
-                    body = SmoothPWL(
-                        knots=k_in, zero_pin=True, act_name="relu2"
-                    ).fit_from_callable()
-                    body_error = float((body(grid) - act(grid)).abs().max())
-                else:
-                    # The frozen PWL body *is* that piecewise-linear curve, so
-                    # both arms are scored through the same reconstruction and
-                    # the comparison is like-for-like.
-                    body_error = table_error
-
-            rows.append(
-                AblationRow(
-                    experiment=f"act_lut_{relaxation}_{act_body}",
-                    metric="lut_params",
-                    baseline=f"{RELAXATION_LOGITS}_{ACT_BODY_PWL}",
-                    variant=f"{relaxation}_{act_body}",
-                    value_baseline=float(k_in * k_out),
-                    value_variant=float(n_params),
-                    delta=float(n_params - k_in * k_out),
-                    better="variant" if n_params < k_in * k_out else "baseline",
-                    seeds=list(range(args.seeds)),
-                    n_seeds=args.seeds,
-                    notes=(
-                        f"relaxation={relaxation} body={act_body}: {n_params} table "
-                        f"parameters vs {k_in * k_out} for a free K_in x K_out logit "
-                        f"matrix at K_in={k_in}, K_out={k_out} (proximity is K_in + "
-                        f"K_out = {k_in + k_out}). {fp8_note}. Measured this run at "
-                        f"K={k_in}: body "
-                        f"max abs error on relu^2 over a {grid.numel()}-point grid "
-                        f"{body_error:.6g}, resolved-table error {table_error:.6g}. "
-                        "These are re-measured per preset, not copied from the "
-                        "handoff, whose figures came from one setting. No model runs."
-                    ),
-                )
-            )
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# sigma_cond
-# ---------------------------------------------------------------------------
-
-
-def count_codebook_cost(module) -> tuple[int, int]:
-    """`(parameter count, artifact bytes)` for a quantizer or codebook module.
-
-    Bytes are the trainable parameters at fp32 plus every persistent buffer at
-    its own element size -- i.e. what the exported artifact actually carries,
-    which is the cost `--db-sigma-codebook` is meant to be judged on. Buffers
-    that are not persistent in `state_dict` (the input/output codebooks a
-    `LearnableIndexLut` keeps for its own indexing) are excluded, because the
-    owning quantizer already ships them in the checkpoint and counting them
-    twice would overstate the artifact.
-    """
-    params = sum(p.numel() for p in module.parameters())
-    persistent = {name for name, _ in module.named_buffers()}
-    buffers = sum(
-        b.numel() * b.element_size()
-        for name, b in module.named_buffers()
-        if name in persistent
-    )
-    return params, params * 4 + buffers
-
-
-def run_sigma_cond(args: argparse.Namespace) -> list[AblationRow]:
-    """`--db-sigma-codebook` static vs conditioned: structural cost only.
-
-    **This experiment makes no accuracy claim, and none should be read into
-    it.** The distributional premise that would justify sigma conditioning --
-    that a block's activation distribution shifts with sigma in a way one
-    shared codebook cannot span -- is recorded here as **UNVERIFIED**: the
-    handoff's own probe (§12.2) looked for it on `c_proj`'s `relu^2` input and
-    did not find it. Whether a conditioned codebook would help accuracy is a
-    question about a premise this driver cannot justify, so it is not asked.
-
-    What *is* measurable without that premise is the price. `conditioned` stores
-    one codebook per anchor (one per diffusion block by default), so its
-    parameter count and artifact bytes are the shared codebook's times the anchor
-    count. That is a structural fact about the export format, and it is the only
-    claim this row makes.
-    """
-    anchors = args.db_sigma_anchors or args.ablation_blocks
-    model = build_active_tiny_gpt()
-    retrofit_model(model, PRESETS[VARIANT_PRESET])
-    proj = model.transformer.h[0].attn.c_proj
-    shared_q = select_quantizer(proj, "act")
-    shared_params, shared_bytes = count_codebook_cost(shared_q)
-    shared_codebook = codebook_of(proj, "act")
-
-    conditioned = SigmaConditionedCodebook(
-        num_anchors=anchors,
-        m_neg=shared_q.m_neg,
-        m_pos=shared_q.m_pos,
-        init_min=float(shared_codebook.min()),
-        init_max=float(shared_codebook.max()),
-    )
-    cond_params, cond_bytes = count_codebook_cost(conditioned)
-
-    return [
-        AblationRow(
-            experiment="sigma_cond",
-            metric="codebook_params",
-            baseline="static",
-            variant=f"conditioned@{anchors}",
-            value_baseline=float(shared_params),
-            value_variant=float(cond_params),
-            delta=float(cond_params - shared_params),
-            better="variant" if cond_params < shared_params else "baseline",
-            seeds=list(range(args.seeds)),
-            n_seeds=args.seeds,
-            notes=(
-                f"STRUCTURAL ONLY. Conditioned stores {anchors} codebooks (one per "
-                f"anchor) vs one shared: {cond_params} parameters / {cond_bytes} B vs "
-                f"{shared_params} / {shared_bytes} B, a "
-                f"{cond_params / shared_params:.1f}x parameter blow-up. The "
-                "distributional premise that a block's activation distribution "
-                "varies with sigma in an exploitable way is UNVERIFIED (handoff "
-                "12.2 disproved it on c_proj's relu^2 input). NO accuracy claim is "
-                "made for this experiment and none should be read into this row."
-            ),
-        )
-    ]
-
-
-# ---------------------------------------------------------------------------
-# bias_quant
-# ---------------------------------------------------------------------------
-
-#: Marker for the "bias codebook parameters moved" flag in the notes. Checked
-#: by string, like the `sparsity` and `act_lut` rows do, so the rendered
-#: leaderboard stays readable and the check needs no side channel.
-BIAS_CODEBOOK_LIVE = "codebook gradient live: True"
-BIAS_CODEBOOK_DEAD = "codebook gradient live: False"
-
-
-def _weight_kwargs(spec: CodebookSpec) -> dict[str, object]:
-    """A `LayerKConfig` cardinality as `from_float`'s weight-codebook kwargs."""
-    if isinstance(spec, tuple):
-        return {"K_weight_split": spec}
-    return {"K_weight": int(spec)}
-
-
-def _act_kwargs(spec: CodebookSpec) -> dict[str, object]:
-    """A `LayerKConfig` cardinality as `from_float`'s activation kwargs."""
-    if isinstance(spec, tuple):
-        return {"K_act_split": spec}
-    return {"K_act": int(spec)}
-
-
-def bias_probe(preset: str, k_bias: int) -> LCQATLinear:
-    """A `c_proj` whose bias goes through a `BiasQuantizer`; the paired baseline.
-
-    nanochat builds every projection with `bias=False`, so the shipped model has
-    nothing to quantize on the bias side and a bias codebook cannot be measured
-    on it at all. This gives `c_proj` a bias and converts *that one layer*
-    in place, so the FP32 baseline and the quantized variant are the same layer
-    -- same weight, same probe -- and the only thing that varies is whether the
-    bias term is quantized. That is what makes the pair paired.
-
-    The preset's real `down_weight` / `down_act` cardinalities are passed
-    through rather than hardcoded, so the weight and activation codebooks under
-    the bias are the ones the preset actually ships and the bias error is read
-    in the same context the other two terms are measured in. `retrofit_model` is
-    deliberately not called: it would re-convert this layer (and `from_float`
-    rejects an `LCQATLinear` input), so the conversion is done directly and the
-    rest of the model is untouched.
-
-    The layer is rebuilt per seed (see `run_bias_quant`) because the codebook is
-    trained below and `build_active_tiny_gpt` is what reseeds the weights.
-    """
-    model = build_active_tiny_gpt()
-    float_proj = model.transformer.h[0].mlp.c_proj
-    # `gpt.py` builds every projection with `bias=False`, so `float_proj.bias`
-    # is None and there is nothing to give the bias codebook to quantize. A
-    # fresh float Linear carrying *this* layer's weight plus a real bias is
-    # built here, so the weight and activation codebooks still span the real
-    # `c_proj` ranges and only the bias term is new.
-    #
-    # The bias is drawn at the `std` `build_active_tiny_gpt` itself uses for the
-    # zero-initialized projections, off the *global* RNG the caller has already
-    # seeded for this sweep -- a dedicated generator seeded to a constant here
-    # would hand every seed the identical bias and quietly turn a paired sweep
-    # into five copies of one measurement.
-    #
-    # It must not be left at zero: `BiasQuantizer.init_from_tensor` returns early
-    # on an all-identical vector and keeps the codebook on its default span,
-    # which for a bias is wider than the data -- the silent, permanent failure
-    # its docstring warns about.
-    float_with_bias = torch.nn.Linear(
-        float_proj.in_features, float_proj.out_features, bias=True
-    )
-    with torch.no_grad():
-        float_with_bias.weight.copy_(float_proj.weight)
-        float_with_bias.bias.normal_(mean=0.0, std=0.02)
-    cfg = PRESETS[preset]
-    replacement = LCQATLinear.from_float(
-        float_with_bias,
-        grad_scale=cfg.grad_scale,
-        quantize_bias=True,
-        K_bias=k_bias,
-        **_weight_kwargs(cfg.down_weight),
-        **_act_kwargs(cfg.down_act),
-    )
-    model.transformer.h[0].mlp.c_proj = replacement
-    return replacement
-
-
-def run_bias_quant(args: argparse.Namespace) -> list[AblationRow]:
-    """Is the bias worth one more codebook per layer? Error, cost, and liveness.
-
-    `dev/HANDOFF_symbiosis.md` §10.2.4 records that nothing in `LCQATLinear`
-    quantized the bias, and §10.4-E item 12 asks for exactly this measurement
-    before the capability is adopted. Three things decide it, and they are
-    reported as three rows rather than folded into one number:
-
-    1. **Fidelity.** The bias round-trip NMSE, quantized vs FP32. Reported on
-       its own, never pooled with the weight or activation NMSE: the bias is
-       `out_features` numbers against a `D x D` weight matrix, so a pooled
-       relative error is ~99.9% weight by element count and would hide whatever
-       the bias term does. That is the §9.8 pooled-NMSE mistake, repeated.
-    2. **Cost.** `count_codebook_cost` on the quantizer: parameters and artifact
-       bytes per layer. Independent of `out_features` -- one shared 1-D table,
-       not one per output channel -- which is the only reason it is cheap enough
-       to be worth asking about.
-    3. **Liveness.** Whether the codebook's own parameters receive a non-zero
-       gradient and then move. A codebook that never moves is inert storage, and
-       a bias error pinned at exactly 1.0 is its signature: every entry buckets
-       to the zero anchor, so the gather is the anchor, so the loss is
-       independent of the table.
-
-    The fidelity number is not read off a layer whose bias codebook was left on
-    the default `act_init` span. That span (-2..2) is fitted to `relu^2`
-    *outputs* and is ~40x wider than a std-0.02 bias, so every entry buckets onto
-    the zero anchor, one level is hit, the error is exactly 1.0 and the gradient
-    is identically zero -- the silent, permanent failure documented on
-    `BiasQuantizer.init_from_tensor`, and measured here rather than assumed.
-    `from_float` already performs that fit; the probe calls `init_from_tensor`
-    itself because it is the precondition the measurement depends on, not
-    something to inherit and hope for.
-
-    Whether the extra table is *worth it* is not decided here and the rows do
-    not pretend otherwise: this is a randomly-initialized layer, a handful of
-    SGD steps, and a reconstruction error. It measures the price and the
-    fidelity cost of the capability, not what it does to a trained model's loss.
-    """
-    nmse_baseline = 0.0
-    nmse_variant = 0.0
-    used_levels = 0
-    k_total = 0
-    moved = 0.0
-    ulp_floor = 0.0
-    non_zero_grads = 0
-    params = 0
-    artifact_bytes = 0
-    out_features = 0
-    in_features = 0
-
-    for seed in range(args.seeds):
-        torch.manual_seed(seed)
-        layer = bias_probe(VARIANT_PRESET, args.bias_quant_k_bias)
-        quantizer = layer.bias_quantizer
-        if quantizer is None:
-            raise RuntimeError(
-                "bias_probe built a layer with no bias_quantizer; the "
-                "quantize_bias flag did not reach LCQATLinear.from_float"
-            )
-        bias = layer.bias.detach().to(torch.float32)
-        out_features = int(bias.numel())
-        in_features = int(layer.in_features)
-
-        # MANDATORY, and the reason this probe measures anything at all: fit the
-        # table to the bias's own range. Without it the span is the layer's
-        # `act_init`, which spans relu^2 outputs and therefore overshoots a
-        # std-0.02 bias by orders of magnitude -- every entry lands on the zero
-        # anchor, the gradient is identically zero, and the error sits at
-        # exactly 1.0 forever. `from_float` already did this; doing it again is
-        # the probe stating the precondition it depends on rather than trusting
-        # a constructor call to have survived.
-        quantizer.init_from_tensor(bias)
-
-        # Baseline: the FP32 bias, which round-trips through nothing. Its error
-        # is zero by construction, and that is the point of pairing against it
-        # -- the question is not "is the quantized bias bad" but "how much does
-        # quantizing it cost".
-        base_mse, _base_max, base_power = quantization_error(bias, bias.clone())
-
-        indices = quantizer.bucketize(bias)
-        reconstructed = quantizer.get_codebook().detach()[indices.long()]
-        var_mse, _var_max, var_power = quantization_error(bias, reconstructed)
-
-        nmse_baseline += base_mse / base_power if base_power > 0 else 0.0
-        nmse_variant += var_mse / var_power if var_power > 0 else float("inf")
-        used_levels += int(torch.unique(indices).numel())
-        k_total += int(quantizer.K)
-
-        # Liveness: a real backward pass through the STE, then the codebook's own
-        # parameters (never the derived `get_codebook()` tensor, which carries no
-        # optimizer state) for `steps` SGD steps. Fixed target, so the loss is a
-        # genuine signal in the same way `observe_grad_scale` makes it one.
-        layer.zero_grad(set_to_none=True)
-        out = layer(non_negative_probe(layer.in_features, args.n, seed))
-        out.square().mean().backward()
-        target = list(quantizer.parameters())
-        if not target:
-            raise RuntimeError("bias_quantizer exposes no trainable parameters")
-        before = [p.detach().clone() for p in target]
-        grad_norm = math.sqrt(
-            sum(
-                float(p.grad.detach().square().sum())
-                for p in target
-                if p.grad is not None
-            )
-        )
-        if grad_norm > 0.0:
-            non_zero_grads += 1
-        optimizer = torch.optim.SGD(target, lr=args.bias_quant_lr)
-        for _ in range(args.bias_quant_steps):
-            optimizer.zero_grad(set_to_none=True)
-            layer(
-                non_negative_probe(layer.in_features, args.n, seed)
-            ).square().mean().backward()
-            optimizer.step()
-        moved += math.sqrt(
-            sum(
-                float(((p.detach() - b).square()).sum())
-                for p, b in zip(target, before, strict=True)
-            )
-        )
-        # `moved > 0` is the wrong liveness test on its own, and it is exactly
-        # the test that made a single-seed sweep report a live codebook as dead.
-        # A non-zero gradient does not guarantee a representable update: these
-        # latents sit at magnitude ~5, where one fp32 ULP is ~5e-7, so an SGD
-        # step of `lr * grad` with `grad` around 1e-5 at the default lr of 1e-2
-        # lands at ~1e-7 -- below the spacing between representable values. The
-        # parameter is then bit-identical before and after and `moved` is
-        # exactly 0.0, which reads as "dead" when the gradient is in fact live
-        # and the codebook merely cannot move at that learning rate. Recording
-        # the representable floor alongside lets the two cases be told apart.
-        ulp_floor += max(
-            float(torch.finfo(p.dtype).eps) * float(p.detach().abs().max())
-            for p in target
-        )
-        params, artifact_bytes = count_codebook_cost(quantizer)
-
-    seeds = args.seeds
-    nmse_baseline /= seeds
-    nmse_variant /= seeds
-    avg_moved = moved / seeds
-    avg_ulp = ulp_floor / seeds
-    # Live means both: a real gradient arrived, AND it moved the table by at
-    # least the representable floor. Requiring both is what keeps this check
-    # able to fail -- `moved` alone reported a live codebook as dead whenever a
-    # single-seed sweep's update landed below one fp32 ULP, while
-    # `gradient alone` would report the §9.8 dead-codebook case as live, since
-    # that trap has a non-zero *gradient* that is too small to matter for a
-    # different reason. Neither half substitutes for the other.
-    live = non_zero_grads == seeds and avg_moved >= avg_ulp > 0.0
-    live_flag = BIAS_CODEBOOK_LIVE if live else BIAS_CODEBOOK_DEAD
-    # `fp32` scores 0 by construction and cannot be beaten, so "better" names
-    # the arm with the lower error honestly instead of pretending the quantized
-    # arm won. The interesting reading is the *size* of the gap next to the cost.
-    better = "variant" if nmse_variant < nmse_baseline else "baseline"
-    baseline_label = "fp32 bias"
-    variant_label = f"bias_quant@{args.bias_quant_k_bias}"
-
-    return [
-        AblationRow(
-            experiment="bias_quant_nmse",
-            metric="bias_nmse",
-            baseline=baseline_label,
-            variant=variant_label,
-            value_baseline=nmse_baseline,
-            value_variant=nmse_variant,
-            delta=nmse_variant - nmse_baseline,
-            better=better,
-            seeds=list(range(seeds)),
-            n_seeds=seeds,
-            notes=(
-                f"BIAS NMSE ONLY, reported separately from the weight and "
-                f"activation errors on purpose: the bias is {out_features} "
-                f"numbers against a {in_features}x{out_features} weight "
-                f"matrix, so a pooled relative error would be the weight's by "
-                f"element count and would hide the bias term entirely (the 9.8 "
-                f"pooled-NMSE mistake). Quantized bias NMSE {nmse_variant:.6g} vs "
-                f"{nmse_baseline:.6g} for the FP32 bias, which round-trips through "
-                f"nothing and so scores 0 exactly. {used_levels // seeds}/"
-                f"{k_total // seeds} levels hit. init_from_tensor() was called "
-                "on the bias before this was "
-                "measured, because the quantizer's default act_init span "
-                "(-2..2, fitted to relu^2 outputs) is ~40x wider than a "
-                "std-0.02 bias: every entry then buckets onto the zero anchor, "
-                "1 level is hit, the error is exactly 1.0 and the gradient is "
-                "identically zero. from_float() performs the same fit, so this "
-                "is a precondition the probe states and checks, not a fix it "
-                "depends on."
-            ),
-        ),
-        AblationRow(
-            experiment="bias_quant_cost",
-            metric="bias_codebook_params",
-            baseline=baseline_label,
-            variant=variant_label,
-            value_baseline=0.0,
-            value_variant=float(params),
-            delta=float(params),
-            better="baseline",
-            seeds=list(range(seeds)),
-            n_seeds=seeds,
-            notes=(
-                f"EXTRA COST PER LAYER: {params} parameters / {artifact_bytes} B "
-                f"for one shared K={args.bias_quant_k_bias} table, independent of "
-                f"out_features={out_features} (one shared 1-D table, not one per "
-                f"output channel). The FP32 baseline carries the bias inline at "
-                "no extra parameters, which is why its value is 0 and `better` is "
-                "always `baseline` here: this row is a price tag, not a "
-                "comparison anyone can win. Judge it against the bias NMSE row."
-            ),
-        ),
-        AblationRow(
-            experiment="bias_quant_liveness",
-            metric="codebook_param_delta",
-            baseline="zero gradient",
-            variant="codebook gradient live: " + ("True" if live else "False"),
-            value_baseline=0.0,
-            value_variant=avg_moved,
-            delta=avg_moved,
-            better="variant" if live else "baseline",
-            seeds=list(range(seeds)),
-            n_seeds=seeds,
-            notes=(
-                f"{live_flag}. L2 distance the bias codebook's parameters moved "
-                f"over {args.bias_quant_steps} SGD steps at lr={args.bias_quant_lr} "
-                f"(mean over {seeds} seeds), from a real backward pass through "
-                f"LCQATLinear.forward: observed {avg_moved:.6g} against a "
-                f"representable floor of {avg_ulp:.6g} (one fp32 ULP at these "
-                "latents' magnitude, times the step count). Liveness requires "
-                "both a non-zero gradient and movement at or above that floor: "
-                "the gradient alone would call the §9.8 dead-codebook case live, "
-                "and movement alone calls a codebook that is merely too small to "
-                "update at this learning rate dead. A codebook with a live "
-                "gradient that does not move at all would mean the learning rate "
-                "or the gradient scale is wrong; zero gradient means every entry "
-                "bucketizes to the zero anchor and the error is pinned at "
-                "exactly 1.0, which is the §9.8 trap this row exists to catch."
-            ),
-        ),
-    ]
 
 
 def check_claims(rows: list[AblationRow], n_elements: int) -> list[str]:

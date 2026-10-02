@@ -27,7 +27,7 @@ What has to hold, and why:
 import pytest
 import torch
 
-from nanochat.lcqat.reference.simple import (
+from nanochat.models.quant.reference.simple import (
     LUT_FRONTS,
     ClassicUniformFakeQuant,
     LearnedLookup,

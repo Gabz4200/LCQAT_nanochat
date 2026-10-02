@@ -10,7 +10,7 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from nanochat.lcqat.ablation import (
+from nanochat.models.quant.ablation import (
     FALLOFFS,
     StrictLearnableGrid,
     cosine_falloff,

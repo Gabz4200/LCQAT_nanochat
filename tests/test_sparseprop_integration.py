@@ -5,8 +5,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nanochat.lcqat.linear import LCQATLinear
-from nanochat.lcqat.sparseprop import (
+from nanochat.models.quant.linear import LCQATLinear
+from nanochat.models.quant.sparseprop import (
     SparsePropLinear,
     SparsePropLinearLCQAT,
     apply_static_sparsity_mask,
@@ -16,7 +16,7 @@ from nanochat.lcqat.sparseprop import (
 
 @pytest.fixture
 def tiny_model():
-    from nanochat.gpt import GPT, GPTConfig
+    from nanochat.models.backbone import GPT, GPTConfig
 
     config = GPTConfig(
         sequence_len=32,
@@ -156,7 +156,7 @@ class TestSparsePropLinearAutograd:
 class TestInjection:
     def test_inject_replaces_linear(self, tiny_model):
         """inject_sparseprop_layers replaces nn.Linear with SparsePropLinear."""
-        from nanochat.lcqat.linear import LCQATLinear
+        from nanochat.models.quant.linear import LCQATLinear
 
         n_before = sum(
             1
@@ -203,7 +203,7 @@ class TestInjection:
 class TestDBCPUIntegration:
     def test_sparseprop_is_linear_subclass(self):
         """SparsePropLinear is recognized as nn.Linear by DB-CPU partitioner."""
-        from nanochat.gpt import Linear
+        from nanochat.models.backbone import Linear
 
         sparse = SparsePropLinear(32, 32, sparsity=0.5)
         assert isinstance(sparse, nn.Linear)
@@ -211,7 +211,7 @@ class TestDBCPUIntegration:
 
     def test_blockwise_training_runs(self, tiny_model):
         """DB-CPU block-wise training step works with SparseProp layer."""
-        from nanochat.diffusion_blocks import (
+        from nanochat.training.diffusion_blocks import (
             DiffusionBlockEngine,
             EquiProbabilityPartitioner,
         )
@@ -250,8 +250,8 @@ class TestDBCPUIntegration:
         "unexpected key(s)" on every wrapped `c_fc` -- a model trained with the
         always-on defaults could not be loaded for evaluation at all.
         """
-        from nanochat.lcqat import LayerKConfig, retrofit_model
-        from nanochat.lcqat.export import attach_learnable_activation_luts
+        from nanochat.models.quant import LayerKConfig, retrofit_model
+        from nanochat.models.quant.export import attach_learnable_activation_luts
 
         model = retrofit_model(tiny_model, LayerKConfig(min_linear_dim=1))
         n_attached = attach_learnable_activation_luts(model)
@@ -269,7 +269,7 @@ class TestDBCPUIntegration:
         )
 
     def test_sparseprop_with_lcqat(self, tiny_model):
-        from nanochat.lcqat import LayerKConfig, retrofit_model
+        from nanochat.models.quant import LayerKConfig, retrofit_model
 
         config = LayerKConfig(min_linear_dim=1)
         model = retrofit_model(tiny_model, config)
@@ -296,7 +296,7 @@ class TestDBCPUIntegration:
 
     def test_engine_apply_sparseprop(self, tiny_model):
         """DiffusionBlockEngine.apply_sparseprop injects SparseProp into all blocks."""
-        from nanochat.diffusion_blocks import (
+        from nanochat.training.diffusion_blocks import (
             DiffusionBlockEngine,
             EquiProbabilityPartitioner,
         )
@@ -323,7 +323,7 @@ class TestDBCPUIntegration:
 class TestSparsePropLCQAT:
     def test_lcqat_backward_gradients_flow(self, tiny_model):
         """SparsePropLinearLCQAT backward produces gradients on all params."""
-        from nanochat.lcqat import LayerKConfig, retrofit_model
+        from nanochat.models.quant import LayerKConfig, retrofit_model
 
         config = LayerKConfig(min_linear_dim=1)
         model = retrofit_model(tiny_model, config)
@@ -349,7 +349,7 @@ class TestSparsePropLCQAT:
 
     def test_lcqat_sparsity_mask_stays_fixed(self, tiny_model):
         """SparsePropLinearLCQAT sparsity mask does not change during training."""
-        from nanochat.lcqat import LayerKConfig, retrofit_model
+        from nanochat.models.quant import LayerKConfig, retrofit_model
 
         config = LayerKConfig(min_linear_dim=1)
         model = retrofit_model(tiny_model, config)
@@ -390,7 +390,7 @@ class TestSparsePropDenseGEMMPath:
 
     @pytest.fixture
     def sparse_layer(self, tiny_model):
-        from nanochat.lcqat import LayerKConfig, retrofit_model
+        from nanochat.models.quant import LayerKConfig, retrofit_model
 
         config = LayerKConfig(min_linear_dim=1)
         model = retrofit_model(tiny_model, config)
@@ -442,7 +442,7 @@ class TestSparsePropDenseGEMMPath:
         band -- so this single ratio pins both the mask arithmetic and the
         gradient scale.
         """
-        from nanochat.lcqat import LayerKConfig, retrofit_model
+        from nanochat.models.quant import LayerKConfig, retrofit_model
 
         # Both arms must be the *same* layer: inject_sparseprop_layers wraps a
         # subset of the Linears, so picking "the first LCQATLinear" and "the
@@ -526,7 +526,7 @@ class TestSparsePropDenseGEMMPath:
         for a missing one, so idempotence proves nothing here. Only the forward
         snapping onto the 15 codebook levels distinguishes them.
         """
-        from nanochat.lcqat import LayerKConfig, retrofit_model
+        from nanochat.models.quant import LayerKConfig, retrofit_model
 
         model = retrofit_model(_fresh_tiny_gpt(), LayerKConfig(min_linear_dim=1))
         inject_sparseprop_layers(model, sparsity=0.75, with_lcqat=True)
@@ -547,7 +547,7 @@ class TestSparsePropDenseGEMMPath:
 
     def test_out_quantizer_receives_gradient(self, tiny_model):
         """The re-parented out_quantizer must be trainable, not dead weight."""
-        from nanochat.lcqat import LayerKConfig, retrofit_model
+        from nanochat.models.quant import LayerKConfig, retrofit_model
 
         torch.manual_seed(0)
         model = retrofit_model(tiny_model, LayerKConfig(min_linear_dim=1))
@@ -578,7 +578,7 @@ def _fresh_tiny_gpt() -> nn.Module:
     reusing one model across arms leaves the arms sharing weight tensors and
     makes any gradient comparison trivially equal.
     """
-    from nanochat.gpt import GPT, GPTConfig
+    from nanochat.models.backbone import GPT, GPTConfig
 
     config = GPTConfig(
         sequence_len=32,
@@ -611,11 +611,11 @@ class TestSparsePropLearnedActivationLUT:
 
     @pytest.fixture
     def models(self):
-        from nanochat.lcqat import LayerKConfig, retrofit_model
-        from nanochat.lcqat.export import attach_learnable_activation_luts
+        from nanochat.models.quant import LayerKConfig, retrofit_model
+        from nanochat.models.quant.export import attach_learnable_activation_luts
 
         def build():
-            from nanochat.gpt import GPT, GPTConfig
+            from nanochat.models.backbone import GPT, GPTConfig
 
             config = GPTConfig(
                 sequence_len=32,

@@ -21,12 +21,26 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
 
-from nanochat.checkpoint_manager import (
+from nanochat.data.tokenizer import get_token_bytes
+from nanochat.models.flash_attention import HAS_FA3
+from nanochat.models.quant import lcqat_config_from_args, retrofit_summary
+from nanochat.models.quant.retrofit import LayerKConfig
+from nanochat.modules.checkpoint_manager import (
     load_model,
     load_optimizer_state,
     save_checkpoint,
 )
-from nanochat.common import (
+from nanochat.modules.engine import Engine
+from nanochat.modules.loss_eval import evaluate_bpb
+from nanochat.tasks.common import TaskMixture
+from nanochat.tasks.gsm8k import GSM8K
+from nanochat.tasks.mmlu import MMLU
+from nanochat.tasks.smoltalk import SmolTalk
+from nanochat.training.diffusion_blocks import (
+    DiffusionBlockEngine,
+    EquiProbabilityPartitioner,
+)
+from nanochat.utils.common import (
     COMPUTE_DTYPE,
     COMPUTE_DTYPE_REASON,
     DummyWandb,
@@ -38,18 +52,7 @@ from nanochat.common import (
     is_ddp_initialized,
     print0,
 )
-from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
-from nanochat.engine import Engine
-from nanochat.flash_attention import HAS_FA3
-from nanochat.lcqat import lcqat_config_from_args, retrofit_summary
-from nanochat.lcqat.retrofit import LayerKConfig
-from nanochat.loss_eval import evaluate_bpb
-from nanochat.tokenizer import get_token_bytes
 from scripts.chat_eval import run_chat_eval
-from tasks.common import TaskMixture
-from tasks.gsm8k import GSM8K
-from tasks.mmlu import MMLU
-from tasks.smoltalk import SmolTalk
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -226,7 +229,7 @@ parser.add_argument(
     default=0.75,
     help="sparsity level for SparseProp (fraction of weights pruned, 0.0-1.0)",
 )
-from nanochat.lcqat.pruning import (  # noqa: E402
+from nanochat.models.quant.pruning import (  # noqa: E402
     add_sparseprop_pruning_args,
     schedule_from_args,
 )
@@ -235,7 +238,7 @@ add_sparseprop_pruning_args(parser)
 # W6 DiffusionBlocks features (sigma codebooks / EfQAT per-block latching /
 # denoiser KD) plus --lcqat-channel-center, registered through the same shared
 # helper base_train uses so the three entry points cannot drift apart.
-from nanochat.lcqat.w6 import (  # noqa: E402
+from nanochat.models.quant.w6 import (  # noqa: E402
     add_w6_args,
     build_denoiser_teacher,
     describe_sigma_codebooks,
@@ -443,7 +446,7 @@ if args.kd_denoiser_alpha > 0.0:
 # not only on the ones where the anchor is installed.
 kd_denoiser = None
 if float_twin is not None:
-    from nanochat.lcqat.kd import DenoiserDistiller
+    from nanochat.models.quant.kd import DenoiserDistiller
 
     kd_denoiser = DenoiserDistiller(float_twin, alpha=args.kd_denoiser_alpha)
     engine.set_distiller(kd_denoiser)
@@ -499,7 +502,7 @@ token_bytes = get_token_bytes(device=device)
 # Initialize the Optimizer (AdamW-only for DiffusionBlocks engine)
 # PRD section 5: codebook delta params get their own AdamW group with a
 # dedicated LR and zero weight decay, distinct from the matrix-weight group.
-from nanochat.lcqat.optimizer import build_qat_param_groups, verify_partition
+from nanochat.models.quant.optimizer import build_qat_param_groups, verify_partition
 
 param_groups = build_qat_param_groups(
     engine,

@@ -24,8 +24,8 @@ and each has a test here:
 import pytest
 import torch
 
-from nanochat.lcqat.codebook import MemoryEfficientLearnedCodebook
-from nanochat.lcqat.learnable_lut import (
+from nanochat.models.quant.codebook import MemoryEfficientLearnedCodebook
+from nanochat.models.quant.learnable_lut import (
     KNOT_DTYPE,
     RELAXATIONS,
     LearnableIndexLut,

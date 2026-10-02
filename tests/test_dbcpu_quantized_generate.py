@@ -22,20 +22,23 @@ therefore fails outright if the odd-K restriction returns.
 import pytest
 import torch
 
-from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
-from nanochat.lcqat.export import export_lcqat_checkpoint
-from nanochat.lcqat.ops.index_linear import index_linear_cpu
-from nanochat.lcqat.ops.references.index_linear_reference import (
+from nanochat.models.quant.export import export_lcqat_checkpoint
+from nanochat.models.quant.packing import index_format_for_k, pack_weight_indices
+from nanochat.models.quant.retrofit import DEFAULT_PRESET, PRESETS, retrofit_model
+from nanochat.ops.index_linear import index_linear_cpu
+from nanochat.ops.references.index_linear_reference import (
     reference_index_linear,
 )
-from nanochat.lcqat.packing import index_format_for_k, pack_weight_indices
-from nanochat.lcqat.retrofit import DEFAULT_PRESET, PRESETS, retrofit_model
+from nanochat.training.diffusion_blocks import (
+    DiffusionBlockEngine,
+    EquiProbabilityPartitioner,
+)
 from tests.conftest import build_active_tiny_gpt
 
 
 def kernel_available() -> bool:
     try:
-        from nanochat.lcqat.kernels.cpu_loader import load_cpu_index_linear_extension
+        from nanochat.ops.kernels.cpu_loader import load_cpu_index_linear_extension
 
         load_cpu_index_linear_extension()
         return True

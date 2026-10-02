@@ -7,7 +7,7 @@ python -m pytest tests/test_lcqat_packing.py -v
 import pytest
 import torch
 
-from nanochat.lcqat.packing import (
+from nanochat.models.quant.packing import (
     FORMAT_INT32,
     FORMAT_NIBBLES,
     FORMAT_TRITS,

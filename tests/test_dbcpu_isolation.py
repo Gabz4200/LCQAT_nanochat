@@ -12,8 +12,8 @@ is exactly what happened before it was split out.
 
 import torch
 
-from nanochat.diffusion_blocks import _layer_groups
-from nanochat.lcqat.efqat import SelectiveFreezer
+from nanochat.models.quant.efqat import SelectiveFreezer
+from nanochat.training.diffusion_blocks import _layer_groups
 from tests.test_dbcpu_engine import make_engine
 
 

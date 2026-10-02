@@ -12,7 +12,7 @@ import copy
 import torch
 import torch.nn.functional as F
 
-from nanochat.lcqat import LCQATLinear, export_lcqat_checkpoint, retrofit_model
+from nanochat.models.quant import LCQATLinear, export_lcqat_checkpoint, retrofit_model
 
 
 def build_pair(preset) -> tuple:
@@ -29,7 +29,7 @@ def build_pair(preset) -> tuple:
 def test_when_exporting_then_activation_lut_wired_on_every_mlp(
     tiny_gpt_factory, tmp_path
 ) -> None:
-    from nanochat.lcqat import PRESETS
+    from nanochat.models.quant import PRESETS
 
     model = retrofit_model(tiny_gpt_factory(), PRESETS["prd"])
     state = export_lcqat_checkpoint(model, str(tmp_path / "act_export.pt"))
@@ -45,7 +45,7 @@ def test_when_exporting_then_lut_matches_value_path_quantizer_ids(
 ) -> None:
     # Independent oracle: run the REAL out-quantizer -> relu^2 -> act-quantizer
     # value path and require the compiled table to reproduce those exact IDs.
-    from nanochat.lcqat import PRESETS
+    from nanochat.models.quant import PRESETS
 
     model = retrofit_model(tiny_gpt_factory(), PRESETS["prd"])
     model.eval()
@@ -67,7 +67,7 @@ def test_when_exporting_then_lut_matches_value_path_quantizer_ids(
 def test_when_quantized_mlp_forward_then_matches_float_path(
     tiny_gpt_factory, tmp_path
 ) -> None:
-    from nanochat.lcqat import PRESETS
+    from nanochat.models.quant import PRESETS
 
     float_model, runtime_model = build_pair(PRESETS["prd"])
     export_lcqat_checkpoint(runtime_model, str(tmp_path / "mlp_export.pt"))

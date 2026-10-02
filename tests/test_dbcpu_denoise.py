@@ -10,7 +10,7 @@ import gc
 
 import torch
 
-from nanochat.diffusion_blocks import (
+from nanochat.training.diffusion_blocks import (
     EquiProbabilityPartitioner,
     edm_preconditioning,
 )

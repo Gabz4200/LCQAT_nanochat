@@ -20,7 +20,7 @@ import json
 import pytest
 import torch
 
-from nanochat.lcqat.efqat import BlockLatchFreezer
+from nanochat.models.quant.efqat import BlockLatchFreezer
 from tests.test_dbcpu_engine import make_engine
 
 

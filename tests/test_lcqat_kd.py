@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.lcqat.kd import KDLoss, kd_loss
+from nanochat.models.quant.kd import KDLoss, kd_loss
 
 
 class TinyModel(nn.Module):

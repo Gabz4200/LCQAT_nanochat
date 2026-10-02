@@ -10,14 +10,14 @@ import math
 import pytest
 import torch
 
-from nanochat.lcqat import (
+from nanochat.models.quant import (
     LCQATLinear,
     export_lcqat_checkpoint,
     is_exported_lcqat_state,
     is_lcqat_state,
     prepare_lcqat_before_load,
 )
-from nanochat.lcqat.packing import (
+from nanochat.models.quant.packing import (
     FORMAT_NIBBLES,
     FORMAT_TRITS,
     FORMAT_UINT8,
@@ -68,7 +68,7 @@ def test_when_loading_exported_artifact_then_loads_and_runs(
 ) -> None:
     from dataclasses import asdict
 
-    from nanochat.lcqat import PRESETS, retrofit_model
+    from nanochat.models.quant import PRESETS, retrofit_model
 
     torch.manual_seed(1)
     source = retrofit_model(tiny_gpt_factory(), PRESETS["prd"])
@@ -98,8 +98,8 @@ def test_when_build_model_with_exported_artifact_then_eval_runs_and_train_reject
 ) -> None:
     from dataclasses import asdict
 
-    from nanochat import checkpoint_manager as cm
-    from nanochat.lcqat import PRESETS, retrofit_model
+    from nanochat.models.quant import PRESETS, retrofit_model
+    from nanochat.modules import checkpoint_manager as cm
 
     torch.manual_seed(2)
     source = retrofit_model(tiny_gpt_factory(), PRESETS["prd"])
@@ -165,7 +165,7 @@ def test_when_exporting_then_indices_are_packed_by_k_format(
 def test_when_exporting_preset_prd_then_uint8_and_trit_formats_coexist(
     tiny_gpt_factory, tmp_path
 ) -> None:
-    from nanochat.lcqat import PRESETS, retrofit_model
+    from nanochat.models.quant import PRESETS, retrofit_model
 
     model = retrofit_model(tiny_gpt_factory(), PRESETS["prd"])
     state = export_lcqat_checkpoint(model, str(tmp_path / "prd_export.pt"))
@@ -177,7 +177,7 @@ def test_when_exporting_preset_prd_then_uint8_and_trit_formats_coexist(
 def test_when_exporting_k_above_255_then_int32_indices_not_rejected(
     tiny_gpt_factory, tmp_path
 ) -> None:
-    from nanochat.lcqat import LayerKConfig, retrofit_model
+    from nanochat.models.quant import LayerKConfig, retrofit_model
 
     cfg = LayerKConfig(down_weight=257, down_act=15)
     model = retrofit_model(tiny_gpt_factory(), cfg)

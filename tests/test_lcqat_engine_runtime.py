@@ -8,8 +8,13 @@ python -m pytest tests/test_lcqat_engine_runtime.py -v
 
 import torch
 
-from nanochat.engine import Engine, KVCache, QuantizedKVCache, kv_codebooks_from_model
-from nanochat.lcqat import PRESETS, retrofit_model
+from nanochat.models.quant import PRESETS, retrofit_model
+from nanochat.modules.engine import (
+    Engine,
+    KVCache,
+    QuantizedKVCache,
+    kv_codebooks_from_model,
+)
 from tests.conftest import build_active_tiny_gpt
 from tests.test_engine import ByteTokenizer
 

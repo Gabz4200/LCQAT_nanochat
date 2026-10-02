@@ -1246,8 +1246,6 @@ dependencies = [
     { name = "requests" },
     { name = "rustbpe" },
     { name = "tiktoken" },
-    { name = "torch", version = "2.14.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
-    { name = "torch", version = "2.14.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
     { name = "wandb" },
 ]
 
@@ -1284,7 +1282,6 @@ requires-dist = [
     { name = "rustbpe", specifier = ">=0.1.0" },
     { name = "setuptools", marker = "extra == 'cpu'", specifier = ">=65.0.0" },
     { name = "tiktoken", specifier = ">=0.11.0" },
-    { name = "torch", specifier = ">=2.14.0" },
     { name = "torch", marker = "extra == 'cpu'", specifier = ">=2.14.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "nanochat", extra = "cpu" } },
     { name = "wandb", specifier = ">=0.21.3" },
 ]

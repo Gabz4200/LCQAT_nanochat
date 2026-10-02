@@ -14,14 +14,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nanochat.lcqat.ablation import LearnableActivationLut
-from nanochat.lcqat.learnable_lut import (
+from nanochat.models.quant.ablation import LearnableActivationLut
+from nanochat.models.quant.learnable_lut import (
     DEFAULT_TEMPERATURE,
     LOGIT_SEED_STRENGTH,
     LearnableIndexLut,
     bake_learnable_table,
 )
-from nanochat.lcqat.lut import compile_activation_lut, get_activation
+from nanochat.models.quant.lut import compile_activation_lut, get_activation
 
 
 def make_codebooks(k_in: int = 15, k_out: int = 15, seed: int = 0):

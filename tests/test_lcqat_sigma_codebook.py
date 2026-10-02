@@ -20,8 +20,8 @@ import math
 import pytest
 import torch
 
-from nanochat.lcqat.codebook import MemoryEfficientLearnedCodebook
-from nanochat.lcqat.sigma_codebook import (
+from nanochat.models.quant.codebook import MemoryEfficientLearnedCodebook
+from nanochat.models.quant.sigma_codebook import (
     SigmaConditionedCodebook,
     SigmaModulatedCodebook,
     log_sigma_anchor_index,

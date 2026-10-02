@@ -21,8 +21,12 @@ What must hold, independent of any optimization:
 import pytest
 import torch
 
-from nanochat.lcqat.packing import FORMAT_NIBBLES, FORMAT_TRITS, index_format_for_k
-from nanochat.lcqat.sparse_artifact import (
+from nanochat.models.quant.packing import (
+    FORMAT_NIBBLES,
+    FORMAT_TRITS,
+    index_format_for_k,
+)
+from nanochat.models.quant.sparse_artifact import (
     MIN_EXPORT_ALPHABET,
     dense_bytes_for,
     pack_sparse_plan,
@@ -291,8 +295,8 @@ class TestSparseExportIntegration:
     def _sparse_lcqat_model(sparsity: float = 0.5):
         import torch.nn as nn
 
-        from nanochat.lcqat.linear import LCQATLinear
-        from nanochat.lcqat.sparseprop import SparsePropLinearLCQAT
+        from nanochat.models.quant.linear import LCQATLinear
+        from nanochat.models.quant.sparseprop import SparsePropLinearLCQAT
 
         torch.manual_seed(3)
         lcqat = LCQATLinear.from_float(nn.Linear(16, 8), K_weight=15, K_act=15)
@@ -306,7 +310,7 @@ class TestSparseExportIntegration:
         `export_lcqat_checkpoint` does not emit these, the compact alphabet and
         the physical size reduction exist only in memory.
         """
-        from nanochat.lcqat.export import export_lcqat_checkpoint
+        from nanochat.models.quant.export import export_lcqat_checkpoint
 
         model = self._sparse_lcqat_model(sparsity=0.5)
         state = export_lcqat_checkpoint(model, str(tmp_path / "sparse.pt"), sparse=True)
@@ -333,7 +337,7 @@ class TestSparseExportIntegration:
 
     def test_when_sparse_is_false_then_no_sparse_buffers_are_emitted(self, tmp_path):
         """Opting out must be a clean dense artifact, not a partial one."""
-        from nanochat.lcqat.export import export_lcqat_checkpoint
+        from nanochat.models.quant.export import export_lcqat_checkpoint
 
         model = self._sparse_lcqat_model(sparsity=0.5)
         state = export_lcqat_checkpoint(model, str(tmp_path / "dense.pt"), sparse=False)
@@ -349,8 +353,8 @@ class TestSparseExportIntegration:
         buffer must get the same answer it got before, which is what keeps this
         an optimization rather than a behaviour change.
         """
-        from nanochat.lcqat.export import export_lcqat_checkpoint
-        from nanochat.lcqat.packing import unpack_weight_indices
+        from nanochat.models.quant.export import export_lcqat_checkpoint
+        from nanochat.models.quant.packing import unpack_weight_indices
 
         model = self._sparse_lcqat_model(sparsity=0.5)
         state = export_lcqat_checkpoint(model, str(tmp_path / "both.pt"), sparse=True)
@@ -366,8 +370,8 @@ class TestSparseExportIntegration:
         """A layer with no mask takes the dense path, unchanged."""
         import torch.nn as nn
 
-        from nanochat.lcqat.export import export_lcqat_checkpoint
-        from nanochat.lcqat.linear import LCQATLinear
+        from nanochat.models.quant.export import export_lcqat_checkpoint
+        from nanochat.models.quant.linear import LCQATLinear
 
         torch.manual_seed(4)
         model = nn.Sequential(

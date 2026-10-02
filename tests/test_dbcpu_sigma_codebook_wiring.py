@@ -17,8 +17,8 @@ silently trains unconditioned while the flag reports itself enabled.
 import pytest
 import torch
 
-from nanochat.lcqat.retrofit import PRESETS
-from nanochat.lcqat.sigma_codebook import (
+from nanochat.models.quant.retrofit import PRESETS
+from nanochat.models.quant.sigma_codebook import (
     SigmaConditionedCodebook,
     SigmaModulatedCodebook,
     resolve_batch_sigma,
@@ -111,8 +111,8 @@ class TestEngineTraining:
         completely broken. Recording what each layer actually receives is the
         only version of this check that can fail.
         """
-        import nanochat.diffusion_blocks as db_mod
-        import nanochat.gpt as gpt_mod
+        import nanochat.models.backbone as gpt_mod
+        import nanochat.training.diffusion_blocks as db_mod
 
         engine = make_engine(3, n_layer=6)
         engine.apply_lcqat(PRESETS["asym"])
@@ -181,8 +181,8 @@ class TestBaseTransformerLayers:
     """
 
     def test_when_conditioned_then_the_base_mlp_receives_sigma(self) -> None:
-        from nanochat.gpt import MLP
-        from nanochat.lcqat.linear import LCQATLinear
+        from nanochat.models.backbone import MLP
+        from nanochat.models.quant.linear import LCQATLinear
 
         mlp = MLP.__new__(MLP)
         torch.nn.Module.__init__(mlp)
@@ -213,8 +213,8 @@ class TestBaseTransformerLayers:
         here the only sigma-dependent thing in the graph *is* the codebook, so a
         constant-sigma regression is unambiguous.
         """
-        from nanochat.gpt import MLP
-        from nanochat.lcqat.linear import LCQATLinear
+        from nanochat.models.backbone import MLP
+        from nanochat.models.quant.linear import LCQATLinear
 
         def build(seed: int) -> MLP:
             torch.manual_seed(seed)
@@ -276,8 +276,8 @@ class TestQuantizedRuntimeGuard:
         first, so calling the layer would assert on a different precondition and
         never reach the sigma guard at all.
         """
-        from nanochat.gpt import MLP
-        from nanochat.lcqat.linear import LCQATLinear
+        from nanochat.models.backbone import MLP
+        from nanochat.models.quant.linear import LCQATLinear
 
         c_fc = LCQATLinear(16, 32, bias=False, K_act=7, quantize_out=True)
         c_fc.act_quantizer = modulated(c_fc.act_quantizer)
@@ -308,7 +308,7 @@ class TestQuantizedRuntimeGuard:
         A guard that raises unconditionally would be indistinguishable from the
         bug it prevents: both look like "the fused path is broken".
         """
-        from nanochat.gpt import MLP, maybe_sigma_call
+        from nanochat.models.backbone import MLP, maybe_sigma_call
 
         mlp = MLP.__new__(MLP)
         torch.nn.Module.__init__(mlp)
@@ -333,7 +333,7 @@ class TestGradientScaling:
         x = torch.randn(4, 32, requires_grad=True)
         codebook = modulated(
             __import__(
-                "nanochat.lcqat.codebook", fromlist=["x"]
+                "nanochat.models.quant.codebook", fromlist=["x"]
             ).MemoryEfficientLearnedCodebook(m_neg=3, m_pos=3)
         )
         x2 = x.detach().clone().requires_grad_(True)

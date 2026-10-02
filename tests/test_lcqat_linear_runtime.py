@@ -11,7 +11,7 @@ import copy
 
 import torch
 
-from nanochat.lcqat import LCQATLinear, export_lcqat_checkpoint, retrofit_model
+from nanochat.models.quant import LCQATLinear, export_lcqat_checkpoint, retrofit_model
 
 
 def make_linear(in_features: int = 16, out_features: int = 8) -> LCQATLinear:
@@ -42,7 +42,7 @@ def test_when_quantized_inference_forward_then_matches_ste_float_path(
 
 
 def test_when_mixed_k_model_forward_then_matches_float_path(tmp_path) -> None:
-    from nanochat.lcqat import PRESETS
+    from nanochat.models.quant import PRESETS
     from tests.conftest import build_active_tiny_gpt
 
     torch.manual_seed(42)

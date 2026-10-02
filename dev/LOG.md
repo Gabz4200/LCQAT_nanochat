@@ -9,7 +9,7 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 Implemented the LC-QAT PRD (the deferred KV-cache storage piece has since been implemented). Every retrofitted `Linear` gets asymmetric odd-size codebooks `K = 2M + 1` with an exact zero anchor at index `M`, monotonic levels via cumulative `softplus` steps, and an STE that trains both the input and the codebook (the PRD's plain `x + (C[Q] - x).detach()` zeroes the codebook gradient, so the forward is written as `C[Q] + (x - x.detach())` instead).
 
 **Wiring:**
-- `nanochat/lcqat/` holds the functional core: codebook, `LCQATLinear` (with output quantizers on Q/K/V and `mlp.c_fc`), per-role retrofit with `small` (max compression: q/k K=3, rest K=15) and `prd` (8-bit down_proj) presets + `--lcqat-k-map` overrides, activation LUT compiler, bit-packing, export.
+- `nanochat/models/quant/` holds the quantization core: codebook, `LCQATLinear` (with output quantizers on Q/K/V and `mlp.c_fc`), per-role retrofit with `small` (max compression: q/k K=3, rest K=15) and `prd` (8-bit down_proj) presets + `--lcqat-k-map` overrides, activation LUT compiler, bit-packing, export.
 - One root-cause integration covers *all* training options: `GPT.setup_optimizer` splits `raw_*_deltas` into their own AdamW group (LR `--codebook-lr`, wd=0, never Muon - they're 1-D), and `checkpoint_manager.build_model` auto-detects LC-QAT checkpoints from state keys and retrofits before/after load as needed. `base_train`/`chat_sft`/`chat_rl` just add `--lcqat` flags; checkpoint meta saves the active config so resumes stay provenance-correct. `--fp8` conflicts are rejected (both convert `Linear`).
 - Mul-less inference GEMV (`K_W=3`): `dispatch_gemv(backend=naive|cpu|gpu)` with a pure-PyTorch oracle, a C++ AVX-512/AVX2/scalar runtime-dispatched kernel (two asymmetric scales per row - PRD's single `c0` assumed symmetric codebooks), and a portable Slang/Vulkan shader, all lazy-loaded, no silent fallback, three-way parity + `opcheck` + `torch.compile` tests green on this machine (AVX2 i5-8250U + Intel UHD 620 iGPU).
 
@@ -95,7 +95,7 @@ autocast is "magic we don't control" — it silently decides which ops run in wh
 
 ### What changed
 
-**Core mechanism** (`nanochat/common.py`, `nanochat/gpt.py`):
+**Core mechanism** (`nanochat/utils/common.py`, `nanochat/models/backbone.py`):
 - `COMPUTE_DTYPE` auto-detected from hardware: SM 80+ → bf16, pre-Ampere → fp32, CPU/MPS → fp32. Override via `NANOCHAT_DTYPE` env var.
 - Custom `Linear(nn.Linear)` class that casts weights to match input dtype in forward: `F.linear(x, self.weight.to(dtype=x.dtype))`. This is the single mechanism that replaces autocast.
 - Embeddings cast to `COMPUTE_DTYPE` at init (saves memory). Exception: fp16 keeps embeddings fp32 because GradScaler cannot unscale fp16 gradients.

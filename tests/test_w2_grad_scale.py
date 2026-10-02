@@ -12,9 +12,9 @@ existed in the library and nowhere else.
 import pytest
 import torch
 
-from nanochat.lcqat import PRESETS, LCQATLinear, retrofit_model
-from nanochat.lcqat.linear import GRAD_SCALE_INV_SQRT_N, GRAD_SCALE_NONE
-from nanochat.lcqat.retrofit import DEFAULT_PRESET, lcqat_config_from_args
+from nanochat.models.quant import PRESETS, LCQATLinear, retrofit_model
+from nanochat.models.quant.linear import GRAD_SCALE_INV_SQRT_N, GRAD_SCALE_NONE
+from nanochat.models.quant.retrofit import DEFAULT_PRESET, lcqat_config_from_args
 from tests.conftest import build_active_tiny_gpt
 
 
@@ -126,7 +126,7 @@ def test_when_grad_scale_persists_in_config_then_resume_cannot_change_it_silentl
 
     cfg = replace(PRESETS[DEFAULT_PRESET], grad_scale=GRAD_SCALE_NONE)
     assert cfg.as_dict()["grad_scale"] == GRAD_SCALE_NONE
-    from nanochat.lcqat.retrofit import LayerKConfig
+    from nanochat.models.quant.retrofit import LayerKConfig
 
     assert LayerKConfig.from_dict(cfg.as_dict()).grad_scale == GRAD_SCALE_NONE
 

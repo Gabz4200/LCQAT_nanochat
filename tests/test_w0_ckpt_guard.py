@@ -10,10 +10,13 @@ healthy.
 import pytest
 import torch
 
-from nanochat.checkpoint_manager import build_model, save_checkpoint
-from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
-from nanochat.lcqat import PRESETS, retrofit_model
-from nanochat.lcqat.retrofit import DEFAULT_PRESET
+from nanochat.models.quant import PRESETS, retrofit_model
+from nanochat.models.quant.retrofit import DEFAULT_PRESET
+from nanochat.modules.checkpoint_manager import build_model, save_checkpoint
+from nanochat.training.diffusion_blocks import (
+    DiffusionBlockEngine,
+    EquiProbabilityPartitioner,
+)
 from tests.conftest import build_active_tiny_gpt
 
 
@@ -37,8 +40,8 @@ def _engine_matching_tokenizer():
     loaded through it. n_embd is kept small so the vocab-sized embedding stays
     cheap in a test.
     """
-    from nanochat.gpt import GPT, GPTConfig
-    from nanochat.tokenizer import get_tokenizer
+    from nanochat.data.tokenizer import get_tokenizer
+    from nanochat.models.backbone import GPT, GPTConfig
 
     vocab = get_tokenizer().get_vocab_size()
     torch.manual_seed(0)

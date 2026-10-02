@@ -15,7 +15,7 @@ Two things are load-bearing and get most of the attention here:
 import pytest
 import torch
 
-from nanochat.lcqat.per_channel import PerChannelValueCenteredQuantizer
+from nanochat.models.quant.per_channel import PerChannelValueCenteredQuantizer
 
 
 def quantizer(
@@ -221,7 +221,7 @@ class TestAgainstSharedCodebook:
         the big channel and would hide the entire effect. The measured result:
         channel 1 goes from 1.0 (discarded) to 0.398.
         """
-        from nanochat.lcqat.codebook import MemoryEfficientLearnedCodebook
+        from nanochat.models.quant.codebook import MemoryEfficientLearnedCodebook
 
         # One channel 100x larger than the rest, which is the case a shared
         # alphabet handles worst.

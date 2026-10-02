@@ -19,21 +19,21 @@ import argparse
 import pytest
 import torch
 
-from nanochat.gpt import GPT, GPTConfig
-from nanochat.lcqat import (
+from nanochat.models.backbone import GPT, GPTConfig
+from nanochat.models.quant import (
     LayerKConfig,
     attach_learnable_activation_luts,
     lcqat_config_from_args,
     retrofit_model,
 )
-from nanochat.lcqat.activation import ACT_BODIES
-from nanochat.lcqat.learnable_lut import RELAXATIONS
-from nanochat.lcqat.optimizer import (
+from nanochat.models.quant.activation import ACT_BODIES
+from nanochat.models.quant.learnable_lut import RELAXATIONS
+from nanochat.models.quant.optimizer import (
     build_qat_param_groups,
     role_for_name,
     verify_partition,
 )
-from nanochat.lcqat.retrofit import is_lcqat_state, prepare_lcqat_before_load
+from nanochat.models.quant.retrofit import is_lcqat_state, prepare_lcqat_before_load
 
 RELAXATION_ACT_BODY_PAIRS = [
     ("logits", "pwl"),

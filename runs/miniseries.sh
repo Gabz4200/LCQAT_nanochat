@@ -20,7 +20,7 @@ if [ -z "$SKIP_SETUP" ]; then
 
     # Tokenizer, download 1000 shards for pretraining
     # (probably this can be reduced but it's tricky to determine the exact right number, TODO).
-    python -m nanochat.dataset -n 1000
+    python -m nanochat.data.dataset -n 1000
     python -m scripts.tok_train --max-chars=2000000000 --vocab-size=32768
 else
     source .venv/bin/activate

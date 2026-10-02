@@ -18,20 +18,20 @@ Tests that only exercise validation skip when the extension cannot build.
 import pytest
 import torch
 
-from nanochat.lcqat.ops.references.sparse_linear_reference import (
-    reference_sparse_index_linear,
-)
-from nanochat.lcqat.sparse_artifact import (
+from nanochat.models.quant.sparse_artifact import (
     pack_sparse_plan,
     plan_sparse_export,
     unpack_sparse_plan,
+)
+from nanochat.ops.references.sparse_linear_reference import (
+    reference_sparse_index_linear,
 )
 
 
 def kernel_available() -> bool:
     """True when the C++ extension can be built, so JIT is not a test failure."""
     try:
-        from nanochat.lcqat.kernels.cpu_loader import load_cpu_sparseprop_extension
+        from nanochat.ops.kernels.cpu_loader import load_cpu_sparseprop_extension
 
         load_cpu_sparseprop_extension()
         return True
@@ -95,7 +95,7 @@ def build_case(
 
 
 def run_kernel(case) -> torch.Tensor:
-    from nanochat.lcqat.ops.sparse_index_linear import sparse_index_linear_cpu
+    from nanochat.ops.sparse_index_linear import sparse_index_linear_cpu
 
     return sparse_index_linear_cpu(
         case["act_indices"],
@@ -240,7 +240,7 @@ class TestZeroSkip:
 class TestKernelRejectsBadInputs:
     def test_when_the_backend_is_unknown_then_it_raises(self, sparse_kernel) -> None:
         """No dense fallback: a silent downgrade would defeat the point."""
-        from nanochat.lcqat.ops.sparse_index_linear import sparse_index_linear
+        from nanochat.ops.sparse_index_linear import sparse_index_linear
 
         case = build_case(0)
         with pytest.raises(ValueError, match="no fallback"):
@@ -259,7 +259,7 @@ class TestKernelRejectsBadInputs:
         self, sparse_kernel
     ) -> None:
         """The kernel reads int32; silently casting would hide a caller bug."""
-        from nanochat.lcqat.ops.sparse_index_linear import sparse_index_linear_cpu
+        from nanochat.ops.sparse_index_linear import sparse_index_linear_cpu
 
         case = build_case(0)
         with pytest.raises(ValueError, match="int32"):
@@ -276,7 +276,7 @@ class TestKernelRejectsBadInputs:
     def test_when_nnz_disagrees_between_buffers_then_it_raises(
         self, sparse_kernel
     ) -> None:
-        from nanochat.lcqat.ops.sparse_index_linear import sparse_index_linear_cpu
+        from nanochat.ops.sparse_index_linear import sparse_index_linear_cpu
 
         case = build_case(0)
         with pytest.raises(ValueError, match="same length"):
@@ -293,7 +293,7 @@ class TestKernelRejectsBadInputs:
     def test_when_the_activation_indices_are_not_uint8_then_it_raises(
         self, sparse_kernel
     ) -> None:
-        from nanochat.lcqat.ops.sparse_index_linear import sparse_index_linear_cpu
+        from nanochat.ops.sparse_index_linear import sparse_index_linear_cpu
 
         case = build_case(0)
         with pytest.raises(ValueError, match="uint8"):

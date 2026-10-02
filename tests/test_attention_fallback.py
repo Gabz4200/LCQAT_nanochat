@@ -17,9 +17,9 @@ Note on test structure:
 import pytest
 import torch
 
-import nanochat.flash_attention as fa_module
-from nanochat.engine import KVCache
-from nanochat.flash_attention import HAS_FA3, flash_attn
+import nanochat.models.flash_attention as fa_module
+from nanochat.models.flash_attention import HAS_FA3, flash_attn
+from nanochat.modules.engine import KVCache
 
 
 def set_impl(impl):

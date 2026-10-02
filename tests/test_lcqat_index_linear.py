@@ -10,9 +10,9 @@ python -m pytest tests/test_lcqat_index_linear.py -v
 import pytest
 import torch
 
-from nanochat.lcqat.kernels.gpu_loader import vulkan_available
-from nanochat.lcqat.ops import dispatch_index_linear
-from nanochat.lcqat.packing import FORMAT_TRITS, pack_weight_indices
+from nanochat.models.quant.packing import FORMAT_TRITS, pack_weight_indices
+from nanochat.ops import dispatch_index_linear
+from nanochat.ops.kernels.gpu_loader import vulkan_available
 
 requires_vulkan = pytest.mark.skipif(
     not vulkan_available(), reason="Vulkan device unavailable for the Taichi backend"
@@ -111,7 +111,7 @@ def test_when_weight_index_exceeds_lut_then_value_error() -> None:
     # Repack with an out-of-range value for the declared K.
     bad = raw.clone()
     bad[0, 0] = 15
-    from nanochat.lcqat.packing import pack_nibbles
+    from nanochat.models.quant.packing import pack_nibbles
 
     case["weight_indices"] = pack_nibbles(bad)
     with pytest.raises(ValueError, match="out of range"):
@@ -155,7 +155,7 @@ def test_when_gpu_backend_then_matches_naive(k: int) -> None:
 
 
 def test_when_cpu_op_then_opcheck_passes() -> None:
-    from nanochat.lcqat.ops.index_linear import _ensure_cpu_index_linear_op
+    from nanochat.ops.index_linear import _ensure_cpu_index_linear_op
 
     _ensure_cpu_index_linear_op()
     case, _ = make_case(15, 6, 16, 3, seed=11)
@@ -171,7 +171,7 @@ def test_when_cpu_op_then_opcheck_passes() -> None:
 
 
 def test_when_compile_with_cpu_backend_then_composes_via_fake_tensor() -> None:
-    from nanochat.lcqat.ops.index_linear import _ensure_cpu_index_linear_op
+    from nanochat.ops.index_linear import _ensure_cpu_index_linear_op
 
     _ensure_cpu_index_linear_op()
     case, _ = make_case(15, 6, 16, 3, seed=12)

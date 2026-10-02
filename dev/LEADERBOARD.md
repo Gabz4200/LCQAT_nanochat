@@ -155,7 +155,7 @@ Achived Mar 3 2026 on commit `324e69c`. The big change is the switch from Huggin
 To reproduce, use the commit above, download at least 150 data shards, train the tokenizer:
 
 ```
-python -m nanochat.dataset -n 150
+python -m nanochat.data.dataset -n 150
 python -m scripts.tok_train
 ```
 

@@ -8,7 +8,7 @@ python -m pytest tests/test_lcqat_kv_cache.py -v
 import pytest
 import torch
 
-from nanochat.engine import QuantizedKVCache, kv_codebooks_from_model
+from nanochat.modules.engine import QuantizedKVCache, kv_codebooks_from_model
 
 K = 15
 L, B, T, H, D = 2, 2, 16, 3, 8

@@ -2,7 +2,7 @@
 
 import torch
 
-from nanochat.optim import AdamW
+from nanochat.training.optim import AdamW
 
 
 def test_adamw_step_deterministic():

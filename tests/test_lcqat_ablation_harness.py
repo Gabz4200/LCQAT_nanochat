@@ -24,7 +24,7 @@ import math
 import pytest
 import torch
 
-from nanochat.lcqat.ablation_metrics import (
+from nanochat.models.quant.ablation_metrics import (
     aggregate_comparisons,
     compare_presets,
     measure_reconstruction,
@@ -34,8 +34,8 @@ from nanochat.lcqat.ablation_metrics import (
     row_to_dict,
     select_quantizer,
 )
-from nanochat.lcqat.linear import GRAD_SCALE_INV_SQRT_N, GRAD_SCALE_NONE
-from nanochat.lcqat.retrofit import PRESETS, retrofit_model
+from nanochat.models.quant.linear import GRAD_SCALE_INV_SQRT_N, GRAD_SCALE_NONE
+from nanochat.models.quant.retrofit import PRESETS, retrofit_model
 from tests.conftest import build_active_tiny_gpt
 
 
@@ -267,7 +267,7 @@ class TestLeaderboardRendering:
         substring assertion passes and the defect ships -- which is exactly what
         happened. The count of table lines is the property that catches it.
         """
-        from nanochat.lcqat.ablation_metrics import AblationRow
+        from nanochat.models.quant.ablation_metrics import AblationRow
 
         rows = [
             AblationRow(
@@ -294,7 +294,7 @@ class TestLeaderboardRendering:
         assert {line.count("|") for line in body} == {header.count("|")}
 
     def test_when_rendered_then_the_table_contains_every_row(self) -> None:
-        from nanochat.lcqat.ablation_metrics import AblationRow
+        from nanochat.models.quant.ablation_metrics import AblationRow
 
         rows = [
             AblationRow(
@@ -330,7 +330,7 @@ class TestLeaderboardRendering:
     def test_when_serialized_then_the_row_is_json_friendly(self) -> None:
         import json
 
-        from nanochat.lcqat.ablation_metrics import AblationRow
+        from nanochat.models.quant.ablation_metrics import AblationRow
 
         row = AblationRow(
             experiment="a",

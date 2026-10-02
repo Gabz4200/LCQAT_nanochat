@@ -26,9 +26,12 @@ import copy
 import pytest
 import torch
 
-from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
-from nanochat.lcqat.kd import DenoiserDistiller, denoiser_kd_loss
-from nanochat.lcqat.retrofit import DEFAULT_PRESET, PRESETS, retrofit_model
+from nanochat.models.quant.kd import DenoiserDistiller, denoiser_kd_loss
+from nanochat.models.quant.retrofit import DEFAULT_PRESET, PRESETS, retrofit_model
+from nanochat.training.diffusion_blocks import (
+    DiffusionBlockEngine,
+    EquiProbabilityPartitioner,
+)
 from tests.conftest import build_active_tiny_gpt
 
 

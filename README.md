@@ -164,25 +164,25 @@ python -m scripts.chat_rl --no-lcqat --no-sparseprop          # plain RL
 | `--db-block-sampling {step,micro}` | Draw the active block once per optimizer step (default) or per micro-step. `micro` is **lossy** with gradient accumulation: `_apply_requires_grad` clears gradients the active block does not own, so each micro-step erases the previous one and only the last block sampled reaches the optimizer |
 | `--fp8` | FP8 training for the float path. **Mutually exclusive with LC-QAT** (both convert `Linear`) |
 | `--lcqat-channel-center` | Per-output-channel weight codebooks instead of one shared table (PRD 3.4), so channels with very different scales are not forced onto a compromise grid. Off by default; costs `out_features × K` levels and makes the layer **un-exportable**, so it cannot be combined with the fused inference path. Persisted in checkpoint meta, so a resume does not silently drop it |
-| bias quantization | Opt-in bias codebook (`nanochat/lcqat/bias_quant.py`), set via `LayerKConfig.quantize_bias` / `LCQATLinear(quantize_bias=True)`. **Off by default and with no CLI flag yet**, so existing checkpoints and outputs are bit-identical. Measured cost and error in the [ablation table](#ablation-harness) |
+| bias quantization | Opt-in bias codebook (`nanochat/models/quant/bias_quant.py`), set via `LayerKConfig.quantize_bias` / `LCQATLinear(quantize_bias=True)`. **Off by default and with no CLI flag yet**, so existing checkpoints and outputs are bit-identical. Measured cost and error in the [ablation table](#ablation-harness) |
 
-Per-layer roles (`nanochat/lcqat/retrofit.py`): `attn.c_q`/`c_k` get ternary weights, Q/K/V **outputs** are quantized during training and the quantized KV-cache runtime is implemented (`Engine.generate(quantized_kv=True)`), `mlp.c_fc` output is quantized as the input side of the fused relu² LUT, `lm_head` and linears under 128 dims stay in floating point.
+Per-layer roles (`nanochat/models/quant/retrofit.py`): `attn.c_q`/`c_k` get ternary weights, Q/K/V **outputs** are quantized during training and the quantized KV-cache runtime is implemented (`Engine.generate(quantized_kv=True)`), `mlp.c_fc` output is quantized as the input side of the fused relu² LUT, `lm_head` and linears under 128 dims stay in floating point.
 
 ### Two things to know about the DiffusionBlocks default
 
 - **`lm_head` is not trained by `--db-objective edm`.** The EDM objective trains a denoiser that predicts a clean *embedding* (`denoise_heads[b]`), never tokens, so `lm_head` has no gradient on that path. It is still used when sampling. This is a property of the objective, not a wiring bug — the loss has no logits to attach a gradient to. Use `--db-objective ce` if you need a token-level objective (and remember the two objectives must not be mixed within a run).
 - **The per-step loss is jittery by design.** σ is resampled every step and `w(σ) = (σ²+σ_d²)/(σ·σ_d)²` reweights it, so the loss varies substantially between steps even with fixed weights. That is EDM working as specified, not instability.
 
-**Activation LUTs.** Beyond weights, activations are quantized through fused lookup tables registered in an activation registry (`nanochat/lcqat/lut.py`). All common nonlinearities are covered: `relu2`, `silu`, `gelu`, `tanh`, `sigmoid`. The export step bakes these into static FP32 LUTs via `wire_activation_luts`.
+**Activation LUTs.** Beyond weights, activations are quantized through fused lookup tables registered in an activation registry (`nanochat/models/quant/lut.py`). All common nonlinearities are covered: `relu2`, `silu`, `gelu`, `tanh`, `sigmoid`. The export step bakes these into static FP32 LUTs via `wire_activation_luts`.
 
 **Knowledge Distillation (KD) anchoring.** High compression ratios compress the loss manifold into sharp local minima. LC-QAT anchors the student QAT optimization using a KL-divergence against a frozen, detached FP32/BF16 teacher (the pre-quantization model, or any other unquantized reference). The teacher is never optimized.
 
 `L_KD = tau^2 * D_KL( softmax(Z_teacher / tau) || softmax(Z_student / tau) )`
 `L_total = (1 - alpha) * L_CE(Y, Y_hat_quant) + alpha * L_KD`
 
-Enabled via `--kd-alpha` (default 0.0 = off; ~0.1 typical), `--kd-teacher-source` and `--kd-teacher-tag` (the float checkpoint to load as teacher). Implemented in `nanochat/lcqat/kd.py` (`KDLoss`).
+Enabled via `--kd-alpha` (default 0.0 = off; ~0.1 typical), `--kd-teacher-source` and `--kd-teacher-tag` (the float checkpoint to load as teacher). Implemented in `nanochat/models/quant/kd.py` (`KDLoss`).
 
-**EfQAT selective layer freezing.** To keep memory flat at scale, LC-QAT can selectively freeze middle-layer codebook deltas and weight gradients after a warm-up, keeping only "critical outlier layers" (input embedding projections, attention q/k, final output) trainable. Enabled with `--efqat-freeze-after N` (default -1 = off). Implemented in `nanochat/lcqat/efqat.py` (`SelectiveFreezer`). The optimizer simply skips params whose `.grad is None`, so momentum buffers are unaffected.
+**EfQAT selective layer freezing.** To keep memory flat at scale, LC-QAT can selectively freeze middle-layer codebook deltas and weight gradients after a warm-up, keeping only "critical outlier layers" (input embedding projections, attention q/k, final output) trainable. Enabled with `--efqat-freeze-after N` (default -1 = off). Implemented in `nanochat/models/quant/efqat.py` (`SelectiveFreezer`). The optimizer simply skips params whose `.grad is None`, so momentum buffers are unaffected.
 
 **EfQAT per-block permanent freezing.** `SelectiveFreezer` above freezes by *layer role* (a global middle-layer band). `--efqat-latch-blocks N --efqat-latch-after M` instead retires the `N` *highest-index* diffusion blocks at step `M`, permanently, via `BlockLatchFreezer`. This is the block-wise analogue: a block that has converged on its noise range is latched and its parameters stop receiving gradients, which flattens optimizer state as the block count grows.
 
@@ -192,7 +192,7 @@ Latched blocks are excluded from sampling (`DiffusionBlockEngine.live_blocks` / 
 
 `L_KD = w(sigma) * || D_quant(x_t, sigma) - D_float(x_t, sigma) ||^2`
 
-Sharing `(x_t, sigma)` is what isolates the anchor to quantization error; a different noise draw would measure two different problems. The float twin is a deepcopy of the model taken *before* LC-QAT retrofit, with SparseProp's forward stripped so the teacher is genuinely dense. `--kd-denoiser-alpha 0` (default) is off. Implemented in `nanochat/lcqat/kd.py` (`DenoiserDistiller`).
+Sharing `(x_t, sigma)` is what isolates the anchor to quantization error; a different noise draw would measure two different problems. The float twin is a deepcopy of the model taken *before* LC-QAT retrofit, with SparseProp's forward stripped so the teacher is genuinely dense. `--kd-denoiser-alpha 0` (default) is off. Implemented in `nanochat/models/quant/kd.py` (`DenoiserDistiller`).
 
 **Sigma-conditioned codebooks (PRD 3.2).** A DiffusionBlocks engine partitions sigma into disjoint equi-probability ranges and trains one block per range, so a single activation codebook has to span every noise level and spends most of its levels on values that never occur. Two mechanisms, both opt-in:
 
@@ -205,7 +205,7 @@ Both variants initialize to *exactly* the unconditional codebook (`gain == 1.0`,
 
 #### Per-channel value-centered quantization
 
-`PerChannelValueCenteredQuantizer` (`nanochat/lcqat/per_channel.py`) gives each output channel its own asymmetric codebook, instead of one alphabet shared across channels. The mechanism is the scalar `ValueCenteredQuantizationLUT` decomposition extended with a per-channel axis, so the exact-zero anchor holds per channel: `x == center_c` reconstructs to exactly `center_c`, and with the default zero centres that is exactly `0.0`, which is the SparseProp structural-zero contract.
+`PerChannelValueCenteredQuantizer` (`nanochat/models/quant/per_channel.py`) gives each output channel its own asymmetric codebook, instead of one alphabet shared across channels. The mechanism is the scalar `ValueCenteredQuantizationLUT` decomposition extended with a per-channel axis, so the exact-zero anchor holds per channel: `x == center_c` reconstructs to exactly `center_c`, and with the default zero centres that is exactly `0.0`, which is the SparseProp structural-zero contract.
 
 Two things about using it:
 
@@ -218,11 +218,11 @@ What is measured: given one channel 100× larger than the others, a fitted share
 
 For quantized decode (`K_W = 3` ternary), the runtime routes through a backend dispatcher:
 
-- `naive` — pure PyTorch oracle (`nanochat/lcqat/ops/references/`), for parity tests and debugging;
-- `cpu` — C++ kernel under `nanochat/lcqat/native/cpu/` (`gemv.cpp`, `index_linear.cpp`, `sparseprop.cpp`), JIT-built by torch on first use (needs `g++`/`clang++`; build cached under `~/.cache/torch_extensions`);
-- `gpu` — Taichi kernel (`nanochat/lcqat/kernels/gpu_loader.py`), loaded lazily (needs `taichi` + a Vulkan ICD).
+- `naive` — pure PyTorch oracle (`nanochat/ops/references/`), for parity tests and debugging;
+- `cpu` — C++ kernel under `nanochat/ops/native/cpu/` (`gemv.cpp`, `index_linear.cpp`, `sparseprop.cpp`), JIT-built by torch on first use (needs `g++`/`clang++`; build cached under `~/.cache/torch_extensions`);
+- `gpu` — Taichi kernel (`nanochat/ops/kernels/gpu_loader.py`), loaded lazily (needs `taichi` + a Vulkan ICD).
 
-`dispatch_index_linear` extends the same pattern to arbitrary storage widths `K ∈ {3, 15, 255, 257}` (see `nanochat/lcqat/ops/index_linear.py`). A requested backend that cannot run raises — it never silently falls back to naive. Three-way parity (`naive == cpu == gpu`), `torch.library.opcheck`, and `torch.compile` composition are covered by `tests/test_lcqat_ops.py`.
+`dispatch_index_linear` extends the same pattern to arbitrary storage widths `K ∈ {3, 15, 255, 257}` (see `nanochat/ops/index_linear.py`). A requested backend that cannot run raises — it never silently falls back to naive. Three-way parity (`naive == cpu == gpu`), `torch.library.opcheck`, and `torch.compile` composition are covered by `tests/test_lcqat_ops.py`.
 
 #### Export
 
@@ -234,9 +234,9 @@ Freezes codebooks into static FP32 LUTs, replaces FP32 weight matrices with `uin
 
 ### SparseProp sparse backprop
 
-[SparseProp](https://arxiv.org/abs/2408.08525) injects unstructured sparsity into the backward pass: a static sparsity mask (default `--sparseprop-sparsity=0.75`, fraction of weights pruned) is applied to `Linear` layers, and the backward pass routes through AVX2 C++ kernels (`nanochat/lcqat/native/cpu/sparseprop.cpp`) that compute gradients over `nnz` entries only — `O(nnz)` instead of `O(M·K)`. Forward is standard masked SpMM; backward is the mul-less/sparse win.
+[SparseProp](https://arxiv.org/abs/2408.08525) injects unstructured sparsity into the backward pass: a static sparsity mask (default `--sparseprop-sparsity=0.75`, fraction of weights pruned) is applied to `Linear` layers, and the backward pass routes through AVX2 C++ kernels (`nanochat/ops/native/cpu/sparseprop.cpp`) that compute gradients over `nnz` entries only — `O(nnz)` instead of `O(M·K)`. Forward is standard masked SpMM; backward is the mul-less/sparse win.
 
-SparseProp is **always-on by default** alongside LC-QAT. When LC-QAT is active, LCQATLinear is wrapped as `SparsePropLinearLCQAT` so the two coexist in one module (`nanochat/lcqat/sparseprop.py`). Disable with `--no-sparseprop`.
+SparseProp is **always-on by default** alongside LC-QAT. When LC-QAT is active, LCQATLinear is wrapped as `SparsePropLinearLCQAT` so the two coexist in one module (`nanochat/models/quant/sparseprop.py`). Disable with `--no-sparseprop`.
 
 | Flag | Meaning |
 |------|---------|
@@ -253,9 +253,9 @@ Parity (`naive == cpu`) and integration with the full training pipeline are in `
 **SparseProp's training path is a masked dense GEMM, not an nnz walk.** The `AVX2` CSR/CSC kernels in `sparseprop.cpp` are retained for parity tests and as the reference oracle, but they are no longer on the training hot path. Both the forward and the backward of `SparsePropLinearFunction` now compute a dense matmul over the pruned weight:
 
 ```python
-out    = x_flat @ weight.t()          # forward
-grad_x = grad_y @ weight              # backward, weight already holds exact zeros
-grad_w = (grad_y.t() @ x_flat) * mask # backward, masked back onto the sparse pattern
+out = x_flat @ weight.t()  # forward
+grad_x = grad_y @ weight  # backward, weight already holds exact zeros
+grad_w = (grad_y.t() @ x_flat) * mask  # backward, masked back onto the sparse pattern
 ```
 
 This is exact, not an approximation: pruned slots hold the *exact* zero anchor, so the dense product sums the same surviving terms as the SpMM. Measured agreement is ~1e-6 relative — fp32 summation-order noise. Pruned slots stay exactly `0.0`, which is the contract the sparse export and the mul-less kernels read.
@@ -324,7 +324,7 @@ Validation bpb is unchanged by the optimization, as expected — these were perf
 **A fifth bug, found by chasing an anomaly: the learned activation LUT was dead on the SparseProp path.** After the four fixes above, the four-arm sweep showed SparseProp *faster* end to end (-20% plain LM, -37% denoiser) while every isolated measurement showed parity. The cause was `SparsePropLinearLCQAT.apply_trained_activation`, which re-implemented the gather as
 
 ```python
-lut.resolved_table()[indices]     # wrong: hard values only
+lut.resolved_table()[indices]  # wrong: hard values only
 ```
 
 instead of calling the table's own forward. `LearnableIndexLut.forward` returns `soft + hard - soft.detach()` — the same forward value, but with the straight-through relaxation attached, so the gradient reaches `logits` / `relaxed()`. The manual gather returns `hard` alone, so **`--lcqat-lut-relaxation` and `--lcqat-act-body` silently did nothing on every SparseProp run** and the trained table received no gradient. It was also ~3x cheaper (14 ms vs 45 ms at `[4,512,1536]`), which is exactly why the sparse arm looked faster: it was skipping the `bucketize` plus relaxation work that `c_fc` legitimately owes.
@@ -368,7 +368,7 @@ Nine experiments ship; `dev/LEADERBOARD.md`'s generated table holds all 20 rows:
 (one-sided, 8 levels) places all 8. Measuring *weights* instead inverts the
 result — `asym` is measurably worse on signed weights.
 
-The driver exits non-zero when a claim it advertises comes out wrong, and writes only between `<!-- BEGIN GENERATED: lcqat_ablation.py -->` markers so hand-written analysis in `dev/LEADERBOARD.md` survives a re-run. Measurement protocol is in `nanochat/lcqat/ablation_metrics.py`, tests in `tests/test_lcqat_ablation_harness.py` and `tests/test_lcqat_ablation_driver.py`.
+The driver exits non-zero when a claim it advertises comes out wrong, and writes only between `<!-- BEGIN GENERATED: lcqat_ablation.py -->` markers so hand-written analysis in `dev/LEADERBOARD.md` survives a re-run. Measurement protocol is in `nanochat/models/quant/ablation_metrics.py`, tests in `tests/test_lcqat_ablation_harness.py` and `tests/test_lcqat_ablation_driver.py`.
 
 **Every row is a micro-probe**, not a training run: random weights, a few SGD
 steps, no end-to-end quality claim. `bias_quant` in particular reports the
@@ -377,7 +377,7 @@ reconstruction error and the storage cost of a bias codebook — whether
 
 ### DiffusionBlocks (block-wise training + diffusion inference)
 
-`nanochat/diffusion_blocks.py` implements SakanaAI DiffusionBlocks (ICLR 2026): depth is partitioned into `B` independent blocks (`EquiProbabilityPartitioner` distributes layers equi-probably across blocks), each block gets a noise-conditioned adapter (AdaLN from an EDM sinusoidal sigma embedding, `denoise_step`), and an equi-probable cycling scheduler picks one block active per micro-step. Only the active block holds gradients + optimizer state, cutting grad/optimizer memory ~`B`×.
+`nanochat/training/diffusion_blocks.py` implements SakanaAI DiffusionBlocks (ICLR 2026): depth is partitioned into `B` independent blocks (`EquiProbabilityPartitioner` distributes layers equi-probably across blocks), each block gets a noise-conditioned adapter (AdaLN from an EDM sinusoidal sigma embedding, `denoise_step`), and an equi-probable cycling scheduler picks one block active per micro-step. Only the active block holds gradients + optimizer state, cutting grad/optimizer memory ~`B`×.
 
 The `DiffusionBlockEngine` is the **default training engine** for `base_train`, `chat_sft`, and `chat_rl` (`--db-blocks`, default `4`). It wraps a `GPT` and exposes `train_step` / `denoise_step` / `generate`. LC-QAT and SparseProp are applied through the engine so the whole pipeline — adapters, denoise head, KV cache — is quantized and sparse.
 
@@ -405,7 +405,7 @@ Measured on CPU (d4/256-wide toy, seq 64, batch 2, peak RSS 406 MB):
 | 4 | 1284 tok/s | 4045 tok/s |
 ### Precision / dtype
 
-nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/common.py`). By default this is auto-detected based on your hardware:
+nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/models/dtype.py`, since every `Linear` casts to it in forward). By default this is auto-detected based on your hardware:
 
 | Hardware | Default dtype | Why |
 |----------|--------------|-----|
@@ -457,135 +457,92 @@ The important thing to note is that nanochat is written and configured around on
 
 ## File structure
 
+The package is split along a **functional-core / imperative-shell** line. `nanochat/models/` holds pure tensor math with no I/O, optimizer, or logging; everything that touches hardware, persistence, or lifecycle lives in the shell packages beside it. `nanochat/ops/` sits between them, so the math never imports a kernel directly.
+
 ```
 .
-├── LICENSE
-├── README.md
-├── dev
-│   ├── LEADERBOARD.md                  # Time-to-GPT-2 leaderboard docs
-│   ├── LOG.md                          # Training experiment log
-│   ├── nanochat.png                    # project logo
-│   ├── repackage_data_reference.py     # Pretraining data shard generation
-│   ├── scaling_analysis.ipynb          # scaling-laws analysis notebooks
-│   ├── scaling_laws_jan26.png
-│   └── estimate_gpt3_core.ipynb
 ├── nanochat
-│   ├── __init__.py                     # empty
-│   ├── checkpoint_manager.py           # Save/Load model checkpoints
-│   ├── common.py                       # Misc small utilities, quality of life (COMPUTE_DTYPE)
-│   ├── core_eval.py                    # Evaluates base model CORE score (DCLM paper)
-│   ├── dataloader.py                   # Tokenizing Distributed Data Loader
-│   ├── dataset.py                      # Download/read utils for pretraining data
-│   ├── diffusion_blocks.py             # DiffusionBlockEngine: block-wise AR + diffusion inference
-│   ├── engine.py                       # Efficient model inference with KV Cache
-│   ├── execution.py                    # Allows the LLM to execute Python code as tool
-│   ├── flash_attention.py              # Flash Attention 3 / SDPA dispatch
-│   ├── fp8.py                          # Float8Linear conversion
-│   ├── gpt.py                          # The GPT nn.Module Transformer
-│   ├── loss_eval.py                    # Evaluate bits per byte (instead of loss)
-│   ├── lcqat                           # LC-QAT: codebooks, KD, EfQAT, retrofit, ops/kernels, export
-│   │   ├── __init__.py
-│   │   ├── ablation_metrics.py         # Ablation measurement protocol
-│   │   ├── codebook.py                 # AsymmetricLearnedCodebook
-│   │   ├── efqat.py                    # SelectiveFreezer, BlockLatchFreezer
-│   │   ├── export.py                   # export_lcqat_checkpoint, wire_activation_luts
-│   │   ├── kd.py                       # KDLoss knowledge distillation
-│   │   ├── linear.py                   # LCQATLinear module
-│   │   ├── lut.py                      # Activation LUTs (relu2/silu/gelu/tanh/sigmoid)
-│   │   ├── packing.py                  # Bit packing utilities
-│   │   ├── learnable_lut.py            # LearnableIndexLut (softmax-relaxed activation LUT)
-│   │   ├── per_channel.py              # PerChannelValueCenteredQuantizer
-│   │   ├── product_lut.py              # Fused 2-D product LUT
-│   │   ├── retrofit.py                 # LayerKConfig, PRESETS, retrofit_model, parse_k_map
-│   │   ├── sigma_codebook.py           # Sigma-conditioned / gain-modulated codebooks
-│   │   ├── sparse_artifact.py          # CSR sparse export planning + packing
-│   │   ├── sparseprop.py               # SparsePropLinear, inject_sparseprop_layers, magnitude pruning
-│   │   ├── kernels
-│   │   │   ├── __init__.py
-│   │   │   ├── cpu_loader.py           # JIT build of C++ ops
-│   │   │   └── gpu_loader.py           # Taichi/Vulkan GPU kernels
-│   │   ├── native
-│   │   │   └── cpu
-│   │   │       ├── gemv.cpp            # mul-less GEMV (AVX-512/AVX2/scalar)
-│   │   │       ├── index_linear.cpp    # multi-width index-fetch matmul
-│   │   │       ├── quant_attn.cpp      # quantized attention
-│   │   │       └── sparseprop.cpp      # AVX2 sparse backward
-│   │   └── ops
-│   │       ├── __init__.py
-│   │       ├── dispatch.py
-│   │       ├── gemv.py                 # dispatch_gemv (naive|cpu|gpu)
-│   │       ├── index_linear.py         # dispatch_index_linear
-│   │       ├── quant_attn.py           # quantized KV-cache attention
-│   │       ├── sparseprop.py           # sparseprop_forward_cpu / _backward_cpu
-│   │       └── references              # PyTorch oracle implementations for parity
-│   │           ├── __init__.py
-│   │           ├── attn_reference.py
-│   │           ├── gemv_reference.py
-│   │           └── index_linear_reference.py
-│   ├── optim.py                        # AdamW + Muon optimizer, 1GPU and distributed
-│   └── tokenizer.py                    # BPE Tokenizer wrapper in style of GPT-4
-├── pyproject.toml                      # CPU-only torch wheels; CUDA extra dropped
-├── runs
-│   ├── miniseries.sh                   # Miniseries training script
-│   ├── runcpu.sh                       # Small example of how to run on CPU/MPS
-│   ├── scaling_laws.sh                 # Scaling laws experiments
-│   └── speedrun.sh                     # Train the ~$100 nanochat GPT-2 speedrun
-├── scripts
-│   ├── base_eval.py                    # Base model: CORE score, bits per byte, samples
-│   ├── base_train.py                   # Base model: pretrain (DiffusionBlockEngine)
-│   ├── chat_cli.py                     # Chat model: talk to over CLI
-│   ├── chat_eval.py                    # Chat model: eval tasks
-│   ├── chat_rl.py                      # Chat model: reinforcement learning
-│   ├── chat_sft.py                     # Chat model: train SFT
-│   ├── export_lcqat.py                 # Export stripped LC-QAT artifact
-│   ├── gemv_bench.py                   # Mul-less GEMV / index-linear microbench
-│   ├── infer_bench.py                  # Inference: latency/throughput/VRAM bench
-│   ├── kv_budget_bench.py              # LC-QAT memory-budget repro
-│   ├── tok_eval.py                     # Tokenizer: evaluate compression rate
-│   └── tok_train.py                    # Tokenizer: train it
-├── tasks
-│   ├── arc.py                          # Multiple choice science questions
-│   ├── common.py                       # TaskMixture | TaskSequence
-│   ├── gsm8k.py                        # 8K Grade School Math questions
-│   ├── humaneval.py                    # Misnomer; Simple Python coding task
-│   ├── mmlu.py                         # Multiple choice, broad topics
-│   └── smoltalk.py                     # Conglomerate dataset of SmolTalk from HF
-├── tests
-│   ├── conftest.py
-│   ├── test_attention_fallback.py      # FA3/SDPA attention fallback
-│   ├── test_adamw_cpu.py               # CPU AdamW optimizer
-│   ├── test_calculator.py              # Sandboxed code execution smoke
-│   ├── test_dbcpu_*.py                 # DiffusionBlocks CPU: engine, train/denoise, packing, ...
-│   ├── test_engine.py                  # Inference engine, KV cache
-│   ├── test_execution.py               # Sandboxed code execution
-│   ├── test_lcqat_codebook.py          # LC-QAT codebooks
-│   ├── test_lcqat_export.py            # Codebook export, activation LUT wiring
-│   ├── test_lcqat_kd.py                # KD anchoring loss
-│   ├── test_lcqat_efqat.py             # EfQAT selective freezing
-│   ├── test_dbcpu_efqat_latch.py        # EfQAT per-block latching + sampler exclusion
-│   ├── test_dbcpu_kd_denoiser.py        # Denoiser distillation objective
-│   ├── test_dbcpu_sigma_codebook_wiring.py  # sigma channel through the engine
-│   ├── test_lcqat_sigma_codebook.py     # Sigma-conditioned codebooks
-│   ├── test_lcqat_per_channel.py        # Per-channel value-centered quantizer
-│   ├── test_lcqat_ablation_harness.py   # Ablation metrics + protocol
-│   ├── test_lcqat_ablation_driver.py    # Ablation CLI + claim checking
-│   ├── test_lcqat_learnable_lut.py      # Learnable activation LUT
-│   ├── test_lcqat_product_lut.py        # Fused product LUT
-│   ├── test_lcqat_sparse_kernel.py      # Compiled CSR sparse index-linear
-│   ├── test_lcqat_sparse_artifact.py    # CSR planning + packing
-│   ├── test_sparseprop_pruning.py       # Magnitude + gradual pruning
-│   ├── test_lcqat_kv_cache.py          # Quantized KV-cache runtime
-│   ├── test_lcqat_linear.py            # LCQATLinear module
-│   ├── test_lcqat_linear_runtime.py    # Quantized inference runtime
-│   ├── test_lcqat_lut.py               # Activation LUT registry
-│   ├── test_lcqat_ops.py               # GEMV / index-linear parity + opcheck
-│   ├── test_lcqat_packing.py           # Bit packing
-│   ├── test_lcqat_quant_attn.py        # Quantized attention parity
-│   ├── test_lcqat_retrofit.py          # retrofit_model / parse_k_map
-│   ├── test_sparseprop.py              # SparseProp kernel parity
-│   ├── test_sparseprop_integration.py  # SparseProp + LC-QAT + DiffusionBlocks
-│   ├── test_tasks.py                   # Task slicing, mixtures, HubDataset
-│   └── test_tokenizer.py               # BPE round-trips, chat rendering
+│   ├── models/                          # functional core: pure tensor math
+│   │   ├── backbone.py                  # the GPT nn.Module Transformer
+│   │   ├── dtype.py                     # COMPUTE_DTYPE policy (model-layer decision)
+│   │   ├── io.py                        # typed contracts (LayerQuantSpec)
+│   │   ├── flash_attention.py           # Flash Attention 3 / SDPA dispatch
+│   │   ├── fp8.py                       # Float8Linear conversion
+│   │   └── quant/                       # LC-QAT: codebooks, layers, export
+│   │       ├── codebook.py              # asymmetric learned codebook (STE)
+│   │       ├── linear.py                # LCQATLinear module
+│   │       ├── lut.py                   # Activation LUTs (relu2/silu/gelu/tanh/sigmoid)
+│   │       ├── learnable_lut.py         # LearnableIndexLut (softmax-relaxed LUT)
+│   │       ├── per_channel.py           # PerChannelValueCenteredQuantizer
+│   │       ├── product_lut.py           # fused 2-D product LUT
+│   │       ├── activation.py            # SmoothPWL activation bodies
+│   │       ├── bias_quant.py            # opt-in bias codebook
+│   │       ├── sigma_codebook.py        # sigma-conditioned / modulated codebooks
+│   │       ├── retrofit.py              # LayerKConfig, PRESETS, retrofit_model
+│   │       ├── sparseprop.py            # SparsePropLinear, magnitude pruning
+│   │       ├── pruning.py               # gradual pruning schedule
+│   │       ├── sparse_artifact.py       # CSR sparse export planning + packing
+│   │       ├── kd.py                    # KDLoss / DenoiserDistiller
+│   │       ├── efqat.py                 # SelectiveFreezer, BlockLatchFreezer
+│   │       ├── optimizer.py             # build_qat_param_groups
+│   │       ├── export.py                # export_lcqat_checkpoint, wire_activation_luts
+│   │       ├── ablation.py              # ablation experiment implementations
+│   │       ├── ablation_metrics.py      # ablation measurement protocol
+│   │       └── reference/               # pure-PyTorch reference implementations
+│   ├── ops/                             # kernel layer: dispatcher + backends
+│   │   ├── dispatch.py                  # dispatch_gemv / dispatch_index_linear
+│   │   ├── gemv.py                      # mul-less GEMV backends
+│   │   ├── index_linear.py              # index-fetch matmul, arbitrary K
+│   │   ├── quant_attn.py                # quantized KV-cache attention
+│   │   ├── sparseprop.py                # AVX2 sparse forward/backward
+│   │   ├── references/                  # naive PyTorch oracles (CI ground truth)
+│   │   ├── native/cpu/                  # C++: gemv, index_linear, quant_attn, sparseprop
+│   │   └── kernels/                     # cpu_loader.py, gpu_loader.py (Taichi)
+│   ├── modules/                         # imperative shell: runtime + persistence
+│   │   ├── checkpoint_manager.py        # save/load model checkpoints
+│   │   ├── experiments/                  # one module per ablation experiment
+│   │   ├── engine.py                    # inference engine, KV cache, calculator tool
+│   │   ├── execution.py                 # sandboxed Python execution
+│   │   ├── core_eval.py                 # DCLM CORE score
+│   │   └── loss_eval.py                 # bits-per-byte evaluation
+│   ├── training/                        # training-time machinery
+│   │   ├── diffusion_blocks.py          # DiffusionBlockEngine, EquiProbabilityPartitioner
+│   │   └── optim.py                     # AdamW + Muon optimizer
+│   ├── data/                            # ingestion boundary
+│   │   ├── dataloader.py                # tokenizing distributed data loader
+│   │   ├── dataset.py                   # download/read utils for pretraining data
+│   │   └── tokenizer.py                 # BPE tokenizer wrapper in GPT-4 style
+│   ├── callbacks/                       # side-effect observers for the loop
+│   │   └── training.py                  # W&B logging, GC management, run summary
+│   ├── utils/
+│   │   └── common.py                    # COMPUTE_DTYPE and misc utilities
+│   └── tasks/                           # evaluation task mixtures
+│       ├── common.py                    # TaskMixture | TaskSequence
+│       └── arc.py / gsm8k.py / humaneval.py / mmlu.py / smoltalk.py
+├── scripts                              # entry points (the imperative shell)
+│   ├── _train/                          # base_train split by concern
+│   │   ├── build.py                     # model construction, LC-QAT + SparseProp wiring
+│   │   ├── loop.py                      # the training loop
+│   │   └── eval.py                      # validation, CORE metric, sampling, checkpoints
+│   ├── base_train.py  base_eval.py  chat_sft.py  chat_rl.py  chat_eval.py
+│   ├── chat_cli.py  export_lcqat.py  tok_train.py  tok_eval.py
+│   └── lcqat_ablation.py  gemv_bench.py  infer_bench.py  kv_budget_bench.py
+├── runs                                 # shell harnesses
+│   ├── speedrun.sh  miniseries.sh  scaling_laws.sh  runcpu.sh  stackcompare.sh
+├── tests                                # mirrors the source layout
+│   ├── test_lcqat_*.py                  # parity, opcheck, runtime, wiring
+│   ├── test_sparseprop*.py              # kernel parity, pruning, integration
+│   ├── test_dbcpu_*.py                  # DiffusionBlocks CPU
+│   ├── test_lm_mode.py                  # plain-LM path (--db-blocks=0)
+│   ├── test_numerical_fingerprint.py    # behavior-preservation gate
+│   ├── test_architecture_boundary.py    # core must not import the shell
+│   └── test_w0_*.py  test_w2_*.py  ...
+├── dev
+│   ├── LEADERBOARD.md                   # Time-to-GPT-2 leaderboard docs
+│   ├── STACK_COMPARE.md                 # four-arm SparseProp/DiffusionBlocks comparison
+│   ├── LOG.md                           # training experiment log
+│   └── *_analysis.ipynb, *.png
+├── pyproject.toml                       # CPU-only torch wheel (the `cpu` extra)
 └── uv.lock
 ```
 

@@ -11,7 +11,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nanochat.lcqat import (
+from nanochat.models.quant import (
     PRESETS,
     LCQATLinear,
     finish_lcqat_after_load,
@@ -22,8 +22,8 @@ from nanochat.lcqat import (
     retrofit_model,
     retrofit_summary,
 )
-from nanochat.lcqat.optimizer import build_qat_param_groups, verify_partition
-from nanochat.lcqat.retrofit import (
+from nanochat.models.quant.optimizer import build_qat_param_groups, verify_partition
+from nanochat.models.quant.retrofit import (
     DEFAULT_PRESET,
     get_layer_config,
     spec_k,
@@ -135,20 +135,18 @@ def test_when_asym_preset_then_non_negative_tensors_get_one_sided_codebooks() ->
     config = PRESETS[DEFAULT_PRESET]
     c_fc = get_layer_config("transformer.h.0.mlp.c_fc", config)
     assert c_fc is not None
-    _, _, quant_out, out_spec = c_fc
-    assert quant_out is True
-    assert out_spec == (0, 7), "c_fc output sees relu^2 >= 0"
+    assert c_fc.quantize_output is True
+    assert c_fc.output == (0, 7), "c_fc output sees relu^2 >= 0"
 
     c_proj = get_layer_config("transformer.h.0.mlp.c_proj", config)
     assert c_proj is not None
-    _, act_spec, _, _ = c_proj
-    assert act_spec == (0, 7), "c_proj input sees relu^2 >= 0"
+    assert c_proj.activation == (0, 7), "c_proj input sees relu^2 >= 0"
 
     # Attention tensors are genuinely signed, so they keep both sides.
     for name in ("transformer.h.0.attn.c_q", "transformer.h.0.attn.c_proj"):
         spec = get_layer_config(name, config)
         assert spec is not None
-        assert spec[1][0] > 0, f"{name} input is RMSNorm'd and signed"
+        assert spec.activation[0] > 0, f"{name} input is RMSNorm'd and signed"
 
 
 def test_when_asym_preset_then_applied_to_a_model() -> None:

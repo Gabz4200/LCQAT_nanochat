@@ -14,19 +14,19 @@ from functools import partial
 import torch
 import torch.distributed as dist
 
-from nanochat.checkpoint_manager import load_model
-from nanochat.common import (
+from nanochat.modules.checkpoint_manager import load_model
+from nanochat.modules.engine import Engine
+from nanochat.tasks.arc import ARC
+from nanochat.tasks.gsm8k import GSM8K
+from nanochat.tasks.humaneval import HumanEval
+from nanochat.tasks.mmlu import MMLU
+from nanochat.utils.common import (
     autodetect_device_type,
     compute_cleanup,
     compute_init,
     get_dist_info,
     print0,
 )
-from nanochat.engine import Engine
-from tasks.arc import ARC
-from tasks.gsm8k import GSM8K
-from tasks.humaneval import HumanEval
-from tasks.mmlu import MMLU
 
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)

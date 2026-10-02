@@ -12,9 +12,9 @@ the quantized runtime); it is not a resumable training checkpoint.
 import argparse
 import os
 
-from nanochat.checkpoint_manager import load_model
-from nanochat.common import autodetect_device_type, compute_init, print0
-from nanochat.lcqat import export_lcqat_checkpoint, is_lcqat_state
+from nanochat.models.quant import export_lcqat_checkpoint, is_lcqat_state
+from nanochat.modules.checkpoint_manager import load_model
+from nanochat.utils.common import autodetect_device_type, compute_init, print0
 
 parser = argparse.ArgumentParser(description="Export a stripped LC-QAT checkpoint")
 parser.add_argument(

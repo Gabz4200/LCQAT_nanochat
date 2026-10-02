@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from nanochat.lcqat.ops.sparseprop import (
+from nanochat.ops.sparseprop import (
     _csc_col_indices,
     _nnz_row_indices,
     build_csr_csc_from_mask,

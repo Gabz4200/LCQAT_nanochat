@@ -14,7 +14,6 @@ dependencies = [
     "requests>=2.32.5",
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
-    "torch>=2.14.0",
     "wandb>=0.21.3",
 ]
 
@@ -51,9 +50,13 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
-# CPU-only: torch resolves from the PyTorch CPU index (CUDA support was
-# dropped for the LC-QAT runtime; re-add a gpu extra + matching CUDA index
-# if GPU training is ever needed again).
+# CPU-only: torch lives in the `cpu` extra, NOT in base dependencies, so the
+# wheel index is chosen by whoever installs rather than forced on everyone.
+# A bare `uv sync` deliberately does not install torch -- `import nanochat.models.backbone`
+# will fail until you run `uv sync --extra cpu`. That is the intended signal.
+# CUDA support was dropped for the LC-QAT runtime; re-add a `gpu` extra with a
+# matching CUDA index (and declare both under [tool.uv] conflicts) if GPU
+# training is ever needed again.
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cpu", extra = "cpu" },

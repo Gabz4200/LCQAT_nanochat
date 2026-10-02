@@ -2,8 +2,8 @@
 Evaluate compression ratio of the tokenizer.
 """
 
-from nanochat.dataset import parquets_iter_batched
-from nanochat.tokenizer import RustBPETokenizer, get_tokenizer
+from nanochat.data.dataset import parquets_iter_batched
+from nanochat.data.tokenizer import RustBPETokenizer, get_tokenizer
 
 # Random text I got from a random website this morning
 news_text = r"""

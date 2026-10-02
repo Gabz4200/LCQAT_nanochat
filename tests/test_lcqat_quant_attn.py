@@ -12,9 +12,9 @@ import math
 import pytest
 import torch
 
-from nanochat.lcqat.kernels.gpu_loader import vulkan_available
-from nanochat.lcqat.ops import dispatch_quant_attn
-from nanochat.lcqat.packing import pack_nibbles
+from nanochat.models.quant.packing import pack_nibbles
+from nanochat.ops import dispatch_quant_attn
+from nanochat.ops.kernels.gpu_loader import vulkan_available
 
 requires_vulkan = pytest.mark.skipif(
     not vulkan_available(), reason="Vulkan device unavailable for the Taichi backend"
@@ -154,7 +154,7 @@ def test_when_gpu_backend_then_matches_naive(
 
 
 def test_when_cpu_op_then_opcheck_passes() -> None:
-    from nanochat.lcqat.ops.quant_attn import _ensure_cpu_attn_op
+    from nanochat.ops.quant_attn import _ensure_cpu_attn_op
 
     _ensure_cpu_attn_op()
     case = make_case(1, 4, 16, seed=11)
@@ -163,7 +163,7 @@ def test_when_cpu_op_then_opcheck_passes() -> None:
 
 
 def test_when_compile_with_cpu_backend_then_composes_via_fake_tensor() -> None:
-    from nanochat.lcqat.ops.quant_attn import _ensure_cpu_attn_op
+    from nanochat.ops.quant_attn import _ensure_cpu_attn_op
 
     _ensure_cpu_attn_op()
     case = make_case(1, 4, 16, seed=12)

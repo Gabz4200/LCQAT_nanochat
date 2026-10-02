@@ -25,7 +25,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nanochat.lcqat.activation import (
+from nanochat.models.quant.activation import (
     ACT_BODIES,
     FIT_SHARPNESS_REFERENCE,
     RBF_SCALE_GRID_UNITS,

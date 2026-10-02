@@ -235,7 +235,7 @@ class TestClaimChecking:
         A ratio of 1.0 means the `1/sqrt(N)` scaling stopped being applied, which
         is the single most important thing this tool exists to catch.
         """
-        from nanochat.lcqat.ablation_metrics import AblationRow
+        from nanochat.models.quant.ablation_metrics import AblationRow
 
         row = AblationRow(
             experiment="grad_scale",
@@ -256,7 +256,7 @@ class TestClaimChecking:
     def test_when_the_grad_scale_ratio_agrees_then_nothing_is_flagged(
         self, driver
     ) -> None:
-        from nanochat.lcqat.ablation_metrics import AblationRow
+        from nanochat.models.quant.ablation_metrics import AblationRow
 
         row = AblationRow(
             experiment="grad_scale",
@@ -276,7 +276,7 @@ class TestClaimChecking:
         self, driver
     ) -> None:
         """The split must strictly reduce wasted levels on relu^2 data."""
-        from nanochat.lcqat.ablation_metrics import AblationRow
+        from nanochat.models.quant.ablation_metrics import AblationRow
 
         row = AblationRow(
             experiment="asym_vs_small_levels",

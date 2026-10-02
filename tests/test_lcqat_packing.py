@@ -86,19 +86,70 @@ def test_when_roundtripping_batched_nibbles_then_indices_are_recovered(shape) ->
     assert torch.equal(unpack_nibbles(packed, shape[-1]), idx)
 
 
+@pytest.mark.parametrize("shape", [(8, 16), (3, 5), (1, 7), (4, 1), (2, 2)])
+def test_when_roundtripping_2d_nibbles_then_the_matrix_shape_survives(
+    shape,
+) -> None:
+    """Exactly-2-D input must come back 2-D, not flattened.
+
+    The 3-D case above decodes with a plain trailing-dim slice, but a 2-D
+    buffer `[m, ceil(n/2)]` interleaves into `[m*ceil(n/2), 2]`, so the decode
+    has to restore the row count explicitly. Without that, every exported
+    weight matrix unpacks to a flat vector -- silently, since a 1-D tensor of
+    the right total length still multiplies correctly under a reshape.
+    """
+    torch.manual_seed(0)
+    idx = torch.randint(0, 16, shape, dtype=torch.uint8)
+    packed = pack_nibbles(idx)
+    back = unpack_nibbles(packed, shape[1])
+    assert back.shape == idx.shape, (back.shape, idx.shape)
+    assert torch.equal(back, idx)
+
+
+def test_when_2d_nibbles_unpack_then_each_row_decodes_independently() -> None:
+    """Row boundaries are preserved: a row-major decode would shift every row.
+
+    With n odd the last nibble of each row is padding, so a decode that treats
+    the buffer as one flat stream lands the padding in the wrong place and
+    every row after the first is shifted by half a byte.
+    """
+    torch.manual_seed(1)
+    idx = torch.randint(0, 16, (5, 7), dtype=torch.uint8)
+    back = unpack_nibbles(pack_nibbles(idx), 7)
+    for row in range(idx.shape[0]):
+        assert torch.equal(back[row], idx[row]), f"row {row} decoded wrong"
+
+
 @pytest.mark.parametrize(
     ("k", "expected_format"),
     [
         (3, FORMAT_TRITS),
+        (4, FORMAT_NIBBLES),
         (5, FORMAT_NIBBLES),
+        (8, FORMAT_NIBBLES),
         (15, FORMAT_NIBBLES),
+        (16, FORMAT_UINT8),
         (17, FORMAT_UINT8),
         (33, FORMAT_UINT8),
         (255, FORMAT_UINT8),
+        (256, FORMAT_INT32),
         (257, FORMAT_INT32),
         (65537, FORMAT_INT32),
     ],
-    ids=["k3", "k5", "k15", "k17", "k33", "k255", "k257", "k65537"],
+    ids=[
+        "k3",
+        "k4",
+        "k5",
+        "k8",
+        "k15",
+        "k16",
+        "k17",
+        "k33",
+        "k255",
+        "k256",
+        "k257",
+        "k65537",
+    ],
 )
 def test_when_k_given_then_format_matches_dtype_table(
     k: int, expected_format: int
@@ -131,10 +182,17 @@ def test_when_packing_weight_indices_then_roundtrip_and_size_match_format(
 
 
 def test_when_weight_index_k_invalid_then_raises() -> None:
-    with pytest.raises(ValueError, match="odd integer"):
-        index_format_for_k(4)
-    with pytest.raises(ValueError, match="odd integer"):
+    # Even K is legal: the asymmetric split is what makes a one-sided codebook
+    # (and therefore K=4, K=8, K=16) possible, and these are all real bit
+    # boundaries rather than odd-numbered approximations.
+    assert index_format_for_k(4) == FORMAT_NIBBLES
+    assert index_format_for_k(16) == FORMAT_UINT8
+    with pytest.raises(ValueError, match=">= 3"):
+        index_format_for_k(2)
+    with pytest.raises(ValueError, match=">= 3"):
         index_format_for_k(1)
+    with pytest.raises(ValueError, match=">= 3"):
+        index_format_for_k(0)
     idx = torch.zeros(2, 8, dtype=torch.uint8)
     idx[0, 0] = 3  # K=3 accepts only {0, 1, 2}
     with pytest.raises(ValueError, match=r"\{0, 1, 2\}"):

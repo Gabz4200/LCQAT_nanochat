@@ -283,7 +283,15 @@ parser.add_argument(
     "--db-blocks",
     type=int,
     default=4,
-    help="number of diffusion blocks for block-wise training (default: 4)",
+    help=(
+        "number of diffusion blocks for block-wise training (default: 4). "
+        "0 (or any negative value) disables DiffusionBlocks entirely and trains "
+        "a plain autoregressive LM by next-token cross-entropy: no partitioner, "
+        "no denoise heads, no block isolation, every layer trains every step. "
+        "Use it for a conventional baseline -- --db-objective ce is NOT that "
+        "baseline, because it still routes through the engine and still "
+        "gradients only one block at a time."
+    ),
 )
 parser.add_argument(
     "--db-objective",
@@ -620,6 +628,23 @@ elif args.sparseprop:
             f"SparseProp pruned to {achieved:.4f} sparsity "
             f"(scope={sparse_schedule.scope}, magnitude criterion)"
         )
+    else:
+        # `inject_sparseprop_layers` above already masked every layer, so this
+        # is the common case, not an error: the schedule declines to prune only
+        # when it has no event at step 0. Reporting the injected state anyway,
+        # because a run that silently masked 75% of its weights is not something
+        # anyone should have to infer from the absence of a log line.
+        from nanochat.lcqat.pruning import collect as _collect_sparse_layers
+
+        masked = _collect_sparse_layers(model)
+        if masked:
+            total = sum(layer.weight.numel() for layer in masked)
+            kept = sum(int(layer.sparsity_mask.sum()) for layer in masked)
+            print0(
+                f"SparseProp injected {len(masked)} sparse Linear layers; "
+                f"{1.0 - kept / total:.4f} of their weights are exact zeros "
+                "(gradual pruning has no event at step 0)"
+            )
 if lcqat_active is not None:
     print0(f"LC-QAT enabled: {retrofit_summary(model)}")
 
@@ -717,85 +742,126 @@ def disable_fp8(model):
 
 orig_model = model  # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 
-# Initialize DiffusionBlocks Engine for block-wise training
-num_db_blocks = min(args.db_blocks, args.depth)
+# Initialize DiffusionBlocks Engine for block-wise training.
+#
+# `--db-blocks <= 0` trains a plain autoregressive LM instead: no partitioner,
+# no adapters, no denoise heads, no block isolation. Everything downstream then
+# runs against the bare `model`, which is why `engine` is None rather than a
+# degenerate one-block engine. A one-block engine still runs the denoiser
+# objective and still gradients one block, so it is not a baseline for this.
+use_diffusion_blocks = args.db_blocks > 0
+num_db_blocks = min(args.db_blocks, args.depth) if use_diffusion_blocks else 0
 if resumed_db_blocks is not None and resumed_db_blocks != num_db_blocks:
     raise SystemExit(
         f"--db-blocks {num_db_blocks} does not match the checkpoint's "
         f"{resumed_db_blocks} blocks; the block partition is checkpoint "
         "provenance and cannot be changed on resume"
     )
-partitioner = EquiProbabilityPartitioner(
-    num_blocks=num_db_blocks,
-    sigma_min=0.002,
-    sigma_max=80.0,
-    sigma_data=0.5,
-)
+if not use_diffusion_blocks:
+    print0(
+        "DiffusionBlocks disabled (--db-blocks<=0): plain next-token LM training, "
+        "every layer trains every step"
+    )
+    # These are all denoiser-only concepts. Rejecting rather than ignoring them
+    # keeps a flag the user typed from looking like it did something.
+    for flag, value in (
+        ("--db-objective", args.db_objective),
+        ("--db-block-sampling", args.db_block_sampling),
+        ("--kd-denoiser-alpha", args.kd_denoiser_alpha),
+        ("--efqat-latch-blocks", args.efqat_latch_blocks),
+    ):
+        if (
+            value not in (0, 0.0, "", None)
+            and not (flag == "--db-objective" and value == "edm")
+            and not (flag == "--db-block-sampling" and value == "step")
+        ):
+            raise SystemExit(
+                f"{flag}={value!r} is meaningless with --db-blocks<=0: there are "
+                "no diffusion blocks to sample, condition or latch. Drop the flag "
+                "or set --db-blocks to a positive count."
+            )
+    if args.db_sigma_codebook:
+        raise SystemExit(
+            f"--db-sigma-codebook={args.db_sigma_codebook!r} requires diffusion "
+            "blocks to condition on. Drop it or set --db-blocks to a positive count."
+        )
+
 # device/dtype: the engine owns adapters + denoise heads, which are created here.
 # Without them they land on CPU while their siblings are on `device`, and since
 # they are in the optimizer but never see a forward on that device, their .grad
 # stays None and AdamW silently skips them forever.
-engine = DiffusionBlockEngine(model, partitioner, device=device, dtype=COMPUTE_DTYPE)
-print0(f"Initialized DiffusionBlocks Engine with {num_db_blocks} independent blocks")
-
-# PRD: "the only training method that exists must use it" — when LC-QAT is
-# enabled, retrofit the engine-owned Linear layers (adapters + denoise heads)
-# too, so the whole training pipeline is LC-QAT.
-if lcqat_active is not None:
-    n_lcqat = engine.apply_lcqat(lcqat_active)
-    print0(f"LC-QAT retrofitted {n_lcqat} diffusion-engine Linear layers")
-
-# Sigma-conditioned activation codebooks (PRD 3.2). Opt-in: a DiffusionBlocks
-# engine's blocks train on disjoint noise ranges, so one activation codebook has
-# to span all of them, and most of its levels are spent on values that never
-# occur. Two mechanisms with very different costs, so both are opt-in and the
-# default recipe is untouched.
-if args.db_sigma_codebook:
-    num_anchors = args.db_sigma_anchors or num_db_blocks
-    n_conditioned = install_sigma_codebooks(
-        engine, args.db_sigma_codebook, args.db_sigma_anchors, num_db_blocks
-    )
-    print0(
-        f"sigma-conditioned activation codebooks: {args.db_sigma_codebook} on "
-        f"{n_conditioned} layers"
-        + (f", {num_anchors} anchors" if num_anchors > 1 else "")
-    )
-
-# SparseProp on the engine-owned layers (adapters + per-block denoise heads).
-# The base transformer is handled separately: on a fresh run by the injection
-# below, and on a resume by the pre-load injection in the resume branch, which
-# has to happen before load_state_dict can see the checkpoint's mask buffers.
-if args.sparseprop:
-    n_sparse = engine.apply_sparseprop(
-        sparsity=args.sparseprop_sparsity,
-        with_lcqat=lcqat_active is not None,
-    )
-    print0(f"SparseProp injected {n_sparse} sparse Linear layers")
-    # `inject_sparseprop_layers` places a per-layer magnitude mask as a
-    # placeholder. The base transformer's masks were already set above; this
-    # only touches the engine-owned layers (adapters + per-block denoise heads),
-    # and on a resume it is skipped so the checkpoint's masks survive.
-    if not resuming:
-        engine_achieved = sparse_schedule.apply(engine, 0)
-        if engine_achieved is not None:
-            print0(
-                f"SparseProp pruned engine layers to {engine_achieved:.4f} "
-                f"sparsity (scope={sparse_schedule.scope})"
-            )
-
-
-# Denoiser distillation teacher (PRD 3.1, EDM form). Taken *here*, before the
-# retrofits below, so on a fresh run the copy is already float: LC-QAT codebooks
-# and SparseProp sparsity are exactly what --kd-denoiser-alpha measures.
+engine = None
 float_twin, n_twin_stripped = (None, 0)
-if args.kd_denoiser_alpha > 0.0:
-    float_twin, n_twin_stripped = build_denoiser_teacher(
-        engine, args.kd_denoiser_alpha, args.db_objective
+if use_diffusion_blocks:
+    partitioner = EquiProbabilityPartitioner(
+        num_blocks=num_db_blocks,
+        sigma_min=0.002,
+        sigma_max=80.0,
+        sigma_data=0.5,
+    )
+    engine = DiffusionBlockEngine(
+        model, partitioner, device=device, dtype=COMPUTE_DTYPE
     )
     print0(
-        f"KD denoiser twin: float copy of the engine "
-        f"({n_twin_stripped} LC-QAT layers stripped)"
+        f"Initialized DiffusionBlocks Engine with {num_db_blocks} independent blocks"
     )
+
+    # PRD: "the only training method that exists must use it" — when LC-QAT is
+    # enabled, retrofit the engine-owned Linear layers (adapters + denoise heads)
+    # too, so the whole training pipeline is LC-QAT.
+    if lcqat_active is not None:
+        n_lcqat = engine.apply_lcqat(lcqat_active)
+        print0(f"LC-QAT retrofitted {n_lcqat} diffusion-engine Linear layers")
+
+    # Sigma-conditioned activation codebooks (PRD 3.2). Opt-in: a DiffusionBlocks
+    # engine's blocks train on disjoint noise ranges, so one activation codebook has
+    # to span all of them, and most of its levels are spent on values that never
+    # occur. Two mechanisms with very different costs, so both are opt-in and the
+    # default recipe is untouched.
+    if args.db_sigma_codebook:
+        num_anchors = args.db_sigma_anchors or num_db_blocks
+        n_conditioned = install_sigma_codebooks(
+            engine, args.db_sigma_codebook, args.db_sigma_anchors, num_db_blocks
+        )
+        print0(
+            f"sigma-conditioned activation codebooks: {args.db_sigma_codebook} on "
+            f"{n_conditioned} layers"
+            + (f", {num_anchors} anchors" if num_anchors > 1 else "")
+        )
+
+    # SparseProp on the engine-owned layers (adapters + per-block denoise heads).
+    # The base transformer is handled separately: on a fresh run by the injection
+    # below, and on a resume by the pre-load injection in the resume branch, which
+    # has to happen before load_state_dict can see the checkpoint's mask buffers.
+    if args.sparseprop:
+        n_sparse = engine.apply_sparseprop(
+            sparsity=args.sparseprop_sparsity,
+            with_lcqat=lcqat_active is not None,
+        )
+        print0(f"SparseProp injected {n_sparse} sparse Linear layers")
+        # `inject_sparseprop_layers` places a per-layer magnitude mask as a
+        # placeholder. The base transformer's masks were already set above; this
+        # only touches the engine-owned layers (adapters + per-block denoise heads),
+        # and on a resume it is skipped so the checkpoint's masks survive.
+        if not resuming:
+            engine_achieved = sparse_schedule.apply(engine, 0)
+            if engine_achieved is not None:
+                print0(
+                    f"SparseProp pruned engine layers to {engine_achieved:.4f} "
+                    f"sparsity (scope={sparse_schedule.scope})"
+                )
+
+    # Denoiser distillation teacher (PRD 3.1, EDM form). Taken *here*, before the
+    # retrofits below, so on a fresh run the copy is already float: LC-QAT codebooks
+    # and SparseProp sparsity are exactly what --kd-denoiser-alpha measures.
+    if args.kd_denoiser_alpha > 0.0:
+        float_twin, n_twin_stripped = build_denoiser_teacher(
+            engine, args.kd_denoiser_alpha, args.db_objective
+        )
+        print0(
+            f"KD denoiser twin: float copy of the engine "
+            f"({n_twin_stripped} LC-QAT layers stripped)"
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -881,8 +947,12 @@ if weight_decay_scaled != args.weight_decay:
 # PRD section 5: codebook delta params (`raw_pos_deltas`, `raw_neg_deltas`)
 # get their own AdamW group with a dedicated LR and zero weight decay,
 # distinct from the matrix-weight group.
+# Everything the optimizer owns: the engine when DiffusionBlocks is on, the
+# bare GPT otherwise. `build_qat_param_groups` accepts either, since it only
+# needs something exposing `named_parameters()`.
+trainable_root = engine if use_diffusion_blocks else model
 param_groups = build_qat_param_groups(
-    engine,
+    trainable_root,
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
     codebook_lr=args.codebook_lr * batch_lr_scale,
@@ -896,7 +966,7 @@ param_groups = build_qat_param_groups(
 # Fail here rather than shipping a run where a whole role silently never trains
 # (which is what happened to --embedding-lr/--unembedding-lr/--scalar-lr while
 # the group builder emitted only matrix + codebook).
-verify_partition(engine, param_groups)
+verify_partition(trainable_root, param_groups)
 print0(
     "Optimizer groups: "
     + ", ".join(f"{g['role']}={len(g['params'])}" for g in param_groups)
@@ -1041,7 +1111,14 @@ if lcqat_active is not None and args.efqat_freeze_after >= 0:
     )
     # The engine consults the freezer before enabling a block, so the freeze
     # survives; previously `_activate_block` re-enabled everything each step.
-    engine.set_freezer(efqat_freezer)
+    if use_diffusion_blocks:
+        engine.set_freezer(efqat_freezer)
+    else:
+        # No `_activate_block` runs in LM mode, so nothing would otherwise ever
+        # re-enable the frozen band and the veto has to be applied here.
+        efqat_freezer.freeze()
+        n_frozen_now = sum(1 for p in model.parameters() if not p.requires_grad)
+        print0(f"EfQAT froze {n_frozen_now} parameters (LM mode: no engine arbiter)")
 
 # -----------------------------------------------------------------------------
 # Denoiser distillation (PRD 3.1, EDM form): hand the frozen float twin to the
@@ -1051,7 +1128,8 @@ if lcqat_active is not None and args.efqat_freeze_after >= 0:
 kd_denoiser = None
 if float_twin is not None:
     kd_denoiser = DenoiserDistiller(float_twin, alpha=args.kd_denoiser_alpha)
-    engine.set_distiller(kd_denoiser)
+    engine.set_distiller(kd_denoiser)  # engine is not None: kd-denoiser-alpha is
+    # rejected outright when DiffusionBlocks is off (see the startup guard).
     print0(
         f"KD denoiser distillation enabled: alpha={args.kd_denoiser_alpha}, "
         f"anchor = w(sigma)*||D_quant - D_float||^2 on the same noisy input"
@@ -1066,7 +1144,7 @@ if float_twin is not None:
 # `_activate_block` re-enables the block -- which `set_freezer` arranges.
 block_latch_freezer = None
 efqat_latch_targets: list[int] = []
-if lcqat_active is not None:
+if lcqat_active is not None and use_diffusion_blocks:
     block_latch_freezer, efqat_latch_targets = make_latch_freezer(
         engine, args.efqat_latch_blocks, num_db_blocks
     )
@@ -1080,6 +1158,7 @@ if block_latch_freezer is not None:
     # start training a block the previous run had retired.
     if resuming and meta_data:
         block_latch_freezer.load_metadata(meta_data.get("efqat_latch"))
+if block_latch_freezer is not None:
     engine.set_freezer(block_latch_freezer)
 
 # -----------------------------------------------------------------------------
@@ -1307,7 +1386,11 @@ while True:
             # below declares meta["db"]. Saving the bare model writes a
             # checkpoint that claims a diffusion engine but carries none of its
             # parameters, so every resume silently reloads zero adapters/heads.
-            engine.state_dict(),
+            # engine.state_dict() when DiffusionBlocks is on, because the engine
+            # owns db_adapters.* / db_denoise_heads.* on top of the bare GPT.
+            # In LM mode there is no engine and the bare model IS the complete
+            # trainable tree.
+            (engine if use_diffusion_blocks else model).state_dict(),
             optimizer.state_dict(),  # optimizer state
             {  # metadata saved as json
                 "step": step,
@@ -1326,18 +1409,28 @@ while True:
                     "tau": args.kd_temperature,
                     "denoiser_alpha": args.kd_denoiser_alpha,
                 },
-                "db": {
-                    "num_blocks": num_db_blocks,
-                    "sigma_min": 0.002,
-                    "sigma_max": 80.0,
-                    "sigma_data": 0.5,
-                },
+                # None, not a zeroed dict: `build_model` gates the whole
+                # DiffusionBlocks reconstruction on meta["db"] being present, so
+                # an LM-mode checkpoint loads as a bare GPT with a strict
+                # load and no engine adapters to be silently zero.
+                "db": (
+                    {
+                        "num_blocks": num_db_blocks,
+                        "sigma_min": 0.002,
+                        "sigma_max": 80.0,
+                        "sigma_data": 0.5,
+                    }
+                    if use_diffusion_blocks
+                    else None
+                ),
                 # EfQAT per-block latch: which blocks have been permanently
                 # retired. Metadata only -- the tensors themselves are already
                 # in engine.state_dict() -- but the freeze decision is not
                 # recoverable from tensor values, so it has to be written out
                 # or a resume silently restarts training a converged block.
-                "efqat_latch": engine.freezer_metadata(),
+                "efqat_latch": (
+                    engine.freezer_metadata() if use_diffusion_blocks else None
+                ),
                 "sigma_codebook": describe_sigma_codebooks(args),
                 "sparseprop": {
                     "enabled": args.sparseprop,
@@ -1376,7 +1469,9 @@ while True:
     # block activation, silently undoing the freeze.
     if efqat_freezer is not None:
         if efqat_freezer.update(step):
-            n_frozen = sum(1 for p in engine.parameters() if not p.requires_grad)
+            n_frozen = sum(
+                1 for p in trainable_root.parameters() if not p.requires_grad
+            )
             print0(f"EfQAT froze {n_frozen} parameters at step {step}")
     # EfQAT per-block latch (PRD 3.2). Fires before the forward, so the retired
     # block is already frozen in the very step the latch lands; latching after
@@ -1397,7 +1492,7 @@ while True:
     # weight is exactly 0.0, so |W| == 0 and it can never be re-selected), which
     # is what makes a resumed ramp safe.
     if args.sparseprop:
-        pruned = sparse_schedule.apply(engine, step)
+        pruned = sparse_schedule.apply(trainable_root, step)
         if pruned is not None:
             n_sparse_above = len(sparse_schedule.layers_above_threshold(engine))
             print0(
@@ -1411,14 +1506,16 @@ while True:
     # DiffusionBlocks depends on.
     block_idx = (
         engine.sample_block()
-        if args.db_objective == "edm" and args.db_block_sampling == "step"
+        if use_diffusion_blocks
+        and args.db_objective == "edm"
+        and args.db_block_sampling == "step"
         else None
     )
     # Hoisted out of the micro-step loop: denoise_step reuses the same (x, y)
     # across grad_accum_steps, so the embedding lookup + L2 normalization would
     # otherwise be redone once per micro-step.
     clean = None
-    if args.db_objective == "edm":
+    if use_diffusion_blocks and args.db_objective == "edm":
         with torch.no_grad():
             clean = F.normalize(engine.model.transformer.wte(x).float(), dim=-1)
 
@@ -1428,7 +1525,13 @@ while True:
     step_kd_logged = 0.0
 
     for micro_step in range(grad_accum_steps):
-        if args.db_objective == "edm":
+        if not use_diffusion_blocks:
+            # Plain autoregressive LM training. `model` here is the LC-QAT
+            # (and possibly SparseProp) retrofitted GPT, so this is the
+            # conventional next-token objective over the same quantized model
+            # the DiffusionBlocks arms train, differing only in the objective.
+            loss = model(x, targets=y, attn_mask=train_attn_mask)
+        elif args.db_objective == "edm":
             # `block_idx=None` under --db-block-sampling micro, which redraws
             # per micro-step (the ablation arm).
             loss, sigma = engine.denoise_step(
@@ -1443,7 +1546,9 @@ while True:
         elif kd_loss_fn is not None:
             # KD anchoring needs logits, so the CE objective asks for them
             # explicitly (targets=None) and computes the CE term here.
-            student_logits = engine.model(x, targets=None, attn_mask=train_attn_mask)
+            # `model` is the bare GPT in both modes -- the engine wraps it, and in
+            # LM mode there is no engine at all.
+            student_logits = model(x, targets=None, attn_mask=train_attn_mask)
             # Mirror GPT.forward's loss exactly: the dataloader already shifted
             # y, so no extra shift here.
             loss_ce = F.cross_entropy(

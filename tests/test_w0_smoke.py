@@ -8,10 +8,44 @@ being undefined, `engine` being shadowed by `Engine`, and
 `orig_model.state_dict()` dropping the whole diffusion engine.
 """
 
+import os
 import subprocess
 import sys
 
 import pytest
+
+
+def _subprocess_python() -> str:
+    """The interpreter that can actually import this project's dependencies.
+
+    `sys.executable` is only correct when pytest itself runs from the project
+    venv. Under a plain `python -m pytest` against the system interpreter it
+    points at /usr/bin/python, and every subprocess test then dies at
+    `import wandb` before reaching any of the code under test -- which is how
+    tests/test_w0_smoke.py came to have subprocess tests that never ran.
+
+    Resolve from the *package* location instead of `sys.executable`: the
+    project's own dependencies are importable from the interpreter whose
+    site-packages contains `nanochat`, and that interpreter is the venv one
+    whether or not pytest itself is running inside it. Falls back to
+    `sys.executable` when the venv layout is not there, which is the normal
+    in-venv case and needs no special handling.
+    """
+    venv_python = os.path.join(sys.prefix, "bin", "python")
+    # A repo checkout inside a venv: the project root is two levels above the
+    # tests directory, and the venv interpreter sits beside bin/activate.
+    candidate = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        ".venv",
+        "bin",
+        "python",
+    )
+    if os.path.exists(candidate):
+        return candidate
+    if os.path.exists(venv_python):
+        return venv_python
+    return sys.executable
+
 
 # d6 with a short sequence length keeps the smoke inside the 7.6 GB host budget.
 SMOKE_ARGS = [
@@ -42,7 +76,7 @@ SMOKE_ARGS = [
 
 def _run(extra, timeout=900):
     return subprocess.run(
-        [sys.executable, "-m", "scripts.base_train", *SMOKE_ARGS, *extra],
+        [_subprocess_python(), "-m", "scripts.base_train", *SMOKE_ARGS, *extra],
         capture_output=True,
         text=True,
         timeout=timeout,

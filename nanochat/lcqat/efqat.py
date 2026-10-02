@@ -15,9 +15,21 @@ The freezer is a stateful callable driven by the training step count. It
 mutates `requires_grad` in place; because AdamW skips params whose `.grad is
 None`, frozen params stop updating without touching the optimizer's momentum
 buffers (those buffers remain but receive no fresh updates).
+
+`BlockLatchFreezer` adds the *per-block permanent* half, which the
+middle-band freezer above cannot express. Under DiffusionBlocks each block
+trains on a disjoint equi-probability sigma range, so a block's quantization
+parameters (LC-QAT codebook deltas, weights) finish specializing early. Once
+that happens the block must stop moving: later optimizer steps that happen to
+sample this block again must not revive it. The latch is therefore one-way --
+`latch_block` has no inverse -- and it is consulted by the engine's
+`_requires_grad_for` *before* block activation, so activation can never
+re-enable a latched parameter.
 """
 
 from __future__ import annotations
+
+from typing import Iterable
 
 import torch.nn as nn
 
@@ -39,6 +51,13 @@ CRITICAL_PATTERNS = (
 
 class SelectiveFreezer:
     """Freeze middle-layer codebook + weight grads after a warm-up window.
+
+    Single source of truth for `requires_grad` under DiffusionBlocks: the engine
+    asks `is_trainable(name)` before enabling a block, instead of enabling
+    everything and letting the freezer lose the race. Previously `_activate_block`
+    unconditionally re-enabled every `transformer.h.*` parameter each micro-step,
+    which undid any freeze applied on the previous step, so EfQAT never took
+    effect at all.
 
     Args:
         model: the (retrofitted) model tree.
@@ -72,6 +91,23 @@ class SelectiveFreezer:
     @staticmethod
     def is_critical(name: str) -> bool:
         return any(pat in name for pat in CRITICAL_PATTERNS)
+
+    def is_trainable(self, name: str) -> bool:
+        """Whether `name` may receive gradients right now.
+
+        The engine's block activation consults this instead of setting
+        `requires_grad_` directly, so a frozen parameter stays frozen across
+        steps. Unfrozen is the default, so this is safe to call before `freeze()`.
+        """
+        if not self._frozen:
+            return True
+        if self.is_critical(name):
+            return True
+        return id(self._lookup(name)) not in self._frozen_params
+
+    def _lookup(self, name: str) -> nn.Parameter | None:
+        params = dict(self.model.named_parameters())
+        return params.get(name)
 
     def _layer_params(self) -> list[tuple[int, str, nn.Parameter]]:
         """Return (layer_index, param_name, param) for every transformer.h param."""
@@ -152,3 +188,132 @@ class SelectiveFreezer:
         self._frozen_params.clear()
         self._frozen = False
         return count
+
+
+class BlockLatchFreezer:
+    """One-way per-block freeze of DiffusionBlocks quantization parameters.
+
+    A DiffusionBlocks block trains on one disjoint equi-probability sigma range,
+    so its quantization parameters converge to that range early. Once they have,
+    later optimizer steps must not move them again -- otherwise a step that
+    happens to resample a converged block silently un-converges it. The latch
+    has no inverse by design: `latch_block` is the only transition, and
+    `is_trainable` keeps returning False for a latched block's names forever.
+
+    The engine consults `is_trainable(name)` from `_requires_grad_for` *before*
+    setting `requires_grad`, which is what makes the latch survive block
+    activation. Setting `requires_grad` first and vetoing afterwards would let
+    the next `_activate_block` revive the block.
+
+    Names follow `DiffusionBlockEngine.named_parameters()` conventions: the
+    block index is the ModuleList position after the prefix, e.g.
+    `db_denoise_heads.2.weight` or `transformer.h.5.attn.c_q.weight` (block 2
+    owning layer 5 under a 4-layer / 2-block split).
+
+    Args:
+        engine: the `DiffusionBlockEngine` whose parameters are gated.
+        block_layers: `engine.block_layers()`, mapping block index to the
+            transformer layer indices it owns. Needed to attribute shared-name
+            transformer parameters to a block.
+    """
+
+    def __init__(self, engine, block_layers: list[list[int]]) -> None:
+        self.engine = engine
+        self.block_layers = [list(group) for group in block_layers]
+        self._latched: set[int] = set()
+
+    # -- name -> block resolution -------------------------------------------
+
+    def block_of(self, name: str) -> int | None:
+        """Return the block index owning `name`, or None if it is shared.
+
+        Shared parameters (embeddings, `lm_head`, per-model scalars) belong to
+        every block, so no single block's freeze can claim them; returning None
+        keeps them trainable, which is what block isolation already does.
+        """
+        if name.startswith("transformer.h."):
+            layer_token = name.split(".")[2]
+            if not layer_token.isdigit():
+                return None
+            layer = int(layer_token)
+            for block_idx, group in enumerate(self.block_layers):
+                if layer in group:
+                    return block_idx
+            return None
+        for prefix in ("db_adapters.", "db_denoise_heads."):
+            if name.startswith(prefix):
+                parts = name.split(".")
+                if len(parts) > 1 and parts[1].isdigit():
+                    return int(parts[1])
+        return None
+
+    def block_parameter_names(self, block_idx: int) -> list[str]:
+        """Every engine parameter name attributed to `block_idx`."""
+        return [
+            name
+            for name, _ in self.engine.named_parameters()
+            if self.block_of(name) == block_idx
+        ]
+
+    # -- the latch -----------------------------------------------------------
+
+    def is_latched(self, block_idx: int) -> bool:
+        """Whether `block_idx` has been permanently frozen."""
+        return int(block_idx) in self._latched
+
+    def latched_blocks(self) -> list[int]:
+        """Sorted list of latched block indices (for logging / checkpointing)."""
+        return sorted(self._latched)
+
+    def latch_block(self, block_idx: int) -> int:
+        """Permanently freeze `block_idx`'s parameters. Idempotent.
+
+        Returns the number of parameters newly frozen (0 if already latched).
+        """
+        b = int(block_idx)
+        if b in self._latched:
+            return 0
+        params = dict(self.engine.named_parameters())
+        frozen = 0
+        for name, p in params.items():
+            if self.block_of(name) != b:
+                continue
+            if p.requires_grad:
+                p.requires_grad_(False)
+                p.grad = None
+                frozen += 1
+        self._latched.add(b)
+        return frozen
+
+    def latch_blocks(self, block_indices: Iterable[int]) -> int:
+        """Latch several blocks; returns the total number of params frozen."""
+        return sum(self.latch_block(b) for b in block_indices)
+
+    def is_trainable(self, name: str) -> bool:
+        """Whether `name` may receive gradients right now.
+
+        A latched block's names are False forever; everything else is True, so
+        this is safe to call before any latch is taken.
+        """
+        if not self._latched:
+            return True
+        block_idx = self.block_of(name)
+        return block_idx is None or block_idx not in self._latched
+
+    def metadata(self) -> dict:
+        """JSON-serializable latch state for checkpoint metadata.
+
+        Codebook/weight tensors are already covered by the engine state_dict, so
+        this records only the (non-recoverable) freeze decision: a resumed run
+        must not train a block the previous run had converged.
+        """
+        return {
+            "latched_blocks": self.latched_blocks(),
+            "n_blocks": len(self.block_layers),
+        }
+
+    def load_metadata(self, meta: dict | None) -> None:
+        """Restore latch state from checkpoint metadata. No-op when absent."""
+        if not meta:
+            return
+        self.latch_blocks(meta.get("latched_blocks", []))

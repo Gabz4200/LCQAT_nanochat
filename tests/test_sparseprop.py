@@ -183,3 +183,101 @@ class TestSparsepropBackward:
         assert (gW_dense[~s["mask"]] == 0).all(), (
             "Non-zero gradient at masked positions!"
         )
+
+
+class TestSparseLayoutContracts:
+    """Ordering contracts the AVX2 kernels depend on.
+
+    Neither ordering is cosmetic: the forward walks `w_col[w_ptr[m]:w_ptr[m+1]]`
+    and the backward walks `w_row[w_ptr_csc[j]:w_ptr_csc[j+1]]` in the stored
+    order, accumulating `grad_out` as it goes. A layout that is correct as a
+    *set* but ordered differently produces different gradients without any
+    error being raised -- so the orders are pinned directly.
+
+    The CSC case is the one that a single `torch.nonzero(mask)` gets wrong:
+    `nonzero` emits row-major order, which is exactly the CSR layout and the
+    wrong one for CSC.
+    """
+
+    @staticmethod
+    def _adversarial_mask() -> torch.Tensor:
+        """Mask with a fully dense row, a fully dense column, and empty rows/cols.
+
+        A random mask can pass an ordering check by accident. Row 1 is dense and
+        column 3 is dense, so an ordering bug has to survive a run of many
+        identical-row entries in the CSC stream to hide.
+        """
+        mask = torch.zeros(6, 8, dtype=torch.bool)
+        mask[1, :] = True  # dense row: long run under row-major ordering
+        mask[:, 3] = True  # dense column: long run under CSC ordering
+        mask[4, 0] = True
+        mask[4, 7] = True
+        mask[0, 0] = True
+        return mask
+
+    def test_when_csc_built_then_rows_ascend_within_each_column(self):
+        """CSC row indices are ascending inside every column."""
+        mask = self._adversarial_mask()
+        col_ptr, row_idx = build_csr_csc_from_mask(mask)[2:]
+
+        row_idx_l = row_idx.long()
+        for j in range(mask.shape[1]):
+            column = row_idx_l[col_ptr[j].long() : col_ptr[j + 1].long()]
+            assert torch.all(column[1:] > column[:-1]), (
+                f"column {j} row indices are not strictly ascending: {column.tolist()}"
+            )
+            expected = torch.nonzero(mask[:, j], as_tuple=True)[0]
+            assert torch.equal(column, expected), (
+                f"column {j} holds {column.tolist()}, expected {expected.tolist()}"
+            )
+
+    def test_when_csr_built_then_cols_ascend_within_each_row(self):
+        """CSR column indices are ascending inside every row."""
+        mask = self._adversarial_mask()
+        row_ptr, col_idx = build_csr_csc_from_mask(mask)[:2]
+
+        col_idx_l = col_idx.long()
+        for m in range(mask.shape[0]):
+            row = col_idx_l[row_ptr[m].long() : row_ptr[m + 1].long()]
+            assert torch.all(row[1:] > row[:-1]), (
+                f"row {m} column indices are not strictly ascending: {row.tolist()}"
+            )
+            expected = torch.nonzero(mask[m], as_tuple=True)[0]
+            assert torch.equal(row, expected), (
+                f"row {m} holds {row.tolist()}, expected {expected.tolist()}"
+            )
+
+    def test_when_mask_random_then_csc_ordering_holds_for_many_seeds(self):
+        """The contract holds for arbitrary masks, not just the crafted one."""
+        for seed in range(8):
+            torch.manual_seed(seed)
+            mask = torch.rand(9, 11) < 0.5
+            # Guarantee >= 1 nnz per row so no column/row degenerates.
+            empty = ~mask.any(dim=1)
+            mask[empty, 0] = True
+            col_ptr, row_idx = build_csr_csc_from_mask(mask)[2:]
+            row_idx_l = row_idx.long()
+            for j in range(mask.shape[1]):
+                column = row_idx_l[col_ptr[j].long() : col_ptr[j + 1].long()]
+                assert torch.all(column[1:] > column[:-1]), (
+                    f"seed {seed} column {j} not ascending"
+                )
+
+    def test_when_layout_built_then_pointers_and_counts_agree(self):
+        """row_ptr[-1] == col_ptr[-1] == nnz, and both cover the mask exactly."""
+        mask = self._adversarial_mask()
+        row_ptr, col_idx, col_ptr, row_idx = build_csr_csc_from_mask(mask)
+
+        nnz = int(mask.sum())
+        assert int(row_ptr[-1]) == nnz
+        assert int(col_ptr[-1]) == nnz
+        assert col_idx.numel() == nnz
+        assert row_idx.numel() == nnz
+        # Every (row, col) in the CSR listing must be a mask entry, and the
+        # CSC listing must be the same set.
+        rows_csr = _nnz_row_indices(row_ptr, mask.shape[0]).long()
+        cols_csc = _csc_col_indices(col_ptr, mask.shape[1], nnz, mask.device).long()
+        csr_set = {(int(r), int(c)) for r, c in zip(rows_csr, col_idx.long())}
+        csc_set = {(int(r), int(c)) for r, c in zip(row_idx.long(), cols_csc)}
+        assert csr_set == csc_set
+        assert all(mask[r, c] for r, c in csr_set)

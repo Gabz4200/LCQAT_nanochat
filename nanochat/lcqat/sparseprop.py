@@ -13,13 +13,22 @@ import torch.nn as nn
 
 from nanochat.gpt import Linear
 from nanochat.lcqat.ops.sparseprop import (
-    _csc_col_indices,
     _nnz_row_indices,
     build_csr_csc_from_mask,
-    gather_values_from_dense,
     sparseprop_backward_cpu,
     sparseprop_forward_cpu,
 )
+
+#: How a pruning target is distributed across layers.
+SCOPE_LAYER = "layer"
+SCOPE_GLOBAL = "global"
+PRUNE_SCOPES = (SCOPE_LAYER, SCOPE_GLOBAL)
+
+#: SparseProp Sec. 4.1: a module stays on the dense kernel until it reaches
+#: this sparsity, then the sparse kernel is chosen by measured forward+backward
+#: time. The paper's own number (80%) is the default; the flag exists because
+#: the crossover is hardware- and shape-dependent.
+DEFAULT_DENSE_THRESHOLD = 0.8
 
 
 class SparsePropLinearFunction(torch.autograd.Function):
@@ -30,7 +39,9 @@ class SparsePropLinearFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, weight, bias, mask, w_ptr, w_col, w_ptr_csc, w_row):
+    def forward(
+        ctx, x, weight, bias, mask, w_ptr, w_col, w_ptr_csc, w_row, csr_gidx, csc_gidx
+    ):
         """Forward: y = SpMM(W * mask, x) + bias.
 
         Layout: x [*, in], weight [out, in], y [*, out].
@@ -47,8 +58,9 @@ class SparsePropLinearFunction(torch.autograd.Function):
         ctx.B = B
         ctx.has_bias = bias is not None
         ctx.x_shape = x.shape  # save original shape for backward reshape
-
-        ctx.save_for_backward(x_flat, weight)
+        # One call, one tensor list: a second save_for_backward overwrites the
+        # first, which silently dropped x/weight from the backward.
+        ctx.save_for_backward(x_flat, weight, csr_gidx, csc_gidx)
         ctx.mask = mask
         ctx.w_ptr = w_ptr
         ctx.w_col = w_col
@@ -57,8 +69,8 @@ class SparsePropLinearFunction(torch.autograd.Function):
 
         # Transpose to [in, B] for kernel (contiguous batch axis)
         x_t = x_flat.t().contiguous()  # [in_f, B]
-        # Gather sparse weight values (CSR order)
-        w_val = gather_values_from_dense(weight, w_col, w_ptr, out_f)
+        # Gather sparse weight values (CSR order) using the precomputed index.
+        w_val = weight.view(-1)[csr_gidx.to(weight.device)]
 
         y_t = sparseprop_forward_cpu(x_t, w_val, w_col, w_ptr, bias, out_f)
         y_flat = y_t.t().contiguous()  # [B, out_f]
@@ -73,22 +85,20 @@ class SparsePropLinearFunction(torch.autograd.Function):
     def backward(ctx, grad_y):
         # Transpose grad_y to [out, B] and x to [in, B] for kernel
         # Flatten to 2D to match forward's flattened layout
-        x_flat, weight = ctx.saved_tensors
+        x_flat, weight, csr_gidx, csc_gidx = ctx.saved_tensors
         B = ctx.B
         in_f = ctx.in_features
         out_f = ctx.out_features
-        nnz = ctx.w_col.numel()
 
         grad_y_flat = grad_y.reshape(B, out_f)
         grad_y_t = grad_y_flat.t().contiguous()  # [out_f, B]
         x_t = x_flat.t().contiguous()  # [in_f, B]
 
-        # Gather sparse weight values (CSR order for dW, CSC order for dX)
-        w_val = gather_values_from_dense(weight, ctx.w_col, ctx.w_ptr, out_f)
-        # For dX (CSC): weight[m,k] where m=w_row[p], k=col_idx_csc[p]
-        col_idx_csc = _csc_col_indices(ctx.w_ptr_csc, in_f, nnz, grad_y.device)
-        lin_idx_csc = ctx.w_row.to(weight.device) * in_f + col_idx_csc.to(weight.device)
-        w_val_csc = weight.view(-1)[lin_idx_csc]
+        # Both gathers use indices precomputed in _build_sparse_structure: CSR
+        # order for dW, CSC order for dX. They depend only on the sparsity
+        # pattern, which does not change between steps.
+        w_val = weight.view(-1)[csr_gidx.to(weight.device)]
+        w_val_csc = weight.view(-1)[csc_gidx.to(weight.device)]
 
         # Sparse backward via C++ kernel
         gX_t, gW_val = sparseprop_backward_cpu(
@@ -123,7 +133,7 @@ class SparsePropLinearFunction(torch.autograd.Function):
         # Zero grad at masked positions (frozen pruned weights)
         gW = gW * ctx.mask.to(gW.dtype)
 
-        return gX, gW, gBias, None, None, None, None, None
+        return gX, gW, gBias, None, None, None, None, None, None, None
 
 
 class SparsePropLinear(Linear):
@@ -150,30 +160,84 @@ class SparsePropLinear(Linear):
     ):
         super().__init__(in_features, out_features, bias=bias, device=device)
         self.sparsity = float(sparsity)
-        # Static boolean mask [out, in]
+        # Static boolean mask [out, in]. persistent=True: the sparsity pattern is
+        # trained state, and a non-persistent mask means resume silently re-rolls
+        # a random pattern instead of restoring the one the weights were pruned
+        # against. The CSR/CSC structures are buffers (not bare attributes) so
+        # .to(device) moves them and they reach the checkpoint.
         self.register_buffer(
             "sparsity_mask",
             torch.zeros(out_features, in_features, dtype=torch.bool, device=device),
-            persistent=False,
+            persistent=True,
         )
         self.sparsity_mask: torch.Tensor  # type hint for pyright
-        self.w_ptr = torch.zeros(1, dtype=torch.int32, device=device)
-        self.w_col = torch.zeros(0, dtype=torch.int32, device=device)
-        self.w_ptr_csc = torch.zeros(1, dtype=torch.int32, device=device)
-        self.w_row = torch.zeros(0, dtype=torch.int32, device=device)
+        self.register_buffer(
+            "w_ptr", torch.zeros(1, dtype=torch.int32, device=device), persistent=True
+        )
+        self.register_buffer(
+            "w_col", torch.zeros(0, dtype=torch.int32, device=device), persistent=True
+        )
+        self.register_buffer(
+            "w_ptr_csc",
+            torch.zeros(1, dtype=torch.int32, device=device),
+            persistent=True,
+        )
+        self.register_buffer(
+            "w_row", torch.zeros(0, dtype=torch.int32, device=device), persistent=True
+        )
+        # Gather indices into the flattened dense weight, in CSR and CSC nnz
+        # order. Derived from the mask alone, so persistent=False: they are
+        # rebuilt in _build_sparse_structure and must not enter the checkpoint.
+        # Rebuilt on every .to(device) via the buffer registration.
+        self.register_buffer(
+            "_csr_gather_index",
+            torch.zeros(0, dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_csc_gather_index",
+            torch.zeros(0, dtype=torch.int32, device=device),
+            persistent=False,
+        )
         self._init_sparsity()
 
     def _init_sparsity(self) -> None:
-        """Initialize sparsity mask if sparsity > 0."""
-        if self.sparsity > 0.0:
-            _init_sparsity_mask(self, self.sparsity)
+        """Build the initial mask.
+
+        Unconditional, including at `sparsity == 0.0`: an all-False mask buffer
+        is not a neutral "no pruning" state, it is an empty CSR structure whose
+        forward raises. The dense mask is what `sparsity=0.0` means.
+        """
+        _init_sparsity_mask(self, self.sparsity)
 
     def _build_sparse_structure(self):
         """Rebuild CSR/CSC index buffers from current mask."""
         mask = self.sparsity_mask
-        self.w_ptr, self.w_col, self.w_ptr_csc, self.w_row = build_csr_csc_from_mask(
-            mask
-        )
+        w_ptr, w_col, w_ptr_csc, w_row = build_csr_csc_from_mask(mask)
+        # Assign through the buffer names so nn.Module keeps the registration
+        # (and moves them on .to(device)); a fresh local would shadow the buffer.
+        self.w_ptr = w_ptr
+        self.w_col = w_col
+        self.w_ptr_csc = w_ptr_csc
+        self.w_row = w_row
+        # The gather index for `gather_values_from_dense` depends only on the
+        # sparsity pattern, which is static between mask updates. Recomputing it
+        # per call cost a `repeat_interleave` over the full row dimension on
+        # every forward AND twice per backward (CSR and CSC orders), which
+        # profiling showed was comparable to the AVX2 kernel's own time. Build
+        # it here, where the mask actually changes, and reuse it.
+        #
+        # Registered with register_buffer(..., persistent=False) so it moves with
+        # .to(device) like the other structure buffers, but stays out of the
+        # checkpoint: it is fully derivable from w_ptr/w_col.
+        M, K = mask.shape
+        row_idx = _nnz_row_indices(w_ptr, M)
+        counts = w_ptr_csc[1:] - w_ptr_csc[:-1]
+        col_idx_csc = torch.repeat_interleave(
+            torch.arange(K, device=w_ptr_csc.device), counts.to(torch.int64)
+        ).to(torch.int32)
+        self._csr_gather_index = (row_idx * K + w_col).to(torch.int32)
+        self._csc_gather_index = (w_row * K + col_idx_csc).to(torch.int32)
 
     def _apply_mask(self):
         """Enforce sparsity: zero masked weight entries, rebuild structure."""
@@ -183,7 +247,12 @@ class SparsePropLinear(Linear):
 
     def _set_mask(self, mask: torch.Tensor) -> None:
         """Update sparsity mask and re-zero inactive weight entries."""
-        self.sparsity_mask = mask
+        if mask.shape != self.sparsity_mask.shape:
+            raise ValueError(
+                f"mask shape {tuple(mask.shape)} does not match the registered "
+                f"buffer {tuple(self.sparsity_mask.shape)}"
+            )
+        self.sparsity_mask.copy_(mask)
         self._apply_mask()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -197,6 +266,8 @@ class SparsePropLinear(Linear):
             self.w_col,
             self.w_ptr_csc,
             self.w_row,
+            self._csr_gather_index,
+            self._csc_gather_index,
         )
 
     @classmethod
@@ -205,7 +276,7 @@ class SparsePropLinear(Linear):
     ) -> "SparsePropLinear":
         """Convert an existing nn.Linear to SparsePropLinear.
 
-        Copies weight/bias and applies a random sparsity mask. All weight
+        Copies weight/bias and applies a magnitude sparsity mask. All weight
         entries at masked positions are zeroed.
         """
         module = cls(
@@ -219,13 +290,9 @@ class SparsePropLinear(Linear):
             module.weight.copy_(linear.weight)
             if linear.bias is not None:
                 module.bias.copy_(linear.bias)
-            # Fresh random mask instead of all-zero default
-            mask = torch.rand_like(linear.weight) > sparsity
-            # Enforce >=1 nnz per row
-            for i in range(mask.shape[0]):
-                if not mask[i].any():
-                    mask[i, int(torch.randint(mask.shape[1], (1,)).item())] = True
-            module.sparsity_mask = mask
+            # copy_ into the buffer: a bare attribute assignment would replace the
+            # buffer's tensor object and detach it from the module's device/dtype.
+            module.sparsity_mask.copy_(magnitude_mask(module.weight, sparsity))
             module._apply_mask()
         return module
 
@@ -271,15 +338,86 @@ class SparsePropLinearLCQAT(SparsePropLinear):
         self.weight = lcqat_linear.weight
         if lcqat_linear.bias is not None:
             self.bias = lcqat_linear.bias
-        self.weight_quantizer = lcqat_linear.weight_quantizer
-        self.act_quantizer = lcqat_linear.act_quantizer
+        # Re-parent EVERYTHING the LCQATLinear owns, not just the two primary
+        # quantizers. `out_quantizer` in particular is mandatory: c_q/c_k/c_v and
+        # c_fc carry one, and dropping it silently disables the KV-cache
+        # quantization path and the fused `quantized_mlp_chain`.
+        for attr in (
+            "weight_quantizer",
+            "act_quantizer",
+            "out_quantizer",
+        ):
+            value = getattr(lcqat_linear, attr, None)
+            if value is not None:
+                setattr(self, attr, value)
+        # Plain-int / str attributes the inference and logging paths read.
+        self.K_weight = lcqat_linear.K_weight
+        self.K_act = lcqat_linear.K_act
+        self.matmul_backend = lcqat_linear.matmul_backend
+        self.grad_scale = getattr(lcqat_linear, "grad_scale", "inv_sqrt_n")
+        # Export-time buffers (packed_weight_indices / weight_index_format /
+        # activation_lut) live on _buffers, not as attributes. Copy them so a
+        # re-wrapped module keeps its quantized inference path.
+        for buf_name, buf in lcqat_linear._buffers.items():
+            if buf is None:
+                continue
+            self.register_buffer(
+                buf_name,
+                buf,
+                persistent=buf_name not in lcqat_linear._non_persistent_buffers_set,
+            )
+        # Submodules owned by the LCQATLinear must be re-parented too, not just
+        # its buffers. `learnable_activation_lut` (the D9 learned activation
+        # table) is registered in `_modules` by attach_learnable_activation_luts,
+        # so the buffer copy above misses it and the `NOTE` below discards the
+        # rest of the tree: the table's `logits` / `initial_table` parameters
+        # were silently dropped the moment this wrapper replaced a `c_fc`, and
+        # the checkpoint then saved without them. Loading such a checkpoint
+        # failed the strict load with "unexpected key(s)" for every wrapped
+        # layer. Copy the whole `_modules` mapping, not a fixed attribute list.
+        for mod_name, mod in lcqat_linear._modules.items():
+            if mod is not None:
+                setattr(self, mod_name, mod)
         # NOTE: do NOT keep a reference to lcqat_linear as an attribute —
         # nn.Module.__setattr__ would register it as a submodule, re-registering
         # its weight/bias/quantizers under a second path and recreating the
-        # orphan + duplicate-parameter bug. The weight/bias/quantizers above
-        # are the only references needed; lcqat_linear is left to be GC'd.
+        # orphan + duplicate-parameter bug. The re-parented attributes above are
+        # the only references needed; lcqat_linear is left to be GC'd.
+        #
+        # That is exactly why the *engine-owned* layers must not go through this
+        # path: `apply_lcqat` replaces the adapter/head Linears in place, so
+        # wrapping them here would re-parent a module that is still registered
+        # elsewhere in the tree and duplicate every codebook parameter. The
+        # engine therefore wraps its own layers via `_wrap_sparseprop`.
         # Apply static sparsity mask (Sparse Transfer) on the shared weight.
         _init_sparsity_mask(self, sparsity)
+
+    def apply_trained_activation(self, y: torch.Tensor) -> torch.Tensor:
+        """Apply the re-parented D9 learned table to this layer's output.
+
+        `gpt.py`'s MLP calls this on the layer it is about to run the trained
+        table through. The wrapper owns `out_quantizer` and
+        `learnable_activation_lut` after re-parenting, so it must expose the
+        entry point itself -- otherwise the caller's `getattr` finds nothing,
+        and a table that can never be reached never receives a gradient, which
+        is the exact failure `LCQATLinear.apply_trained_activation` prevents.
+        """
+        lut = getattr(self, "learnable_activation_lut", None)
+        if lut is None:
+            raise RuntimeError(
+                "apply_trained_activation requires a learnable_activation_lut; "
+                "call attach_learnable_activation_luts() first, or use the "
+                "float activation."
+            )
+        if self.out_quantizer is None:
+            raise RuntimeError(
+                "apply_trained_activation needs c_fc.out_quantizer: the "
+                "trained table is indexed by this layer's *output* codebook."
+            )
+        with torch.no_grad():
+            indices = self.out_quantizer.bucketize(y).reshape(-1)
+        table = lut.resolved_table()
+        return table[indices].reshape(y.shape).to(y.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward: quantize through codebooks (STE), then sparse matmul.
@@ -294,21 +432,27 @@ class SparsePropLinearLCQAT(SparsePropLinear):
 
         # Quantize through codebooks (STE — builds autograd graph to codebook params)
         x_q = self.act_quantizer(x_flat)
+        # No post-dequantization mask multiply: pruned positions already hold an
+        # exact 0.0 in the shadow weight, and 0.0 is a codebook *level* (the
+        # zero anchor at index m_neg), so it quantizes to exactly 0.0. The old
+        # `w_q.value * mask` was numerically identical but discarded the anchor,
+        # which cost the codebook any gradient signal from the anchor bin's width
+        # and would have made the exported indices disagree with the sparse
+        # pattern.
         w_q = self.weight_quantizer(self.weight)
-        W_eff = w_q.value * self.sparsity_mask.to(w_q.value.dtype)
 
-        # Sparse matmul via autograd Function (weight here is W_eff, which carries
-        # the STE graph back to codebook params)
         bias = self.bias if self.bias is not None else None
         out = SparsePropLinearFunction.apply(
             x_q.value,
-            W_eff,
+            w_q.value,
             bias,
             self.sparsity_mask,
             self.w_ptr,
             self.w_col,
             self.w_ptr_csc,
             self.w_row,
+            self._csr_gather_index,
+            self._csc_gather_index,
         )
 
         if orig_shape[:-1] != out.shape[:-1] or out.shape[-1] != self.out_features:
@@ -330,37 +474,209 @@ def apply_static_sparsity_mask(
     model: nn.Module,
     sparsity: float = 0.75,
     target_modules: list[str] | None = None,
-) -> None:
+    scope: str = SCOPE_LAYER,
+) -> float:
     """Initialize sparsity masks on all SparsePropLinear modules.
 
-    Args:
-        model: model to mask
-        sparsity: fraction to prune (0.0-1.0)
-        target_modules: optional name suffixes to limit scope
+    `scope="layer"` prunes every matching module to `sparsity` on its own
+    (Uniform in SparseProp's terminology). `scope="global"` ranks |W| across all
+    matching modules jointly, which the paper measures as the better of the two
+    at equal average sparsity.
+
+    Returns the achieved sparsity, measured from the masks rather than assumed:
+    a tie at the magnitude threshold can leave a few extra entries alive.
     """
-    for name, module in model.named_modules():
-        if isinstance(module, SparsePropLinear):
-            if target_modules is not None:
-                if not any(name.endswith(suffix) for suffix in target_modules):
-                    continue
-            _init_sparsity_mask(module, sparsity)
+    if scope not in PRUNE_SCOPES:
+        raise ValueError(f"scope must be one of {PRUNE_SCOPES}, got {scope!r}")
+    modules = [
+        module
+        for name, module in model.named_modules()
+        if isinstance(module, SparsePropLinear)
+        and (
+            target_modules is None
+            or any(name.endswith(suffix) for suffix in target_modules)
+        )
+    ]
+    if scope == SCOPE_GLOBAL:
+        return apply_global_pruning(modules, sparsity)
+    for module in modules:
+        _init_sparsity_mask(module, sparsity)
+    if not modules:
+        return 0.0
+    total = sum(m.weight.numel() for m in modules)
+    nnz = sum(int(m.sparsity_mask.sum()) for m in modules)
+    return 1.0 - nnz / total if total else 0.0
+
+
+def collect_sparse_layers(root: nn.Module) -> list[SparsePropLinear]:
+    """Every SparsePropLinear reachable from `root`, in module-tree order.
+
+    The gradual-pruning schedule and the global-scope pruner both need the same
+    list, and the ordering only has to be deterministic.
+    """
+    return [m for m in root.modules() if isinstance(m, SparsePropLinear)]
+
+
+def sparse_layers_above(
+    root: nn.Module, dense_threshold: float = DEFAULT_DENSE_THRESHOLD
+) -> list[SparsePropLinear]:
+    """SparseProp layers whose achieved sparsity reaches `dense_threshold`.
+
+    SparseProp Sec. 4.1 keeps a module on the dense kernel until it is at least
+    80% sparse, because below that crossover the sparse kernel's bookkeeping
+    costs more than the multiply it saves. This is the measurement-facing half
+    of that rule: the report says which layers would actually benefit.
+    """
+    return [
+        m
+        for m in collect_sparse_layers(root)
+        if m.weight.numel() > 0
+        and 1.0 - int(m.sparsity_mask.sum()) / m.weight.numel() >= dense_threshold
+    ]
 
 
 def _init_sparsity_mask(module: SparsePropLinear, sparsity: float) -> None:
-    """Random sparsity mask with >=1 nnz per row."""
+    """Magnitude sparsity mask on the shadow weight, with >=1 nnz per row.
+
+    Magnitude, not random (SparseProp Sec. 4.1 "global magnitude pruning
+    criterion"). A random mask spends the same budget on a large weight it
+    spends on a negligible one, so it is not a pruning criterion at all -- it is
+    a way of making nnz/numel exact and leaving accuracy to luck. Pruning the
+    smallest |W| keeps the layer's function approximately intact.
+
+    Per-layer here; `apply_global_pruning` re-runs the selection jointly across
+    layers when the scope is `global`.
+    """
     with torch.no_grad():
-        mask = torch.rand(module.weight.shape, device=module.weight.device) > sparsity
-        row_sums = mask.sum(dim=1)
-        for i in range(mask.shape[0]):
-            if row_sums[i] == 0:
-                j = int(
-                    torch.randint(
-                        mask.shape[1], (1,), device=module.weight.device
-                    ).item()
-                )
-                mask[i, j] = True
+        mask = magnitude_mask(module.weight, sparsity)
         module.sparsity_mask.copy_(mask)
         module._apply_mask()
+
+
+@torch.no_grad()
+def magnitude_mask(weight: torch.Tensor, sparsity: float) -> torch.Tensor:
+    """Boolean keep-mask pruning the `sparsity` fraction of smallest |W| entries.
+
+    Returns a mask of the same shape as `weight`; True means "kept".
+
+    The per-row guarantee (>= 1 kept entry) falls out of `topk`: each row keeps
+    exactly `max(1, round(n * (1 - sparsity)))` entries, which is >= 1 for every
+    sparsity below 1.0. Ties at the threshold are broken by `topk`'s index
+    order, so the result is deterministic for a given weight.
+
+    An all-zero row is a special case that a plain threshold gets wrong: every
+    entry satisfies `|W| >= 0.0`, so a `>=` comparison would keep the whole row
+    and silently report 0.0 sparsity for that layer. nanochat zero-initializes
+    `attn.c_proj` and `mlp.c_proj`, so those rows exist in every fresh model.
+    Such a row keeps exactly `keep` entries rather than all of them.
+    """
+    out_f, in_f = weight.shape
+    if sparsity <= 0.0:
+        return torch.ones(out_f, in_f, dtype=torch.bool, device=weight.device)
+    if sparsity >= 1.0:
+        # An all-zero layer annihilates the input; every row keeps exactly one
+        # entry (the largest) so the layer stays rank-1 rather than dead.
+        keep = 1
+    else:
+        keep = max(1, round(in_f * (1.0 - sparsity)))
+    if keep >= in_f:
+        return torch.ones(out_f, in_f, dtype=torch.bool, device=weight.device)
+    magnitudes = weight.detach().abs().float()
+    # topk over the flattened row; -inf at pruned positions keeps a uniform
+    # threshold mask on ties instead of an arbitrary subset.
+    threshold = magnitudes.topk(keep, dim=1).values[:, -1:].contiguous()
+    mask = magnitudes >= threshold
+    # Rows whose top-`keep` threshold is exactly 0.0 are all-zero rows, which the
+    # `>=` above keeps entirely. Fall back to a topk selection for those, so
+    # the per-row keep count is honoured regardless of the weight values.
+    degenerate = threshold.squeeze(1) == 0.0
+    if bool(degenerate.any()):
+        # `topk` on the magnitudes: positions with the largest |W| survive, ties
+        # resolved by index order, which is deterministic.
+        order = magnitudes.topk(keep, dim=1).indices
+        fallback = torch.zeros_like(mask)
+        fallback.scatter_(1, order, True)
+        mask = torch.where(degenerate.unsqueeze(1), fallback, mask)
+    return mask
+
+
+@torch.no_grad()
+def apply_global_pruning(
+    modules: list[SparsePropLinear],
+    sparsity: float,
+    current_sparsity: float = 0.0,
+) -> float:
+    """Re-prune `modules` jointly to `sparsity` and report the achieved sparsity.
+
+    SparseProp Fig. 6 compares Uniform-GMP against Global-GMP at the same target
+    sparsity and finds Global better, so the two scopes are not equivalent and
+    neither is the default by construction. Global scope ranks |W| across *all*
+    listed modules by one threshold, which lets a layer whose weights are
+    uniformly small keep far more of them than a layer with heavy-tailed
+    weights -- the per-row cap is applied after the global selection so no row
+    is ever emptied.
+
+    `current_sparsity` is the sparsity those modules already carry. Gradual
+    pruning raises it toward `sparsity`; a raise never revives a pruned weight,
+    which is the monotone behaviour Gradual Magnitude Pruning is defined to
+    have.
+
+    Monotonicity is enforced explicitly rather than assumed. Ranking |W| across
+    all positions from scratch does *not* produce a nested selection: a pruned
+    entry's shadow weight is zeroed by `_apply_mask`, so |W| == 0 and it loses
+    every comparison -- but a row whose surviving entries happen to be equal in
+    magnitude can still swap one for another as the global threshold moves. The
+    current mask is therefore intersected with the fresh selection.
+    """
+    if not modules:
+        return current_sparsity
+    if sparsity <= current_sparsity:
+        return current_sparsity
+    with torch.no_grad():
+        # 1. Rank every candidate position jointly and take the global top.
+        magnitudes = torch.cat(
+            [m.weight.detach().abs().float().reshape(-1) for m in modules]
+        )
+        target_nnz = int(round(magnitudes.numel() * (1.0 - sparsity)))
+        flat_mask = torch.zeros(
+            magnitudes.numel(), dtype=torch.bool, device=magnitudes.device
+        )
+        if target_nnz > 0:
+            threshold = magnitudes.topk(target_nnz).values[-1]
+            # `>=` may keep more than target_nnz under ties; that is fine (the
+            # achieved sparsity is recomputed below and reported truthfully).
+            flat_mask = magnitudes >= threshold
+        # 2. Intersect with what is already kept (monotonicity), then
+        #    re-impose the per-row guarantee on the survivors.
+        offset = 0
+        for module in modules:
+            n = module.weight.numel()
+            chunk = flat_mask[offset : offset + n].view_as(module.weight)
+            offset += n
+            module.sparsity_mask.logical_and_(chunk)
+            _give_back_empty_rows(module, module.sparsity_mask)
+            module._apply_mask()
+    total = sum(m.weight.numel() for m in modules)
+    nnz = sum(int(m.sparsity_mask.sum()) for m in modules)
+    achieved = 1.0 - nnz / total if total else 0.0
+    return achieved
+
+
+@torch.no_grad()
+def _give_back_empty_rows(module: "SparsePropLinear", chunk: torch.Tensor) -> None:
+    """Set each all-pruned row's largest-magnitude entry in `chunk` to True.
+
+    Vectorized over rows: a per-row Python loop would be out_f host syncs, which
+    is the same cost W3.3 removed from the CSR/CSC builders. Only the empty
+    rows are touched (`nonzero` on the row sums), so the common case does no
+    host work at all beyond one shape read.
+    """
+    empty_rows = (chunk.sum(dim=1) == 0).nonzero(as_tuple=True)[0]
+    if empty_rows.numel() == 0:
+        return
+    magnitudes = module.weight.detach().abs().float()
+    best = magnitudes[empty_rows].argmax(dim=1)
+    chunk[empty_rows, best] = True
 
 
 def inject_sparseprop_layers(
@@ -440,10 +756,19 @@ def inject_sparseprop_layers(
 
 
 __all__ = [
+    "DEFAULT_DENSE_THRESHOLD",
+    "PRUNE_SCOPES",
+    "SCOPE_GLOBAL",
+    "SCOPE_LAYER",
     "SparsePropLinear",
     "SparsePropLinearLCQAT",
     "SparsePropLinearFunction",
+    "_give_back_empty_rows",
+    "apply_global_pruning",
     "apply_static_sparsity_mask",
+    "collect_sparse_layers",
     "inject_sparseprop_layers",
+    "magnitude_mask",
+    "sparse_layers_above",
     "_init_sparsity_mask",
 ]

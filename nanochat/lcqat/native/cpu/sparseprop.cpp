@@ -42,19 +42,29 @@ void spmm_row_avx2(const float* __restrict gy_unused, // kept for signature unif
                    int nnz_in_row, int B,
                    float* __restrict y_row) {
   (void)gy_unused;
-  for (int p = 0; p < nnz_in_row; ++p) {
-    int kc = cols[p];
-    float w = vals[p];
-    const float* x_row = x_base + static_cast<int64_t>(kc) * B;
-    __m256 vw = _mm256_set1_ps(w);
-    int b = 0;
-    for (; b + AVX2_W <= B; b += AVX2_W) {
-      __m256 vy = _mm256_loadu_ps(y_row + b);
-      __m256 vx = _mm256_loadu_ps(x_row + b);
-      vy = _mm256_fmadd_ps(vw, vx, vy);
-      _mm256_storeu_ps(y_row + b, vy);
+  // Register-blocked over the batch axis. The naive form accumulated straight
+  // into y_row, so every nnz entry paid a load/add/store round trip on the
+  // output row: at the default 0.75 sparsity that is ~4/3 * K read-modify-writes
+  // per output element, which streamed y far more than it did arithmetic and
+  // lost to a dense GEMM. Here each AVX2 lane chunk is accumulated in a
+  // register across all nnz in the row and stored once, so y is touched O(B/W)
+  // times per row instead of O(nnz * B/W).
+  constexpr int VB = 8;  // one __m256 of accumulators
+  int nvec = B / VB;
+  for (int i = 0; i < nvec; ++i) {
+    __m256 acc = _mm256_loadu_ps(y_row + i * VB);
+    for (int p = 0; p < nnz_in_row; ++p) {
+      const float* x_row = x_base + static_cast<int64_t>(cols[p]) * B + i * VB;
+      acc = _mm256_fmadd_ps(_mm256_set1_ps(vals[p]), _mm256_loadu_ps(x_row), acc);
     }
-    for (; b < B; ++b) y_row[b] += w * x_row[b];
+    _mm256_storeu_ps(y_row + i * VB, acc);
+  }
+  // Scalar tail for B not divisible by the vector width.
+  for (int b = nvec * VB; b < B; ++b) {
+    float acc = y_row[b];
+    for (int p = 0; p < nnz_in_row; ++p)
+      acc += vals[p] * x_base[static_cast<int64_t>(cols[p]) * B + b];
+    y_row[b] = acc;
   }
 }
 
@@ -297,6 +307,87 @@ std::tuple<at::Tensor, at::Tensor> lcqat_sparseprop_backward(
   return std::make_tuple(gX, gW_val);
 }
 
+// Quantized index-linear over a CSR listing of surviving weight slots.
+//
+//   y[t, m] = sum_j act_lut[act_indices[t, j]] * alphabet[slot_index[m, j]]
+//
+// The listing is (row_ptr, col_indices, alphabet) with `alphabet[k]` the FP32
+// weight of the k-th *stored* slot; the ordering within a row is the caller's
+// CSR order (ascending column). This is the runtime form of
+// `sparse_linear_reference.reference_sparse_index_linear`.
+//
+// Zero-skip: a stored slot whose alphabet value is exactly 0.0 contributes
+// nothing, so its column fetch and multiply are skipped. That is not an
+// optimisation -- LC-QAT's zero anchor makes 0.0 a first-class weight, and a
+// pruned slot is stored as a real entry rather than dropped from the listing.
+// Skipping is therefore observably equal to accumulating a zero.
+//
+// One thread per (row, t) output element, -O3 scalar: the inner loop is a
+// short strided gather over <= nnz_row slots, so a SIMD variant would need a
+// gather instruction this path cannot rely on.
+at::Tensor lcqat_sparse_index_linear(
+    const at::Tensor& act_indices, const at::Tensor& act_lut,
+    const at::Tensor& col_indices, const at::Tensor& row_ptr,
+    const at::Tensor& alphabet, int64_t M, int64_t N) {
+  TORCH_CHECK(act_indices.dim() == 2, "act_indices must be [T, N]");
+  TORCH_CHECK(act_indices.size(1) == N, "act_indices width must equal N");
+  TORCH_CHECK(act_indices.scalar_type() == at::kByte,
+              "act_indices must be uint8");
+  TORCH_CHECK(act_lut.scalar_type() == at::kFloat, "act_lut must be float32");
+  TORCH_CHECK(alphabet.scalar_type() == at::kFloat, "alphabet must be float32");
+  TORCH_CHECK(act_lut.dim() == 1, "act_lut must be 1-D");
+  TORCH_CHECK(alphabet.dim() == 1, "alphabet must be 1-D");
+  TORCH_CHECK(row_ptr.dim() == 1 && row_ptr.size(0) == M + 1,
+              "row_ptr must have M+1 entries");
+  TORCH_CHECK(col_indices.dim() == 1, "col_indices must be 1-D");
+  TORCH_CHECK(col_indices.scalar_type() == at::kInt, "col_indices must be int32");
+  TORCH_CHECK(row_ptr.scalar_type() == at::kInt, "row_ptr must be int32");
+
+  const int64_t T = act_indices.size(0);
+  const int64_t nnz = col_indices.size(0);
+
+  auto act_i = act_indices.contiguous();
+  auto lut = act_lut.contiguous();
+  auto cols = col_indices.contiguous();
+  auto ptr = row_ptr.contiguous();
+  auto alpha = alphabet.contiguous();
+
+  const uint8_t* act_ptr = act_i.data_ptr<uint8_t>();
+  const float* lut_ptr = lut.data_ptr<float>();
+  const int32_t* cols_ptr = cols.data_ptr<int32_t>();
+  const int32_t* ptr_ptr = ptr.data_ptr<int32_t>();
+  const float* alpha_ptr = alpha.data_ptr<float>();
+
+  at::Tensor out = at::empty({T, M}, act_lut.options());
+  float* out_ptr = out.data_ptr<float>();
+
+  at::parallel_for(0, M * T, 1, [&](int64_t begin, int64_t end) {
+    for (int64_t idx = begin; idx < end; ++idx) {
+      // `out` is [T, M] row-major, so element (t, m) lives at t * M + m.
+      // Deriving the linear index from (m, t) instead would write the whole
+      // result transposed -- a correct accumulation landing in the wrong row,
+      // which shows up only as a wrong number, never as a shape error.
+      const int64_t m = idx / T;
+      const int64_t t = idx % T;
+      const uint8_t* act_row = act_ptr + t * N;
+      const int32_t p_start = ptr_ptr[m];
+      const int32_t p_end = ptr_ptr[m + 1];
+      float acc = 0.0f;
+      for (int32_t p = p_start; p < p_end; ++p) {
+        const float w = alpha_ptr[p];
+        // Zero-skip: an exact 0.0 weight contributes nothing, so skip the
+        // column fetch and the multiply entirely.
+        if (w == 0.0f) continue;
+        const int64_t j = cols_ptr[p];
+        acc += lut_ptr[act_row[j]] * w;
+      }
+      out_ptr[t * M + m] = acc;
+    }
+  });
+
+  return out;
+}
+
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(nanochat, m) {
@@ -306,9 +397,13 @@ TORCH_LIBRARY_FRAGMENT(nanochat, m) {
         "Tensor w_val, Tensor w_col, Tensor w_ptr, "
         "Tensor w_val_csc, Tensor w_row, Tensor w_cptr, "
         "int M, int K) -> (Tensor, Tensor)");
+  m.def("lcqat_sparse_index_linear(Tensor act_indices, Tensor act_lut, "
+        "Tensor col_indices, Tensor row_ptr, Tensor alphabet, "
+        "int M, int N) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(nanochat, CPU, m) {
   m.impl("lcqat_sparseprop_forward", &lcqat_sparseprop_forward);
   m.impl("lcqat_sparseprop_backward", &lcqat_sparseprop_backward);
+  m.impl("lcqat_sparse_index_linear", &lcqat_sparse_index_linear);
 }

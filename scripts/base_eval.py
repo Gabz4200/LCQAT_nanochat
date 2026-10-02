@@ -200,6 +200,14 @@ def main():
     model, tokenizer, meta = load_model(
         "base", device, phase="eval", model_tag=args.model_tag, step=args.step
     )
+    # `load_model` returns the DiffusionBlocks engine itself when the checkpoint
+    # declares meta["db"], but the autoregressive `Engine` below needs the bare
+    # GPT that engine wraps -- `base_train` does the same thing by passing
+    # `orig_model`. Without this, Engine.forward hits the engine and dies with
+    # "'DiffusionBlockEngine' object has no attribute 'forward'". The loss
+    # evaluations above are unaffected: they go through `model(...)`, which the
+    # engine implements as the block-isolated objective.
+    base_model = getattr(model, "model", model)
     sequence_len = meta["model_config"]["sequence_len"]
     token_bytes = get_token_bytes(device=device)
     model_name = f"base_model (step {meta['step']})"
@@ -229,7 +237,7 @@ def main():
                 "My favorite color is",
                 "If 5*x + 3 = 13, then x is",
             ]
-            engine = Engine(model, tokenizer)
+            engine = Engine(base_model, tokenizer)
             print0("\nConditioned samples:")
             for prompt in prompts:
                 tokens = tokenizer(prompt, prepend="<|bos|>")

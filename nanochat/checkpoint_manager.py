@@ -9,7 +9,7 @@ import re
 
 import torch
 
-from nanochat.common import get_base_dir, setup_default_logging
+from nanochat.common import COMPUTE_DTYPE, get_base_dir, setup_default_logging
 from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.lcqat.retrofit import (
@@ -129,23 +129,92 @@ def build_model(checkpoint_dir, step, device, phase, lcqat=None):
         model = GPT(model_config)
     model.to_empty(device=device)
     model.init_weights()  # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    # Check if DiffusionBlocks state was saved in metadata or state keys
+    # Do this BEFORE the strict load so malformed db checkpoints fail with
+    # the intended message instead of an incidental LUT key error.
+    db_meta = meta_data.get("db")
+    if db_meta is not None:
+        # The engine's own parameters (adapters, denoise heads) are zero-initialized
+        # at construction (diffusion_blocks.py NoiseConditionedBlockAdapter /
+        # denoise_head). A checkpoint that declares meta["db"] but carries no
+        # db_* keys therefore loads a *silently zero* engine. That is always a
+        # bug in the writer, so fail loudly instead of evaluating garbage.
+        # Two required families, each satisfied by either the current or the
+        # legacy key prefix: `db_denoise_heads.{b}.*` (per-block, W1.3) or
+        # `db_denoise_head.*` (the single shared head that preceded it).
+        families = {
+            "db_adapters.": ("db_adapters.",),
+            "db_denoise_head": ("db_denoise_heads.", "db_denoise_head."),
+        }
+        missing = [
+            family
+            for family, prefixes in families.items()
+            if not any(k.startswith(p) for p in prefixes for k in model_data)
+        ]
+        if missing:
+            raise RuntimeError(
+                f"checkpoint declares meta['db'] but its state_dict is missing "
+                f"{missing} keys: the DiffusionBlocks engine would load with "
+                "zero-initialized adapters/denoise heads. This checkpoint was "
+                "written with `orig_model.state_dict()` instead of "
+                "`engine.state_dict()`; retrain or re-save it."
+            )
+
+    # Early legacy-head check: if meta has num_blocks > 1 but state has the
+    # legacy single-head prefix (db_denoise_head.) and NOT the per-block
+    # prefix (db_denoise_heads.), fail with the intended message before
+    # the strict base load (which would complain about LUT keys instead).
+    if db_meta is not None:
+        num_blocks = db_meta.get("num_blocks", 4)
+        has_legacy_head = any(k.startswith("db_denoise_head.") for k in model_data)
+        has_per_block_heads = any(k.startswith("db_denoise_heads.") for k in model_data)
+        if num_blocks > 1 and has_legacy_head and not has_per_block_heads:
+            raise RuntimeError(
+                f"checkpoint declares meta['db'] with num_blocks={num_blocks} "
+                "but state_dict has legacy single-head keys (db_denoise_head.) "
+                "and no per-block heads (db_denoise_heads.). A legacy checkpoint "
+                "with one head cannot be split across multiple blocks; retrain "
+                "or re-save it with the current format."
+            )
+
     # LC-QAT: retrofit before load when the checkpoint already has codebooks,
     # otherwise retrofit after load only when QAT start was requested
     lcqat_active = prepare_lcqat_before_load(
         model, model_data, meta_data.get("lcqat"), lcqat
     )
+    # SparseProp must also be injected BEFORE the load, for the same reason
+    # LC-QAT is: the checkpoint carries `sparsity_mask` / `w_ptr` / `w_col` /
+    # `w_ptr_csc` / `w_row` as persistent buffers, so loading into a model that
+    # was not injected fails with "unexpected key(s)". The training entry points
+    # do this themselves, but they inject *before* calling build_model; an eval
+    # or inference path that goes straight to load_model did not, so a model
+    # trained with the always-on SparseProp default could not be loaded for
+    # evaluation at all. Rebuild it here from meta["sparseprop"], which records
+    # the settings the checkpoint was written with.
+    sparseprop_meta = meta_data.get("sparseprop")
+    if sparseprop_meta and sparseprop_meta.get("enabled"):
+        from nanochat.lcqat.sparseprop import inject_sparseprop_layers
+
+        # No pruning: the mask built here is a placeholder that the strict load
+        # immediately overwrites with the checkpoint's own.
+        inject_sparseprop_layers(
+            model,
+            sparsity=float(sparseprop_meta.get("sparsity", 0.75)),
+            with_lcqat=lcqat_active is not None,
+        )
     # Strip db_ keys for base model load
     base_model_data = {
         k: v
         for k, v in model_data.items()
-        if not k.startswith("db_adapters.") and not k.startswith("db_denoise_head.")
+        if not k.startswith("db_adapters.")
+        and not k.startswith("db_denoise_heads.")
+        and not k.startswith("db_denoise_head.")
     }
     model.load_state_dict(base_model_data, strict=True, assign=True)
     if lcqat_active is None:
         finish_lcqat_after_load(model, lcqat)
 
-    # Check if DiffusionBlocks state was saved in metadata or state keys
-    db_meta = meta_data.get("db")
+    # DiffusionBlocks engine construction (top level, only when db_meta exists)
     if db_meta is not None:
         num_blocks = db_meta.get("num_blocks", 4)
         sigma_min = db_meta.get("sigma_min", 0.002)
@@ -157,7 +226,9 @@ def build_model(checkpoint_dir, step, device, phase, lcqat=None):
             sigma_max=sigma_max,
             sigma_data=sigma_data,
         )
-        engine = DiffusionBlockEngine(model, partitioner)
+        engine = DiffusionBlockEngine(
+            model, partitioner, device=device, dtype=COMPUTE_DTYPE
+        )
         engine.load_state_dict(model_data, strict=False)
         target_model = engine
     else:

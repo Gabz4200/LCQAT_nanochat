@@ -5,6 +5,7 @@ import torch
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.lcqat import PRESETS, retrofit_model
+from nanochat.lcqat.retrofit import DEFAULT_PRESET
 
 
 def build_tiny_gpt() -> GPT:
@@ -57,4 +58,8 @@ def tiny_gpt_factory():
 def tiny_gpt_lcqat() -> GPT:
     # Independent instance: retrofitting mutates the model in place, so it must
     # not share state with the `tiny_gpt` fixture.
-    return retrofit_model(build_tiny_gpt(), PRESETS["small"])
+    #
+    # Built with the DEFAULT preset so that a state_dict roundtrip through
+    # `prepare_lcqat_before_load(fresh, state, None, None)` -- which falls back
+    # to the default when no meta is supplied -- reconstructs the same config.
+    return retrofit_model(build_tiny_gpt(), PRESETS[DEFAULT_PRESET])

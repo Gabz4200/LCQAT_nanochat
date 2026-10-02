@@ -22,7 +22,14 @@ from nanochat.lcqat import (
     retrofit_model,
     retrofit_summary,
 )
-from nanochat.lcqat.retrofit import get_layer_config
+from nanochat.lcqat.optimizer import build_qat_param_groups, verify_partition
+from nanochat.lcqat.retrofit import (
+    DEFAULT_PRESET,
+    get_layer_config,
+    spec_k,
+    spec_split,
+)
+from tests.conftest import build_tiny_gpt
 
 
 def _k_of(model: nn.Module, name: str) -> tuple[int, int]:
@@ -101,10 +108,79 @@ def test_when_parsing_k_map_then_validates_entries() -> None:
         ("mlp.c_proj", 255, 255),
         ("attn.c_q", 3, 15),
     )
-    with pytest.raises(ValueError, match="odd"):
-        parse_k_map("mlp.c_proj:4/15")
+    # Asymmetric split syntax: m_neg-m_pos. The MLP `relu^2` tensors are the
+    # case this exists for, so 0-7 (one-sided, 8 levels) must parse.
+    assert parse_k_map("mlp.c_proj:0-7/0-7") == (("mlp.c_proj", (0, 7), (0, 7)),)
+    assert parse_k_map("attn.c_q:6-8/6-8") == (("attn.c_q", (6, 8), (6, 8)),)
+    # Even K is legal; 4 is a real 2-bit boundary, not an error.
+    assert parse_k_map("mlp.c_proj:4/15") == (("mlp.c_proj", 4, 15),)
+    with pytest.raises(ValueError, match=">= 3"):
+        parse_k_map("mlp.c_proj:2/15")
+    # A one-sided codebook needs two levels on its side, or the zero anchor
+    # would also be the endpoint and bucketize would have no interior midpoint.
+    with pytest.raises(ValueError, match="m_pos >= 2"):
+        parse_k_map("mlp.c_proj:0-1/15")
     with pytest.raises(ValueError, match="substring:KW/KA"):
         parse_k_map("mlp.c_proj")
+
+
+def test_when_asym_preset_then_non_negative_tensors_get_one_sided_codebooks() -> None:
+    """`gpt.py` computes `relu(x).square()` before `mlp.c_proj`.
+
+    The 4*n_embd hidden tensor is therefore non-negative, so both codebooks
+    touching it (c_fc's output quantizer and c_proj's activation quantizer) get
+    m_neg=0. A symmetric 15 spends 7 of its levels on a sign the tensor never
+    takes; 0/7 spends all 8 on the range that exists.
+    """
+    config = PRESETS[DEFAULT_PRESET]
+    c_fc = get_layer_config("transformer.h.0.mlp.c_fc", config)
+    assert c_fc is not None
+    _, _, quant_out, out_spec = c_fc
+    assert quant_out is True
+    assert out_spec == (0, 7), "c_fc output sees relu^2 >= 0"
+
+    c_proj = get_layer_config("transformer.h.0.mlp.c_proj", config)
+    assert c_proj is not None
+    _, act_spec, _, _ = c_proj
+    assert act_spec == (0, 7), "c_proj input sees relu^2 >= 0"
+
+    # Attention tensors are genuinely signed, so they keep both sides.
+    for name in ("transformer.h.0.attn.c_q", "transformer.h.0.attn.c_proj"):
+        spec = get_layer_config(name, config)
+        assert spec is not None
+        assert spec[1][0] > 0, f"{name} input is RMSNorm'd and signed"
+
+
+def test_when_asym_preset_then_applied_to_a_model() -> None:
+    model = retrofit_model(build_tiny_gpt(), PRESETS[DEFAULT_PRESET])
+    c_fc = model.get_submodule("transformer.h.0.mlp.c_fc")
+    c_proj = model.get_submodule("transformer.h.0.mlp.c_proj")
+    assert isinstance(c_fc, LCQATLinear) and isinstance(c_proj, LCQATLinear)
+    assert c_fc.out_quantizer.m_neg == 0
+    assert c_fc.out_quantizer.m_pos == 7
+    assert c_proj.act_quantizer.m_neg == 0
+    assert c_proj.act_quantizer.m_pos == 7
+    # The one-sided codebook's levels are all >= 0, which is the point: a
+    # symmetric 15 would place 7 levels below the minimum the tensor can reach.
+    assert (c_proj.act_quantizer.get_codebook() >= 0).all()
+    assert c_proj.act_quantizer.get_codebook()[0].item() == 0.0
+    # The forward agrees: a non-negative activation never produces a negative
+    # dequantized value.
+    with torch.no_grad():
+        pos = torch.rand(2, 16, c_proj.in_features)
+        assert (c_proj.act_quantizer(pos).value >= 0).all()
+
+
+def test_when_spec_helpers_then_k_and_split_are_consistent() -> None:
+    assert spec_k(15) == 15
+    assert spec_k((0, 7)) == 8
+    assert spec_split(15) == (7, 7)
+    # Even K cannot be symmetric; the extra level goes positive.
+    assert spec_split(8) == (3, 4)
+    assert sum(spec_split(8)) + 1 == spec_k(8)
+    assert spec_split((6, 8)) == (6, 8)
+    with pytest.raises(ValueError, match=">= 3"):
+        spec_split(2)
 
 
 def test_when_config_from_args_then_preset_and_k_map_apply() -> None:
@@ -162,44 +238,87 @@ def test_when_num_scaling_params_then_codebooks_are_tracked_separately(
     assert lcqat_counts["total"] == sum(p.numel() for p in tiny_gpt_lcqat.parameters())
 
 
-def test_when_setup_optimizer_then_codebooks_get_their_own_adamw_group(
+def test_when_build_qat_param_groups_then_codebooks_get_their_own_adamw_group(
     tiny_gpt, tiny_gpt_lcqat
 ) -> None:
-    optimizer = tiny_gpt.setup_optimizer()
-    codebook_params = {id(p) for n, p in tiny_gpt.named_parameters() if "deltas" in n}
-    assert not any(
-        any(id(p) in codebook_params for p in group["params"])
-        for group in optimizer.param_groups
-    )
+    """Codebook params get a dedicated group (PRD 5: own LR, no weight decay).
 
-    optimizer = tiny_gpt_lcqat.setup_optimizer()
+    Runs against `build_qat_param_groups`, which is the real integration point.
+    `GPT.setup_optimizer` was deleted: it only ever saw `transformer.h`, so it
+    would silently drop the DiffusionBlocks adapters and denoise heads.
+    """
+    groups = build_qat_param_groups(tiny_gpt, matrix_lr=0.02, weight_decay=0.1)
+    codebook_params = {id(p) for n, p in tiny_gpt.named_parameters() if "deltas" in n}
+    assert not codebook_params
+    assert not any(
+        any(id(p) in codebook_params for p in group["params"]) for group in groups
+    )
+    verify_partition(tiny_gpt, groups)
+
+    groups = build_qat_param_groups(
+        tiny_gpt_lcqat, matrix_lr=0.02, weight_decay=0.1, codebook_lr=1e-3
+    )
     codebook_params = {
         id(p) for n, p in tiny_gpt_lcqat.named_parameters() if "deltas" in n
     }
     groups_with_codebooks = [
         group
-        for group in optimizer.param_groups
+        for group in groups
         if any(id(p) in codebook_params for p in group["params"])
     ]
     assert len(groups_with_codebooks) == 1
     group = groups_with_codebooks[0]
     assert group["kind"] == "adamw"
+    assert group["role"] == "codebook"
     assert group["weight_decay"] == 0.0
     assert group["lr"] > 0
     assert {id(p) for p in group["params"]} == codebook_params
-    # No Muon groups remain in the codebase
-    muon_groups = [g for g in optimizer.param_groups if g.get("kind") == "muon"]
-    assert len(muon_groups) == 0, f"Expected no Muon groups, got {len(muon_groups)}"
-    # All params covered by some AdamW group
-    covered = {id(p) for group in optimizer.param_groups for p in group["params"]}
+    # Every parameter lands in exactly one group (this is the check that caught
+    # the duplicate-codebook-parameter bug).
+    verify_partition(tiny_gpt_lcqat, groups)
+    covered = {id(p) for group in groups for p in group["params"]}
     assert covered == {id(p) for p in tiny_gpt_lcqat.parameters()}
+
+
+def test_when_build_qat_param_groups_then_per_role_lrs_are_not_dropped(
+    tiny_gpt,
+) -> None:
+    """Regression for the silently-discarded `--embedding-lr` family.
+
+    The previous two-group builder ignored embedding_lr / unembedding_lr /
+    scalar_lr entirely, so those flags were parsed and thrown away.
+    """
+    groups = build_qat_param_groups(
+        tiny_gpt,
+        matrix_lr=0.02,
+        weight_decay=0.1,
+        embedding_lr=0.3,
+        unembedding_lr=0.008,
+        scalar_lr=0.5,
+    )
+    lrs = {g["role"]: g["lr"] for g in groups}
+    assert lrs["embed"] == pytest.approx(0.3)
+    assert lrs["lm_head"] == pytest.approx(0.008)
+    assert lrs["x0"] == pytest.approx(0.5)
+    assert lrs["resid"] == pytest.approx(0.5 * 0.01)
+    assert lrs["matrix"] == pytest.approx(0.02)
+    # dmodel_lr_scale multiplies the AdamW roles but not the scalar ones,
+    # matching GPT.setup_optimizer's tuned recipe.
+    scaled = build_qat_param_groups(
+        tiny_gpt, matrix_lr=0.02, weight_decay=0.1, dmodel_lr_scale=2.0
+    )
+    s_lrs = {g["role"]: g["lr"] for g in scaled}
+    assert s_lrs["embed"] == pytest.approx(0.6)
+    assert s_lrs["x0"] == pytest.approx(0.5)
 
 
 @pytest.mark.slow
 def test_when_optimizer_step_then_codebook_params_change(tiny_gpt_lcqat) -> None:
     torch.manual_seed(0)
     model = tiny_gpt_lcqat
-    optimizer = model.setup_optimizer()
+    optimizer = torch.optim.AdamW(
+        build_qat_param_groups(model, matrix_lr=0.02, weight_decay=0.1)
+    )
 
     def step() -> None:
         idx = torch.randint(0, model.config.vocab_size, (2, 16))
@@ -234,8 +353,11 @@ def test_when_checkpoint_helpers_then_state_detection_and_roundtrip_work(
     assert not is_lcqat_state(tiny_gpt.state_dict())
 
     fresh = tiny_gpt_factory()
+    # No meta and no requested config: the active config falls back to the
+    # default preset, which is now `asym` (not `small`). The roundtrip below
+    # therefore only holds because the fixture was built with that same preset.
     active = prepare_lcqat_before_load(fresh, state, None, None)
-    assert active == PRESETS["small"]
+    assert active == PRESETS[DEFAULT_PRESET]
     fresh.load_state_dict(state, strict=True)
     fresh.eval()
     tiny_gpt_lcqat.eval()

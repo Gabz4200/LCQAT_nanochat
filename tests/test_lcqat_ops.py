@@ -136,7 +136,7 @@ def test_when_compile_codebook_quantization_then_composes() -> None:
     # the STE identity must survive tracing.
     from nanochat.lcqat import MemoryEfficientLearnedCodebook
 
-    cb = MemoryEfficientLearnedCodebook(K=15, init_min=-2.0, init_max=2.0)
+    cb = MemoryEfficientLearnedCodebook.from_k(15, init_min=-2.0, init_max=2.0)
     x = torch.randn(64)
     compiled = torch.compile(lambda t: cb(t).value, fullgraph=True)
     got = compiled(x)

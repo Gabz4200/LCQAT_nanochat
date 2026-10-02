@@ -109,9 +109,28 @@ def test_when_dequant_window_out_of_range_then_value_error() -> None:
 
 
 def test_when_codebook_k_out_of_range_then_constructor_raises() -> None:
-    k_cbs, v_cbs = make_codebooks()
-    with pytest.raises(ValueError, match=r"odd K in \[3, 15\]"):
+    # The bound is the nibble packing (K <= 15), not oddness. Even K is legal:
+    # the asymmetric split makes one-sided codebooks, so K=4, 8, 14 all work.
+    with pytest.raises(ValueError, match=r"K in \[3, 15\]"):
         make_cache(k_codebooks=torch.zeros(L, H, 31))
+    with pytest.raises(ValueError, match=r"K in \[3, 15\]"):
+        make_cache(k_codebooks=torch.zeros(L, H, 2))
+
+
+def test_when_codebook_k_even_then_cache_is_constructed() -> None:
+    # K=8 exercises the even path end to end through the nibble packer.
+    even_k = torch.linspace(-1.0, 1.0, 8)
+    cbs = even_k + 0.05 * torch.randn(
+        L, H, 8, generator=torch.Generator().manual_seed(4)
+    )
+    cbs = cbs.sort(dim=-1).values.to(torch.float32)
+    cache = make_cache(k_codebooks=cbs, v_codebooks=cbs)
+    k = 1.8 * torch.rand(B, 4, H, D, generator=torch.Generator().manual_seed(5)) - 0.9
+    cache.write(0, k, k)
+    deq_k, deq_v = cache.dequant_window(0, 0, 4)
+    assert deq_k.shape == (B, 4, H, D)
+    assert torch.isfinite(deq_k).all()
+    assert torch.isfinite(deq_v).all()
 
 
 def test_when_codebook_shape_mismatch_then_constructor_raises() -> None:

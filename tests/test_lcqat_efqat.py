@@ -66,11 +66,14 @@ def test_selective_freezer_keeps_boundaries_critical():
     for li in (0, n_layer - 1):
         # c_q / c_k are critical: codebook deltas must stay trainable.
         params = [
-            p for n, p in model.transformer.h[li].named_parameters()
+            p
+            for n, p in model.transformer.h[li].named_parameters()
             if n.endswith(("raw_pos_deltas", "raw_neg_deltas")) and "c_q" in n
         ]
         assert params, f"layer {li} should have c_q codebook params"
-        assert all(p.requires_grad for p in params), f"boundary {li} c_q should stay trainable"
+        assert all(p.requires_grad for p in params), (
+            f"boundary {li} c_q should stay trainable"
+        )
 
 
 def test_selective_freezer_noop_when_frac_zero():

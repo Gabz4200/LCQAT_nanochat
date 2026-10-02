@@ -77,8 +77,13 @@ at::Tensor lcqat_index_linear(
         act_indices.size(1) == n, "act_indices width must equal n");
 
     const int64_t k_w = weight_lut.numel();
-    TORCH_CHECK(
-        k_w >= 3 && k_w % 2 == 1, "weight_lut K must be an odd integer >= 3");
+    // K >= 3 only. An *odd* K is NOT required: LC-QAT's asymmetric split
+    // `K = m_neg + 1 + m_pos` exists precisely so a one-sided codebook
+    // (m_neg = 0) makes the true 2-bit (K=4) and 4-bit (K=16) boundaries
+    // reachable, both of which are even. Requiring odd K here would reject
+    // exactly the bit-widths the design targets, and `expected_format` below
+    // already selects a storage format for every K >= 3.
+    TORCH_CHECK(k_w >= 3, "weight_lut K must be an integer >= 3");
     TORCH_CHECK(
         format == expected_format(k_w),
         "format does not match weight_lut K");
@@ -121,8 +126,8 @@ at::Tensor lcqat_index_linear(
     // Bound every index against its LUT before the kernel trusts it
     // (same contract as lcqat_gemv_k3; the kernel indexes unchecked).
     const int64_t k_a = act_lut.numel();
-    TORCH_CHECK(
-        k_a >= 3 && k_a % 2 == 1, "act_lut K must be an odd integer >= 3");
+    // Same reasoning as weight_lut above: K >= 3, even K allowed.
+    TORCH_CHECK(k_a >= 3, "act_lut K must be an integer >= 3");
     const uint8_t* act = act_indices.data_ptr<uint8_t>();
     for (int64_t i = 0; i < act_indices.numel(); ++i) {
         TORCH_CHECK(act[i] < k_a, "act index out of range for act_lut");

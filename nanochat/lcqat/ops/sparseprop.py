@@ -21,20 +21,30 @@ def _ensure_cpu_op() -> None:
 
         @torch.library.register_fake("nanochat::lcqat_sparseprop_forward")
         def _sparseprop_forward_fake(x, w_val, w_col, w_ptr, bias, M):
-            return torch.empty(
-                M, x.size(1), dtype=torch.float32, device=x.device
-            )
+            return torch.empty(M, x.size(1), dtype=torch.float32, device=x.device)
 
         @torch.library.register_fake("nanochat::lcqat_sparseprop_backward")
-        def _sparseprop_backward_fake(gY, x, w_val, w_col, w_ptr,
-                                      w_val_csc, w_row, w_cptr, M, K):
+        def _sparseprop_backward_fake(
+            gY, x, w_val, w_col, w_ptr, w_val_csc, w_row, w_cptr, M, K
+        ):
             gX = torch.empty(K, gY.size(1), dtype=torch.float32, device=gY.device)
             gW_val = torch.empty_like(w_val)
             return gX, gW_val
 
         def _sparseprop_backward_autograd(ctx, *grad_outputs):
             gX_grad, gW_val_grad = grad_outputs
-            return (gX_grad, None, gW_val_grad, None, None, None, None, None, None, None)
+            return (
+                gX_grad,
+                None,
+                gW_val_grad,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
 
         torch.library.register_autograd(
             "nanochat::lcqat_sparseprop_backward", _sparseprop_backward_autograd
@@ -63,7 +73,7 @@ def _validate_sparseprop_inputs(
     if w_ptr.dtype != torch.int32:
         raise ValueError(f"w_ptr must be int32, got {w_ptr.dtype}")
     if w_ptr.size(0) != M + 1:
-        raise ValueError(f"w_ptr size {w_ptr.size(0)} != M+1 = {M+1}")
+        raise ValueError(f"w_ptr size {w_ptr.size(0)} != M+1 = {M + 1}")
 
 
 def sparseprop_forward_cpu(
@@ -103,7 +113,9 @@ def sparseprop_backward_cpu(
     if gY.dim() != 2 or x.dim() != 2:
         raise ValueError("gY and x must be 2D [M/B, B]")
     if gY.size(0) != M or x.size(0) != K:
-        raise ValueError(f"shape mismatch: gY[0]={gY.size(0)} != M={M} or x[0]={x.size(0)} != K={K}")
+        raise ValueError(
+            f"shape mismatch: gY[0]={gY.size(0)} != M={M} or x[0]={x.size(0)} != K={K}"
+        )
     if gY.size(1) != x.size(1):
         raise ValueError(f"batch size mismatch: gY[1]={gY.size(1)} != x[1]={x.size(1)}")
     if gY.dtype != torch.float32 or x.dtype != torch.float32:
@@ -126,40 +138,56 @@ def sparseprop_backward_cpu(
 
 # Naive Reference (for testing parity)
 
+
 def _build_csr_from_mask(mask: torch.Tensor):
-    """Build CSR (row_ptr, col_idx) from boolean mask [M, K]."""
-    M, K = mask.shape
-    row_ptr = [0]
-    col_idx = []
-    for i in range(M):
-        cols = mask[i].nonzero(as_tuple=True)[0].tolist()
-        col_idx.extend(cols)
-        row_ptr.append(len(col_idx))
-    return (
-        torch.tensor(row_ptr, dtype=torch.int32, device=mask.device),
-        torch.tensor(col_idx, dtype=torch.int32, device=mask.device),
-    )
+    """Build CSR (row_ptr, col_idx) from boolean mask [M, K].
+
+    Vectorized: `nonzero` + `bincount` + `cumsum`. The previous version looped
+    over rows calling `.tolist()` on each, which is O(M) host syncs -- unusable
+    at 4096 rows, and a large share of why SparseProp had never been exercised at
+    real depth. `nonzero` returns row-major order, so columns within a row stay
+    ascending exactly as the loop produced them.
+    """
+    M = mask.shape[0]
+    rows, cols = torch.nonzero(mask, as_tuple=True)
+    counts = torch.bincount(rows, minlength=M)
+    row_ptr = torch.zeros(M + 1, dtype=torch.int64, device=mask.device)
+    torch.cumsum(counts, dim=0, out=row_ptr[1:])
+    return row_ptr.to(torch.int32), cols.to(torch.int32)
 
 
 def _build_csc_from_mask(mask: torch.Tensor):
-    """Build CSC (col_ptr, row_idx) from boolean mask [M, K]."""
-    M, K = mask.shape
-    col_ptr = [0]
-    row_idx = []
-    for j in range(K):
-        rows = mask[:, j].nonzero(as_tuple=True)[0].tolist()
-        row_idx.extend(rows)
-        col_ptr.append(len(row_idx))
-    return (
-        torch.tensor(col_ptr, dtype=torch.int32, device=mask.device),
-        torch.tensor(row_idx, dtype=torch.int32, device=mask.device),
-    )
+    """Build CSC (col_ptr, row_idx) from boolean mask [M, K].
+
+    Vectorized, but the **row indices within each column must be ascending**.
+
+    That ordering is a real contract, not a cosmetic detail: the AVX2 backward
+    walks column `j` over `w_row[col_ptr[j] : col_ptr[j+1]]` and accumulates
+    `grad_out` rows in that order, so a different order changes the result. A
+    single `torch.nonzero(mask)` emits row-major order, which groups *all* of row
+    0 together, then all of row 1, etc. -- correct for CSR, wrong for CSC.
+
+    Sorting the flat pairs by `(col, row)` restores the per-column ascending
+    order. `torch.sort` on a composite key avoids materializing a second pass;
+    the alternative (`mask.t().nonzero()`) is the transpose trick: nonzero on the
+    transposed mask is column-major over the original, i.e. ascending rows per
+    column.
+    """
+    K = mask.shape[1]
+    # Transpose first: nonzero over the transposed mask enumerates
+    # (col, row) pairs in column-major order, so within each column the row
+    # indices come out ascending -- exactly the CSC layout the kernel expects.
+    cols, rows = torch.nonzero(mask.t().contiguous(), as_tuple=True)
+    counts = torch.bincount(cols, minlength=K)
+    col_ptr = torch.zeros(K + 1, dtype=torch.int64, device=mask.device)
+    torch.cumsum(counts, dim=0, out=col_ptr[1:])
+    return col_ptr.to(torch.int32), rows.to(torch.int32)
 
 
 def _naive_sparseprop_forward(
-    x: torch.Tensor,           # [K, B]
+    x: torch.Tensor,  # [K, B]
     weight_dense: torch.Tensor,  # [M, K]
-    mask: torch.Tensor,         # [M, K] bool
+    mask: torch.Tensor,  # [M, K] bool
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
     """Dense masked matmul reference: y = (W * mask) @ x + bias.
@@ -174,10 +202,10 @@ def _naive_sparseprop_forward(
 
 
 def _naive_sparseprop_backward(
-    gY: torch.Tensor,           # [M, B]
-    x: torch.Tensor,            # [K, B]
+    gY: torch.Tensor,  # [M, B]
+    x: torch.Tensor,  # [K, B]
     weight_dense: torch.Tensor,  # [M, K]
-    mask: torch.Tensor,         # [M, K] bool
+    mask: torch.Tensor,  # [M, K] bool
     bias: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Dense masked backward reference."""
@@ -221,26 +249,22 @@ def build_csr_csc_from_mask(mask: torch.Tensor):
 
 
 def _nnz_row_indices(w_row_ptr: torch.Tensor, M: int) -> torch.Tensor:
-    """Expand CSR/CSC row_ptr into per-nnz row indices [nnz]."""
-    nnz = int(w_row_ptr[-1].item())
-    row_idx = torch.zeros(nnz, dtype=torch.int32, device=w_row_ptr.device)
-    ptr = 0
-    for i in range(M):
-        end = int(w_row_ptr[i + 1].item())
-        row_idx[ptr:end] = i
-        ptr = end
-    return row_idx
+    """Expand CSR row_ptr into per-nnz row indices [nnz].
+
+    Vectorized via `repeat_interleave`: the previous version did an `.item()`
+    per row (M host syncs). `w_row_ptr` is already on device, so only the final
+    length needs a sync.
+    """
+    counts = w_row_ptr[1:] - w_row_ptr[:-1]
+    rows = torch.arange(M, device=w_row_ptr.device)
+    return torch.repeat_interleave(rows, counts.to(torch.int64)).to(torch.int32)
 
 
 def _csc_col_indices(w_cptr: torch.Tensor, K: int, nnz: int, device) -> torch.Tensor:
-    """Expand CSC col_ptr into per-nnz column indices [nnz]."""
-    col_idx = torch.zeros(nnz, dtype=torch.int32, device=device)
-    ptr = 0
-    for k in range(K):
-        end = int(w_cptr[k + 1].item())
-        col_idx[ptr:end] = k
-        ptr = end
-    return col_idx
+    """Expand CSC col_ptr into per-nnz column indices [nnz]. Vectorized."""
+    counts = w_cptr[1:] - w_cptr[:-1]
+    cols = torch.arange(K, device=w_cptr.device)
+    return torch.repeat_interleave(cols, counts.to(torch.int64)).to(torch.int32)
 
 
 def gather_values_from_dense(

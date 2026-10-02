@@ -1,5 +1,6 @@
 """Integration tests for SparsePropLinear module: autograd equivalence,
 mask integrity, and DB-CPU block-wise integration."""
+
 import pytest
 import torch
 import torch.nn as nn
@@ -16,9 +17,15 @@ from nanochat.lcqat.sparseprop import (
 @pytest.fixture
 def tiny_model():
     from nanochat.gpt import GPT, GPTConfig
+
     config = GPTConfig(
-        sequence_len=32, vocab_size=64, n_layer=2, n_head=2,
-        n_kv_head=2, n_embd=32, window_pattern="L",
+        sequence_len=32,
+        vocab_size=64,
+        n_layer=2,
+        n_head=2,
+        n_kv_head=2,
+        n_embd=32,
+        window_pattern="L",
     )
     with torch.device("meta"):
         model = GPT(config)
@@ -36,10 +43,13 @@ class TestSparsePropLinearAutograd:
         sparse = SparsePropLinear.from_linear(lin, sparsity=0.0)
         with torch.no_grad():
             mask = torch.tensor(
-                [[1, 0, 1, 0, 1, 0],
-                 [0, 1, 0, 1, 0, 1],
-                 [1, 1, 1, 0, 0, 1],
-                 [0, 0, 1, 1, 1, 0]], dtype=torch.bool
+                [
+                    [1, 0, 1, 0, 1, 0],
+                    [0, 1, 0, 1, 0, 1],
+                    [1, 1, 1, 0, 0, 1],
+                    [0, 0, 1, 1, 1, 0],
+                ],
+                dtype=torch.bool,
             )
             sparse._set_mask(mask)
 
@@ -60,10 +70,13 @@ class TestSparsePropLinearAutograd:
         sparse = SparsePropLinear.from_linear(lin, sparsity=0.0)
 
         mask = torch.tensor(
-            [[1, 0, 1, 0, 1, 0],
-             [0, 1, 0, 1, 0, 1],
-             [1, 1, 1, 0, 0, 1],
-             [0, 0, 1, 1, 1, 0]], dtype=torch.bool
+            [
+                [1, 0, 1, 0, 1, 0],
+                [0, 1, 0, 1, 0, 1],
+                [1, 1, 1, 0, 0, 1],
+                [0, 0, 1, 1, 1, 0],
+            ],
+            dtype=torch.bool,
         )
         sparse._set_mask(mask)
 
@@ -90,11 +103,15 @@ class TestSparsePropLinearAutograd:
             f"grad_x mismatch: max diff = {(x_sparse.grad - x_ref.grad).abs().max()}"
         )
         # grad_w at nnz positions should match
-        assert torch.allclose(sparse.weight.grad[mask], lin_ref.weight.grad[mask], atol=1e-3), (
+        assert torch.allclose(
+            sparse.weight.grad[mask], lin_ref.weight.grad[mask], atol=1e-3
+        ), (
             f"grad_w (nnz) mismatch: max diff = {(sparse.weight.grad[mask] - lin_ref.weight.grad[mask]).abs().max()}"
         )
         # grad_w at masked positions should be zero
-        assert (sparse.weight.grad[~mask] == 0).all(), "Non-zero grad at masked positions!"
+        assert (sparse.weight.grad[~mask] == 0).all(), (
+            "Non-zero grad at masked positions!"
+        )
         # grad_bias should match
         assert torch.allclose(sparse.bias.grad, lin_ref.bias.grad, atol=1e-5), (
             f"grad_b mismatch: max diff = {(sparse.bias.grad - lin_ref.bias.grad).abs().max()}"
@@ -140,14 +157,16 @@ class TestInjection:
     def test_inject_replaces_linear(self, tiny_model):
         """inject_sparseprop_layers replaces nn.Linear with SparsePropLinear."""
         from nanochat.lcqat.linear import LCQATLinear
+
         n_before = sum(
-            1 for m in tiny_model.modules()
-            if isinstance(m, nn.Linear) and not isinstance(m, (SparsePropLinear, LCQATLinear))
+            1
+            for m in tiny_model.modules()
+            if isinstance(m, nn.Linear)
+            and not isinstance(m, (SparsePropLinear, LCQATLinear))
         )
         inject_sparseprop_layers(tiny_model, sparsity=0.5)
         n_after = sum(
-            1 for m in tiny_model.modules()
-            if isinstance(m, SparsePropLinear)
+            1 for m in tiny_model.modules() if isinstance(m, SparsePropLinear)
         )
         assert n_after > 0, "No SparsePropLinear modules created"
         assert n_after == n_before, f"Expected {n_before} replacements, got {n_after}"
@@ -161,23 +180,31 @@ class TestInjection:
         assert out.shape == (2, 16, 64), f"Expected (2, 16, 64), got {out.shape}"
 
     def test_apply_static_sparsity_mask(self, tiny_model):
-        """apply_static_sparsity_mask sets masks on SparsePropLinear modules."""
+        """apply_static_sparsity_mask prunes every SparsePropLinear to the target."""
         inject_sparseprop_layers(tiny_model, sparsity=0.1)
-        apply_static_sparsity_mask(tiny_model, sparsity=0.6)
-        for m in tiny_model.modules():
-            if isinstance(m, SparsePropLinear):
-                nnz = m.sparsity_mask.sum().item()
-                total = m.weight.numel()
-                actual = 1.0 - nnz / total
-                assert 0.50 <= actual <= 0.70, (
-                    f"Module sparsity {actual:.2f} outside range for 0.6 target"
-                )
+        achieved = apply_static_sparsity_mask(tiny_model, sparsity=0.6)
+        layers = [m for m in tiny_model.modules() if isinstance(m, SparsePropLinear)]
+        assert layers, "no SparsePropLinear modules to mask"
+        for m in layers:
+            nnz = m.sparsity_mask.sum().item()
+            total = m.weight.numel()
+            actual = 1.0 - nnz / total
+            assert 0.55 <= actual <= 0.65, (
+                f"Module sparsity {actual:.2f} outside range for 0.6 target"
+            )
+            # The pruning criterion writes exact zeros, which is what makes a
+            # pruned position a structural zero under the LC-QAT codebook.
+            assert (m.weight.detach()[~m.sparsity_mask] == 0.0).all()
+        total_all = sum(m.weight.numel() for m in layers)
+        nnz_all = sum(int(m.sparsity_mask.sum()) for m in layers)
+        assert achieved == pytest.approx(1.0 - nnz_all / total_all)
 
 
 class TestDBCPUIntegration:
     def test_sparseprop_is_linear_subclass(self):
         """SparsePropLinear is recognized as nn.Linear by DB-CPU partitioner."""
         from nanochat.gpt import Linear
+
         sparse = SparsePropLinear(32, 32, sparsity=0.5)
         assert isinstance(sparse, nn.Linear)
         assert isinstance(sparse, Linear)
@@ -211,6 +238,36 @@ class TestDBCPUIntegration:
                 break
         assert has_grad, "No gradients found on model parameters"
 
+    def test_wrapping_lcqat_preserves_learned_activation_lut(self, tiny_model):
+        """SparseProp must not drop the D9 learned activation tables.
+
+        `SparsePropLinearLCQAT` re-parents the wrapped LCQATLinear's
+        parameters, quantizers and buffers, then deliberately drops the
+        reference to the original module. `learnable_activation_lut` is a
+        *submodule* (it holds the trainable `logits` / `initial_table`
+        parameters), so it was silently lost at wrap time. The checkpoint then
+        saved without those keys and `build_model`'s strict load failed with
+        "unexpected key(s)" on every wrapped `c_fc` -- a model trained with the
+        always-on defaults could not be loaded for evaluation at all.
+        """
+        from nanochat.lcqat import LayerKConfig, retrofit_model
+        from nanochat.lcqat.export import attach_learnable_activation_luts
+
+        model = retrofit_model(tiny_model, LayerKConfig(min_linear_dim=1))
+        n_attached = attach_learnable_activation_luts(model)
+        assert n_attached > 0, "precondition: a learned table must be attached"
+
+        before = {k for k in model.state_dict() if "learnable_activation_lut" in k}
+        assert before, "precondition: the table must appear in the state_dict"
+
+        inject_sparseprop_layers(model, sparsity=0.5, with_lcqat=True)
+
+        after = {k for k in model.state_dict() if "learnable_activation_lut" in k}
+        assert after == before, (
+            "wrapping in SparseProp dropped the learned activation table: "
+            f"before={sorted(before)} after={sorted(after)}"
+        )
+
     def test_sparseprop_with_lcqat(self, tiny_model):
         from nanochat.lcqat import LayerKConfig, retrofit_model
 
@@ -222,8 +279,12 @@ class TestDBCPUIntegration:
         # After inject with_lcqat=True, top-level LCQATLinear modules are wrapped
         # in SparsePropLinearLCQAT (which absorbs the LCQATLinear's weight/
         # quantizers in-tree, so no orphan LCQATLinear remains).
-        sparse_count = sum(1 for m in model.modules() if isinstance(m, SparsePropLinearLCQAT))
-        assert sparse_count > 0, "LCQAT retrofit should produce SparsePropLinearLCQAT modules"
+        sparse_count = sum(
+            1 for m in model.modules() if isinstance(m, SparsePropLinearLCQAT)
+        )
+        assert sparse_count > 0, (
+            "LCQAT retrofit should produce SparsePropLinearLCQAT modules"
+        )
         # No orphan LCQATLinear modules should remain after wrapping
         orphans = sum(1 for m in model.modules() if isinstance(m, LCQATLinear))
         assert orphans == 0, f"Expected no orphan LCQATLinear modules, got {orphans}"
@@ -271,7 +332,9 @@ class TestSparsePropLCQAT:
         model.train()
 
         x = torch.randn(4, 8, 32, dtype=torch.float32)
-        module = next(m for m in model.modules() if isinstance(m, SparsePropLinearLCQAT))
+        module = next(
+            m for m in model.modules() if isinstance(m, SparsePropLinearLCQAT)
+        )
         y = module(x)
         loss = y.sum()
         loss.backward()
@@ -293,7 +356,9 @@ class TestSparsePropLCQAT:
         inject_sparseprop_layers(model, sparsity=0.5, with_lcqat=True)
 
         model.train()
-        module = next(m for m in model.modules() if isinstance(m, SparsePropLinearLCQAT))
+        module = next(
+            m for m in model.modules() if isinstance(m, SparsePropLinearLCQAT)
+        )
         mask_before = module.sparsity_mask.clone()
 
         x = torch.randn(4, 8, 32, dtype=torch.float32)
@@ -308,4 +373,6 @@ class TestSparsePropLCQAT:
         opt.step()
 
         # Mask should not change after optimizer step
-        assert torch.equal(module.sparsity_mask, mask_before), "Sparsity mask changed during training"
+        assert torch.equal(module.sparsity_mask, mask_before), (
+            "Sparsity mask changed during training"
+        )

@@ -263,9 +263,13 @@ class QuantizedKVCache:
                     f"{label} must be [n_layers, num_heads, K] = "
                     f"[{num_layers}, {num_heads}, K], got {tuple(cb.shape)}"
                 )
-            if cb.shape[-1] < 3 or cb.shape[-1] > 15 or cb.shape[-1] % 2 != 1:
+            # Even K is legal: the asymmetric split K = m_neg + 1 + m_pos is
+            # what makes one-sided codebooks (and therefore K=4, K=8, K=16)
+            # possible. The storage limit is still K <= 15, because the cache is
+            # nibble-packed (2 indices per byte).
+            if cb.shape[-1] < 3 or cb.shape[-1] > 15:
                 raise ValueError(
-                    f"{label} last dim must be an odd K in [3, 15] (nibble-packed), "
+                    f"{label} last dim must be a K in [3, 15] (nibble-packed), "
                     f"got {cb.shape[-1]}"
                 )
         self.batch_size = batch_size

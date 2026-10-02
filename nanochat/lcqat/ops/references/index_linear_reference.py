@@ -44,8 +44,8 @@ def validate_index_linear_inputs(
     for label, lut in (("act_lut", act_lut), ("weight_lut", weight_lut)):
         if lut.dtype != torch.float32:
             raise ValueError(f"{label} must be float32, got {lut.dtype}")
-        if lut.numel() < 3 or lut.numel() % 2 != 1:
-            raise ValueError(f"{label} K must be an odd integer >= 3")
+        if lut.numel() < 3:
+            raise ValueError(f"{label} K must be an integer >= 3")
     if weight_indices.ndim != 2:
         raise ValueError(
             f"weight_indices must be [m, ...], got shape {tuple(weight_indices.shape)}"

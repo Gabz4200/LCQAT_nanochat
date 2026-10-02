@@ -10,43 +10,222 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
 
+import torch
 import torch.nn as nn
 
-from nanochat.lcqat.linear import LCQATLinear
+from nanochat.common import print0
+from nanochat.lcqat.activation import ACT_BODIES, ACT_BODY_PWL
+from nanochat.lcqat.codebook import validate_split as _validate_split
+from nanochat.lcqat.learnable_lut import RELAXATION_LOGITS, RELAXATIONS
+from nanochat.lcqat.linear import GRAD_SCALE_INV_SQRT_N, GRAD_SCALES, LCQATLinear
+
+#: A codebook cardinality: either a total level count `K` (split symmetrically
+#: as `m_neg = m_pos = (K - 1) // 2`) or an explicit `(m_neg, m_pos)` split.
+#: K >= 3 in both forms; even K is legal and is what a one-sided (m_neg = 0)
+#: codebook exists to enable.
+CodebookSpec = int | tuple[int, int]
+
+#: The exact set of `LayerKConfig` fields whose value is a `CodebookSpec`.
+#:
+#: This is an explicit list rather than a suffix heuristic (`name.endswith(("_weight",
+#: "_act"))`) because the heuristic is a landmine: `per_channel_weight: bool` ends
+#: in `_weight` and was therefore fed to `_validate_codebook_spec` as a codebook
+#: spec, raising `ValueError` on every `retrofit_model` call with no per-channel
+#: flag anywhere in play (dev/HANDOFF_symbiosis.md §9.3 Defect 1). Any future field
+#: named `*_weight` or `*_act` would reproduce the bug silently, and the fix in
+#: §9.3 ("rename the field") would have churned every checkpoint's `meta["lcqat"]`.
+#: Naming the fields makes the class of bug impossible rather than merely absent.
+CODEBOOK_SPEC_FIELDS: frozenset[str] = frozenset(
+    {
+        "qk_weight",
+        "qk_act",
+        "v_weight",
+        "v_act",
+        "o_weight",
+        "o_act",
+        "fc_weight",
+        "fc_act",
+        "down_weight",
+        "down_act",
+        "qkv_out",
+        "fc_out",
+    }
+)
+
+
+def _validate_codebook_spec(spec: CodebookSpec, label: str) -> None:
+    """Raise unless `spec` is an int >= 3 or a valid `(m_neg, m_pos)` pair."""
+    # A bool is an int subclass, so `per_channel_weight=False` reaches the
+    # `isinstance(spec, int)` branch below as a "K of 0" without this guard --
+    # and False <= 3 would then raise the *wrong* error for the *right* reason.
+    # CODEBOOK_SPEC_FIELDS keeps booleans out of this function entirely; this
+    # guard is the defense-in-depth that makes that exclusion a non-issue.
+    if isinstance(spec, bool):
+        raise ValueError(
+            f"{label} is a bool, not a codebook spec; a codebook cardinality is "
+            f"an int K or an (m_neg, m_pos) tuple, got {spec!r}"
+        )
+    if isinstance(spec, tuple):
+        if len(spec) != 2:
+            raise ValueError(
+                f"{label}: an asymmetric split must be (m_neg, m_pos), got {spec!r}"
+            )
+        m_neg, m_pos = spec
+        if (
+            isinstance(m_neg, bool)
+            or isinstance(m_pos, bool)
+            or not isinstance(m_neg, int)
+            or not isinstance(m_pos, int)
+        ):
+            raise ValueError(f"{label}: m_neg/m_pos must be ints, got {spec!r}")
+        # Delegate the structural rules (non-negative, one-sided needs >= 2, and
+        # K >= 3) to the codebook's own validator so there is one source of truth.
+        _validate_split(m_neg, m_pos)
+        return
+    if isinstance(spec, bool) or not isinstance(spec, int):
+        raise ValueError(
+            f"{label} must be an int K or an (m_neg, m_pos) tuple, got {spec!r}"
+        )
+    if spec < 3:
+        raise ValueError(f"{label} must be >= 3, got {spec}")
+
+
+def spec_k(spec: CodebookSpec) -> int:
+    """Total level count K implied by a `CodebookSpec`."""
+    if isinstance(spec, tuple):
+        m_neg, m_pos = spec
+        _validate_split(m_neg, m_pos)
+        return m_neg + 1 + m_pos
+    return int(spec)
+
+
+def spec_split(spec: CodebookSpec) -> tuple[int, int]:
+    """`(m_neg, m_pos)` implied by a `CodebookSpec`, splitting an int K evenly."""
+    if isinstance(spec, tuple):
+        m_neg, m_pos = spec
+        _validate_split(m_neg, m_pos)
+        return m_neg, m_pos
+    k = int(spec)
+    if k < 3:
+        raise ValueError(f"codebook K must be >= 3, got {k}")
+    half = (k - 1) // 2
+    # An odd K gets the extra level on the positive side; an even K splits evenly.
+    return half, k - 1 - half
+
+
+def _as_spec(value) -> CodebookSpec:
+    """Normalize a JSON-decoded spec to int or tuple.
+
+    JSON has no tuples, so a saved `(m_neg, m_pos)` split reads back as a list.
+    """
+    if isinstance(value, list):
+        if len(value) != 2:
+            raise ValueError(
+                f"asymmetric split must have 2 entries (m_neg, m_pos), got {value!r}"
+            )
+        return (int(value[0]), int(value[1]))
+    return int(value)
 
 
 @dataclass(frozen=True)
 class LayerKConfig:
-    """Codebook cardinalities per module role (all odd, >= 3).
+    """Codebook cardinalities per module role (each >= 3).
 
     Roles are nanochat module-name suffixes: attn.c_q/c_k, attn.c_v,
     attn.c_proj (o_proj), mlp.c_fc (gate/up), mlp.c_proj (down_proj).
     `k_map` holds explicit (name_substring, K_weight, K_act) overrides,
     checked in order before the role defaults.
+
+    Each field is a `CodebookSpec`: an int K (symmetric) or an explicit
+    `(m_neg, m_pos)` split. The asymmetric form matters because `gpt.py`'s MLP
+    computes `relu(x).square()` before `mlp.c_proj`, so the 4*n_embd hidden
+    tensor is non-negative: a symmetric codebook puts half its levels on the
+    negative side, which that tensor never occupies.
     """
 
-    qk_weight: int = 3
-    qk_act: int = 15
-    v_weight: int = 15
-    v_act: int = 15
-    o_weight: int = 15
-    o_act: int = 15
-    fc_weight: int = 15
-    fc_act: int = 15
-    down_weight: int = 15
-    down_act: int = 15
+    qk_weight: CodebookSpec = 3
+    qk_act: CodebookSpec = 15
+    v_weight: CodebookSpec = 15
+    v_act: CodebookSpec = 15
+    o_weight: CodebookSpec = 15
+    o_act: CodebookSpec = 15
+    fc_weight: CodebookSpec = 15
+    fc_act: CodebookSpec = 15
+    down_weight: CodebookSpec = 15
+    down_act: CodebookSpec = 15
+    # Output quantizers (c_q/c_k/c_v output, c_fc output). `fc_out` is the
+    # non-negative MLP hidden -> one-sided by default in the asym preset.
+    qkv_out: CodebookSpec = 15
+    fc_out: CodebookSpec = 15
     quantize_qkv_out: bool = True
     quantize_fc_out: bool = True
-    k_map: tuple[tuple[str, int, int], ...] = ()
+    k_map: tuple[tuple[str, CodebookSpec, CodebookSpec], ...] = ()
     min_linear_dim: int = 128
+    # PRD 2.4: "none" (plain STE) or "inv_sqrt_n" (1/sqrt(numel) on the
+    # codebook gradient). Config-level so a checkpoint records which one it was
+    # trained under, rather than silently changing behaviour on reload.
+    grad_scale: str = GRAD_SCALE_INV_SQRT_N
+    # PRD 3.4: one weight codebook per output channel instead of one shared.
+    # Config-level for the same reason as `grad_scale` -- a checkpoint has to
+    # record that it was trained this way, or a reload silently builds shared
+    # tables and the saved per-channel parameters are orphaned.
+    per_channel_weight: bool = False
+    # Quantize the bias through a per-layer learned codebook
+    # (`LCQATLinear.bias_quantizer`). Off by default, and deliberately *not* a
+    # CODEBOOK_SPEC_FIELDS entry: it is a bool, so `validate()` must not feed it
+    # to `_validate_codebook_spec` -- that is exactly the §9.3 Defect 1 class of
+    # bug (a bool reaching an int validator) that the explicit frozenset exists
+    # to make impossible. Its cardinality, when enabled, defaults to `K_act`.
+    #
+    # Config-level for the same reason as `grad_scale`: a checkpoint trained
+    # with a bias codebook carries its step parameters, so a reload that skipped
+    # the flag would fail the strict state_dict load with "unexpected keys".
+    quantize_bias: bool = False
+    # D9: how the *trained* activation LUT selects its output level.
+    # "logits" is the original free `(K_in, K_out)` logit matrix with a
+    # straight-through round; "proximity" replaces it with a `knots + levels`
+    # pair selected by inverse-square distance, which costs K_in + K_in
+    # parameters instead of K_in x K_out and has no softmax-saturation cliff
+    # (dev/HANDOFF_symbiosis.md §10.2.1).
+    #
+    # Config-level for the same reason as `grad_scale`: a checkpoint records
+    # which relaxation produced its LUT weights, so a reload does not silently
+    # build a different module with orphaned parameters.
+    lut_relaxation: str = RELAXATION_LOGITS
+    # D9: which body approximates the elementwise activation between two
+    # quantized layers. "pwl" is the shipped frozen K_in -> K_out index table
+    # (exact at the knots, linear between). "smoothpwl" is the learnable
+    # radial-basis body from `activation.py`.
+    #
+    # Same reasoning as `lut_relaxation`: the two bodies have different
+    # parameter shapes, so a checkpoint trained with one cannot be reloaded as
+    # the other.
+    act_body: str = ACT_BODY_PWL
 
     @classmethod
     def from_dict(cls, data: dict) -> "LayerKConfig":
         kwargs = dict(data)
         if "k_map" in kwargs:
+            # A split survives a JSON round-trip as a list, so normalize to tuple.
             kwargs["k_map"] = tuple(
-                (str(s), int(kw), int(ka)) for s, kw, ka in kwargs["k_map"]
+                (str(s), _as_spec(kw), _as_spec(ka)) for s, kw, ka in kwargs["k_map"]
             )
+        for name in (
+            "qk_weight",
+            "qk_act",
+            "v_weight",
+            "v_act",
+            "o_weight",
+            "o_act",
+            "fc_weight",
+            "fc_act",
+            "down_weight",
+            "down_act",
+            "qkv_out",
+            "fc_out",
+        ):
+            if name in kwargs:
+                kwargs[name] = _as_spec(kwargs[name])
         known = {f.name for f in fields(cls)}
         unknown = set(kwargs) - known
         if unknown:
@@ -54,54 +233,142 @@ class LayerKConfig:
         return cls(**kwargs)
 
     def validate(self) -> None:
-        k_fields = {
-            name: value
-            for name, value in vars(self).items()
-            if name.endswith(("_weight", "_act"))
-        }
-        for name, value in k_fields.items():
-            if value % 2 != 1 or value < 3:
-                raise ValueError(
-                    f"LayerKConfig.{name} must be an odd integer >= 3, got {value}"
-                )
         for substr, kw, ka in self.k_map:
-            for label, value in (("K_weight", kw), ("K_act", ka)):
-                if value % 2 != 1 or value < 3:
-                    raise ValueError(
-                        f"k_map rule {substr!r} {label} must be an odd integer >= 3, got {value}"
-                    )
+            _validate_codebook_spec(kw, f"k_map rule {substr!r} K_weight")
+            _validate_codebook_spec(ka, f"k_map rule {substr!r} K_act")
+        # Every codebook-spec field must be a *declared* member of
+        # CODEBOOK_SPEC_FIELDS, checked here rather than assumed. A field
+        # holding a CodebookSpec that nobody validates is a config that fails
+        # at model-build time instead of flag-parse time, which is the same
+        # late-failure mode the explicit set exists to prevent.
+        undeclared = CODEBOOK_SPEC_FIELDS - {f.name for f in fields(self)}
+        if undeclared:
+            raise ValueError(
+                f"CODEBOOK_SPEC_FIELDS names fields LayerKConfig does not "
+                f"define: {sorted(undeclared)}"
+            )
+        for name in CODEBOOK_SPEC_FIELDS:
+            _validate_codebook_spec(getattr(self, name), f"LayerKConfig.{name}")
+        if self.grad_scale not in GRAD_SCALES:
+            raise ValueError(
+                f"LayerKConfig.grad_scale must be one of {GRAD_SCALES}, got "
+                f"{self.grad_scale!r}"
+            )
+        # Both are validated here rather than trusted from argparse, because a
+        # config also arrives from `from_dict` on a resume -- and a resume that
+        # silently accepted a typo would build a module whose parameter shape
+        # does not match the saved weights.
+        if self.lut_relaxation not in RELAXATIONS:
+            raise ValueError(
+                f"LayerKConfig.lut_relaxation must be one of {RELAXATIONS}, got "
+                f"{self.lut_relaxation!r}"
+            )
+        if self.act_body not in ACT_BODIES:
+            raise ValueError(
+                f"LayerKConfig.act_body must be one of {ACT_BODIES}, got "
+                f"{self.act_body!r}"
+            )
+
+    def as_dict(self) -> dict:
+        """JSON-serializable form (splits become lists, as JSON has no tuples)."""
+        data = {f.name: getattr(self, f.name) for f in fields(self)}
+        data["k_map"] = [
+            (
+                s,
+                list(kw) if isinstance(kw, tuple) else kw,
+                list(ka) if isinstance(ka, tuple) else ka,
+            )
+            for s, kw, ka in self.k_map
+        ]
+        for name in (
+            "qk_weight",
+            "qk_act",
+            "v_weight",
+            "v_act",
+            "o_weight",
+            "o_act",
+            "fc_weight",
+            "fc_act",
+            "down_weight",
+            "down_act",
+            "qkv_out",
+            "fc_out",
+        ):
+            if isinstance(data[name], tuple):
+                data[name] = list(data[name])
+        return data
 
 
 # small: maximum-compression default (user-approved). prd: PRD section 4 table
 # verbatim (8-bit down_proj / residual recombination path).
+#
+# asym (the default): same total level counts as `small`, but split so the two
+# non-negative tensors stop wasting half their codebook. `gpt.py`'s MLP is
+# `c_fc -> relu(x).square() -> c_proj`, so
+#   * `mlp.c_fc`'s OUTPUT codebook sees relu^2 >= 0  -> m_neg = 0
+#   * `mlp.c_proj`'s INPUT codebook sees relu^2 >= 0  -> m_neg = 0
+# A symmetric 15 spends 7 levels on a sign those tensors never take; 0/7 spends
+# all 8. Everything upstream of the activation (attention in/out, c_fc in) is
+# genuinely signed and gets an asymmetric split rather than a symmetric one.
 PRESETS: dict[str, LayerKConfig] = {
     "small": LayerKConfig(),
     "prd": LayerKConfig(down_weight=255, down_act=255),
+    "asym": LayerKConfig(
+        # Attention: signed (RMSNorm'd) inputs and outputs, mildly skewed.
+        qk_weight=(1, 1),
+        qk_act=(6, 8),
+        v_weight=(6, 8),
+        v_act=(6, 8),
+        o_weight=(6, 8),
+        o_act=(6, 8),
+        # c_fc input is signed (post-RMSNorm); its OUTPUT is relu^2 >= 0.
+        fc_weight=(6, 8),
+        fc_act=(6, 8),
+        # c_proj input is relu^2 >= 0 (one-sided); its output rejoins the stream.
+        down_weight=(6, 8),
+        down_act=(0, 7),
+        qkv_out=(6, 8),
+        fc_out=(0, 7),
+    ),
 }
 
+DEFAULT_PRESET = "asym"
 
-def parse_k_map(spec: str) -> tuple[tuple[str, int, int], ...]:
-    """Parse `substr:KW/KA,substr:KW/KA` into override rules."""
-    rules: list[tuple[str, int, int]] = []
+
+def _parse_spec_token(token: str, label: str) -> CodebookSpec:
+    """Parse one K token: `8` or `0-7` (m_neg-m_pos)."""
+    token = token.strip()
+    if not token:
+        raise ValueError(f"{label}: empty codebook spec")
+    if "-" in token[1:]:
+        neg, _, pos = token.partition("-")
+        spec = (int(neg), int(pos))
+    else:
+        spec = int(token)
+    _validate_codebook_spec(spec, label)
+    return spec
+
+
+def parse_k_map(spec: str) -> tuple[tuple[str, CodebookSpec, CodebookSpec], ...]:
+    """Parse `substr:KW/KA,substr:KW/KA` into override rules.
+
+    Each K is either a total level count (`15`) or an asymmetric split written
+    `m_neg-m_pos` (`0-7`).
+    """
+    rules: list[tuple[str, CodebookSpec, CodebookSpec]] = []
     for part in spec.split(","):
         part = part.strip()
         if not part:
             continue
         if ":" not in part or "/" not in part.split(":", 1)[1]:
-            raise ValueError(f"k-map entry {part!r} must have the form substring:KW/KA")
+            raise ValueError(
+                f"k-map entry {part!r} must have the form "
+                "substring:KW/KA, with each K either N or Mneg-Mpos"
+            )
         substr, ks = part.rsplit(":", 1)
         kw_s, ka_s = ks.split("/", 1)
-        try:
-            kw, ka = int(kw_s), int(ka_s)
-        except ValueError as error:
-            raise ValueError(
-                f"k-map entry {part!r} has non-integer K values"
-            ) from error
-        for label, value in (("K_weight", kw), ("K_act", ka)):
-            if value % 2 != 1 or value < 3:
-                raise ValueError(
-                    f"k-map entry {part!r}: {label} must be an odd integer >= 3, got {value}"
-                )
+        kw = _parse_spec_token(kw_s, f"k-map entry {part!r} K_weight")
+        ka = _parse_spec_token(ka_s, f"k-map entry {part!r} K_act")
         if not substr.strip():
             raise ValueError(f"k-map entry {part!r} has an empty substring")
         rules.append((substr.strip(), kw, ka))
@@ -111,7 +378,21 @@ def parse_k_map(spec: str) -> tuple[tuple[str, int, int], ...]:
 
 
 def lcqat_config_from_args(args) -> LayerKConfig:
-    """Build the LayerKConfig from --lcqat-preset / --lcqat-k-map flags."""
+    """Build the LayerKConfig from the `--lcqat-*` flags.
+
+    Reads `--lcqat-preset`, `--lcqat-k-map`, `--codebook-grad-scale` and
+    `--lcqat-channel-center`. Every one after the preset is read via `getattr`
+    with a default, so a caller that registers a subset of the flags still
+    works -- `chat_rl` does not register `--lcqat-channel-center` at all.
+
+    `--lcqat-channel-center` is the flag that was previously registered but
+    never consumed (dev/HANDOFF_symbiosis.md §13: "a CLI flag that is registered
+    but not consumed is worse than an absent flag"). It is consumed here, and
+    the resulting config is what the three training scripts persist to
+    `meta["lcqat"]`, so a resume rebuilds per-channel tables instead of
+    silently reverting to shared ones and orphaning the saved per-channel
+    parameters.
+    """
     if args.lcqat_preset not in PRESETS:
         raise ValueError(
             f"Unknown --lcqat-preset {args.lcqat_preset!r}, valid: {sorted(PRESETS)}"
@@ -119,25 +400,60 @@ def lcqat_config_from_args(args) -> LayerKConfig:
     cfg = PRESETS[args.lcqat_preset]
     if args.lcqat_k_map:
         cfg = replace(cfg, k_map=parse_k_map(args.lcqat_k_map))
+    if getattr(args, "lcqat_channel_center", False):
+        cfg = replace(cfg, per_channel_weight=True)
+    grad_scale = getattr(args, "codebook_grad_scale", None)
+    if grad_scale is not None:
+        if grad_scale not in GRAD_SCALES:
+            raise ValueError(
+                f"Unknown --codebook-grad-scale {grad_scale!r}, "
+                f"valid: {sorted(GRAD_SCALES)}"
+            )
+        cfg = replace(cfg, grad_scale=grad_scale)
+    # D9: the activation-LUT relaxation and the activation body. Both default to
+    # the shipped behaviour, and both are read with a `getattr` default so a
+    # caller that registers a subset of the flags keeps working.
+    lut_relaxation = getattr(args, "lcqat_lut_relaxation", None)
+    if lut_relaxation is not None:
+        if lut_relaxation not in RELAXATIONS:
+            raise ValueError(
+                f"Unknown --lcqat-lut-relaxation {lut_relaxation!r}, "
+                f"valid: {sorted(RELAXATIONS)}"
+            )
+        cfg = replace(cfg, lut_relaxation=lut_relaxation)
+    act_body = getattr(args, "lcqat_act_body", None)
+    if act_body is not None:
+        if act_body not in ACT_BODIES:
+            raise ValueError(
+                f"Unknown --lcqat-act-body {act_body!r}, valid: {sorted(ACT_BODIES)}"
+            )
+        cfg = replace(cfg, act_body=act_body)
+    cfg.validate()
     return cfg
 
 
-# Module-name roles: (K_weight field, K_act field, quantize output?)
-_ROLE_QK = ("qk_weight", "qk_act", "quantize_qkv_out")
-_ROLE_V = ("v_weight", "v_act", "quantize_qkv_out")
-_ROLE_O = ("o_weight", "o_act", None)
-_ROLE_FC = ("fc_weight", "fc_act", "quantize_fc_out")
-_ROLE_DOWN = ("down_weight", "down_act", None)
+# Module-name roles: (weight spec field, act spec field, quantize-out flag field,
+# out spec field). A `None` flag field means the role has no output quantizer.
+_ROLE_QK = ("qk_weight", "qk_act", "quantize_qkv_out", "qkv_out")
+_ROLE_V = ("v_weight", "v_act", "quantize_qkv_out", "qkv_out")
+_ROLE_O = ("o_weight", "o_act", None, None)
+_ROLE_FC = ("fc_weight", "fc_act", "quantize_fc_out", "fc_out")
+_ROLE_DOWN = ("down_weight", "down_act", None, None)
 
 
 def get_layer_config(
     module_name: str, config: LayerKConfig
-) -> tuple[int, int, bool] | None:
-    """Return (K_weight, K_act, quantize_out) for a module, or None to skip.
+) -> tuple[CodebookSpec, CodebookSpec, bool, CodebookSpec] | None:
+    """Return (weight_spec, act_spec, quantize_out, out_spec) for a module.
 
-    Matching is on nanochat role suffixes, not the PRD's q_proj/down_proj
-    names: attn.c_q/c_k are q/k, mlp.c_proj is down_proj, attn.c_proj is
-    o_proj. Unmatched names (lm_head, ve_gate, smear_gate) are skipped.
+    Returns None to skip the module. Matching is on nanochat role suffixes, not
+    the PRD's q_proj/down_proj names: attn.c_q/c_k are q/k, mlp.c_proj is
+    down_proj, attn.c_proj is o_proj. Unmatched names (lm_head, ve_gate,
+    smear_gate) are skipped.
+
+    `out_spec` is the output-quantizer cardinality and is only meaningful when
+    the returned `quantize_out` is True; otherwise it is the same as the act
+    spec (which is what LCQATLinear does when `out_k` is None).
     """
     role = None
     if "attn.c_q" in module_name or "attn.c_k" in module_name:
@@ -153,14 +469,17 @@ def get_layer_config(
     if role is None:
         return None
 
-    k_weight_field, k_act_field, out_field = role
+    k_weight_field, k_act_field, out_field, out_spec_field = role
     k_weight, k_act = getattr(config, k_weight_field), getattr(config, k_act_field)
     for substr, kw, ka in config.k_map:
         if substr in module_name:
             k_weight, k_act = kw, ka
             break
-    quantize_out = bool(getattr(config, out_field)) if out_field is not None else False
-    return k_weight, k_act, quantize_out
+    if out_field is None:
+        return k_weight, k_act, False, k_act
+    quantize_out = bool(getattr(config, out_field))
+    out_spec = getattr(config, out_spec_field) if quantize_out else k_act
+    return k_weight, k_act, quantize_out, out_spec
 
 
 def retrofit_model(model: nn.Module, config: LayerKConfig) -> nn.Module:
@@ -171,7 +490,14 @@ def retrofit_model(model: nn.Module, config: LayerKConfig) -> nn.Module:
     requires materialized (non-meta) weights.
     """
     config.validate()
-    replacements: list[tuple[nn.Module, str, nn.Linear, tuple[int, int, bool]]] = []
+    replacements: list[
+        tuple[
+            nn.Module,
+            str,
+            nn.Linear,
+            tuple[CodebookSpec, CodebookSpec, bool, CodebookSpec],
+        ]
+    ] = []
     matched_rules: set[str] = set()
 
     for full_name, child in model.named_modules():
@@ -202,33 +528,56 @@ def retrofit_model(model: nn.Module, config: LayerKConfig) -> nn.Module:
     if unmatched:
         raise ValueError(f"--lcqat-k-map rules matched no modules: {sorted(unmatched)}")
 
-    for parent, attr, child, (k_weight, k_act, quantize_out) in replacements:
+    for parent, attr, child, (k_weight, k_act, quantize_out, out_spec) in replacements:
         setattr(
             parent,
             attr,
             LCQATLinear.from_float(
                 child,
-                K_weight=k_weight,
-                K_act=k_act,
+                K_weight=spec_k(k_weight),
+                K_act=spec_k(k_act),
                 quantize_out=quantize_out,
-                out_k=k_act,
+                out_k=spec_k(out_spec),
+                K_weight_split=spec_split(k_weight),
+                K_act_split=spec_split(k_act),
+                out_split=spec_split(out_spec),
+                grad_scale=config.grad_scale,
+                per_channel_weight=config.per_channel_weight,
+                # A per-layer no-op where the module has no bias: every nanochat
+                # projection is `bias=False`, so this is the normal case, not an
+                # error. `from_float` still raises on the direct-construction
+                # combination.
+                quantize_bias=config.quantize_bias,
             ),
         )
     return model
 
 
 def retrofit_summary(model: nn.Module) -> dict[str, int]:
-    """Count retrofitted modules per (K_weight, K_act) for logging."""
+    """Count retrofitted modules per (weight split, act split) for logging.
+
+    Splits are logged rather than bare K because the sign split is the thing
+    that changes the effective resolution: `m_neg=0, m_pos=7` and
+    `m_neg=3, m_pos=4` are both K=8 but only the first spends all 8 levels on a
+    non-negative tensor.
+    """
     summary: dict[str, int] = {}
     for module in model.modules():
         if isinstance(module, LCQATLinear):
-            key = f"Kw={module.K_weight},Ka={module.K_act}"
+            w, a = module.weight_quantizer, module.act_quantizer
+            key = f"Kw={w.K}(m{w.m_neg},p{w.m_pos}),Ka={a.K}(m{a.m_neg},p{a.m_pos})"
             summary[key] = summary.get(key, 0) + 1
     return summary
 
 
 def is_lcqat_state(state_dict: dict) -> bool:
-    """True if a checkpoint state_dict was trained with LC-QAT."""
+    """True if a checkpoint state_dict was trained with LC-QAT.
+
+    Matches on the *post* side only. A one-sided codebook (`m_neg=0`, which is
+    exactly the MLP `relu^2` case) registers `raw_neg_deltas` as None and so has
+    no such key, while a two-sided codebook always does. Using the post side
+    keeps the detection correct for both shapes.
+    """
     return any(key.endswith("raw_pos_deltas") for key in state_dict)
 
 
@@ -245,7 +594,7 @@ def resolve_lcqat_config(
         return LayerKConfig.from_dict(meta_lcqat)
     if requested is not None:
         return requested
-    return PRESETS["small"]
+    return PRESETS[DEFAULT_PRESET]
 
 
 def _prepare_exported_buffers(model: nn.Module, model_data: dict) -> None:
@@ -278,6 +627,22 @@ def _prepare_exported_buffers(model: nn.Module, model_data: dict) -> None:
         module.register_buffer(
             "weight_index_format", model_data[f"{name}.weight_index_format"]
         )
+        # Sparse artifact (W3.4): the layer was exported as CSR over the
+        # surviving index slots with a compacted alphabet. Carry the structure
+        # through so the runtime can take the zero-skipping path; without these
+        # the module would silently fall back to the dense interpretation of
+        # `packed_weight_indices`.
+        for suffix in (
+            "sparse_keep_indices",
+            "sparse_row_ptr",
+            "sparse_col_indices",
+            "sparse_index_format",
+            "sparse_alphabet",
+            "sparse_k_used",
+        ):
+            key = f"{name}.{suffix}"
+            if key in model_data:
+                module.register_buffer(suffix, model_data[key])
         lut_key = f"{name}.activation_lut"
         if lut_key in model_data:
             module.register_buffer("activation_lut", model_data[lut_key])
@@ -298,6 +663,14 @@ def prepare_lcqat_before_load(
     model is retrofitted to the checkpoint's config and re-shaped into the
     exported runtime structure (packed IDs, no shadow weights); training
     from such a state is rejected by the caller (checkpoint_manager).
+
+    The learned activation tables (D9) are attached on *both* retrofit paths
+    here, not just in `finish_lcqat_after_load`. This function runs *before*
+    `load_state_dict`, and the training checkpoint now carries
+    `learnable_activation_lut.*` parameters -- so a resume that retrofitted
+    without attaching them would fail the caller's `strict=True` load with
+    "unexpected keys", and a resume that attached the wrong body would fail
+    with a shape mismatch.
     """
     if is_exported_lcqat_state(model_data):
         if requested is not None:
@@ -313,15 +686,127 @@ def prepare_lcqat_before_load(
     if is_lcqat_state(model_data):
         config = resolve_lcqat_config(meta_lcqat, requested)
         retrofit_model(model, config)
+        _attach_luts(model, config)
+        _patch_missing_lut_keys(model, model_data)
         return config
     return None
+
+
+def _lut_key_groups(model: nn.Module) -> dict[str, list[str]]:
+    """Expected activation-table keys, grouped by the sub-table that owns them.
+
+    A flat key-level presence test is too blunt here, because the tables
+    shipped in two generations: the baked `activation_lut` buffer first, then
+    the learned `learnable_activation_lut.{logits,initial_table}` parameters. A
+    checkpoint carrying the baked buffer and none of the learned parameters is
+    a legitimate older format, not a corrupt one, and must still resume.
+    Grouping by the sub-table prefix is what separates that case from genuine
+    truncation, where only *part* of one table's keys survived.
+    """
+    groups: dict[str, list[str]] = {}
+    for name in model.state_dict():
+        if "activation_lut" not in name:
+            continue
+        if "learnable_activation_lut." in name:
+            # `...c_fc.learnable_activation_lut.logits` -> the owning module, so
+            # each layer's learned table is its own group. Splitting on a fixed
+            # number of dots instead would merge layer 0 and layer 1 into one
+            # group and make an ordinary two-layer checkpoint look truncated
+            # whenever only one layer's table was absent.
+            group = name.rsplit(".learnable_activation_lut.", 1)[0]
+        else:
+            group = name
+        groups.setdefault(group, []).append(name)
+    return groups
+
+
+def _patch_missing_lut_keys(model: nn.Module, model_data: dict) -> int:
+    """Fill D9 activation-table entries the checkpoint predates.
+
+    `_attach_luts` installs the tables before the caller's `strict=True` load,
+    so a checkpoint written before a given table existed is short exactly that
+    table's keys and would otherwise fail with "missing keys" -- a resume that
+    cannot resume. The defaults are the freshly attached tables themselves:
+    `LearnableIndexLut` initializes bit-identical to `compile_activation_lut`,
+    so a checkpoint with no table resumes at the behaviour it had before the
+    table was learned, rather than at a different one.
+
+    Only *missing* keys are filled. A key present in the checkpoint always
+    wins, so this can never overwrite a trained table.
+
+    An entirely absent sub-table is an older format and is patched. A
+    *partially* present one is truncation, and filling the gap would blend
+    half a trained table into half an untrained one, so it raises. Neither case
+    is a config mismatch: a resume that rebuilt the wrong relaxation or body
+    produces a model whose table keys the checkpoint does not have *and*
+    checkpoint keys the model does not have, and that is left to the caller's
+    `strict=True` load to report, so the error names the real problem.
+    """
+    groups = _lut_key_groups(model)
+    expected = {n for names in groups.values() for n in names}
+    # Keys the checkpoint has that this rebuild would not produce. Their
+    # presence means the resume rebuilt the wrong relaxation or body, which is
+    # a *config mismatch*, not truncation, and the caller's `strict=True` load
+    # reports that accurately as an unexpected key. Patching anything while
+    # such keys are present would paper over the real error with the wrong one.
+    if any("activation_lut" in name and name not in expected for name in model_data):
+        return 0
+    missing: list[str] = []
+    for group, names in groups.items():
+        absent = [n for n in names if n not in model_data]
+        if not absent:
+            continue
+        if len(absent) != len(names):
+            raise RuntimeError(
+                f"checkpoint carries {len(names) - len(absent)} of {len(names)} "
+                f"keys for activation table {group!r}; {absent[:3]} are missing. "
+                "A table is either absent entirely -- an older checkpoint format, "
+                "which is patched -- or complete. A partial set is a truncated "
+                "or corrupt checkpoint, and filling the gap would blend trained "
+                "and untrained values. Retrain or re-save it."
+            )
+        missing.extend(absent)
+    if not missing:
+        return 0
+    state = model.state_dict()
+    with torch.no_grad():
+        for name in missing:
+            model_data[name] = state[name].detach().clone()
+    print0(
+        f"Patched {len(missing)} missing activation-table entries to their "
+        "initial values; this checkpoint predates those tables."
+    )
+    return len(missing)
+
+
+def _attach_luts(model: nn.Module, config: LayerKConfig) -> int:
+    """Attach the D9 learned activation tables for `config`.
+
+    Imported lazily: `export.py` imports from this module, so a module-level
+    import here would be circular.
+    """
+    from nanochat.lcqat.export import attach_learnable_activation_luts
+
+    return attach_learnable_activation_luts(
+        model,
+        relaxation=config.lut_relaxation,
+        act_body=config.act_body,
+    )
 
 
 def finish_lcqat_after_load(
     model: nn.Module, requested: LayerKConfig | None
 ) -> LayerKConfig | None:
-    """Retrofit a freshly loaded float checkpoint when QAT start was requested."""
+    """Retrofit a freshly loaded float checkpoint when QAT start was requested.
+
+    Also attaches the D9 learned activation tables, because this is the resume
+    path and it has the same obligation as the fresh-retrofit path: a resume
+    that builds the layers but not their tables would resume with fewer
+    parameters than it saved, and `verify_partition` would then flag the
+    mismatch. Attached after `retrofit_model` for the same ordering reason.
+    """
     if requested is None:
         return None
     retrofit_model(model, requested)
+    _attach_luts(model, requested)
     return requested

@@ -1,0 +1,21 @@
+{
+  "digests": {
+    "diffusionblocks/loss": "40190ea920000000",
+    "lcqat/grad": "3fe4c57c6db6afc4",
+    "lcqat/grad_params": "135",
+    "lcqat/logits": "c020eb973b970fac",
+    "lcqat/loss": "4019020e00000000",
+    "plain_lm/grad": "3ffb86eea6a1f690",
+    "plain_lm/grad_params": "35",
+    "plain_lm/logits": "c042e51456504200",
+    "plain_lm/loss": "4018dfe9c0000000",
+    "sparseprop/grad": "bf71c7e4d9f115c8",
+    "sparseprop/grad_params": "135",
+    "sparseprop/logits": "c020ecd934f32330",
+    "sparseprop/loss": "4019020e20000000"
+  },
+  "tolerances": {
+    "lcqat/grad": 1e-11,
+    "sparseprop/grad": 1e-11
+  }
+}

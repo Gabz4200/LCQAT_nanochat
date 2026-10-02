@@ -14,8 +14,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nanochat.lcqat.pruning import GradualPruningSchedule, collect
-from nanochat.lcqat.sparseprop import (
+from nanochat.models.quant.pruning import GradualPruningSchedule, collect
+from nanochat.models.quant.sparseprop import (
     PRUNE_SCOPES,
     SCOPE_GLOBAL,
     SCOPE_LAYER,
@@ -353,7 +353,7 @@ class TestScheduleFromArgs:
         """The three entry points share one flag surface; a dropped flag is silent."""
         import argparse
 
-        from nanochat.lcqat.pruning import (
+        from nanochat.models.quant.pruning import (
             add_sparseprop_pruning_args,
             schedule_from_args,
         )

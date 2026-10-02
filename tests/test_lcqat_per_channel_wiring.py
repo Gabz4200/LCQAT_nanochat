@@ -24,10 +24,10 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nanochat.lcqat.export import export_lcqat_checkpoint
-from nanochat.lcqat.linear import LCQATLinear
-from nanochat.lcqat.per_channel import PerChannelValueCenteredQuantizer
-from nanochat.lcqat.retrofit import (
+from nanochat.models.quant.export import export_lcqat_checkpoint
+from nanochat.models.quant.linear import LCQATLinear
+from nanochat.models.quant.per_channel import PerChannelValueCenteredQuantizer
+from nanochat.models.quant.retrofit import (
     CODEBOOK_SPEC_FIELDS,
     DEFAULT_PRESET,
     PRESETS,

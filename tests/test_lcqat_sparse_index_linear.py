@@ -14,16 +14,16 @@ easiest thing in this codebase to get backwards.
 import pytest
 import torch
 
-from nanochat.lcqat.ops.references.sparse_linear_reference import (
-    reference_masked_index_linear,
-    reference_sparse_index_linear,
-    validate_sparse_index_linear_inputs,
-)
-from nanochat.lcqat.sparse_artifact import (
+from nanochat.models.quant.sparse_artifact import (
     MIN_EXPORT_ALPHABET,
     pack_sparse_plan,
     plan_sparse_export,
     unpack_sparse_plan,
+)
+from nanochat.ops.references.sparse_linear_reference import (
+    reference_masked_index_linear,
+    reference_sparse_index_linear,
+    validate_sparse_index_linear_inputs,
 )
 
 

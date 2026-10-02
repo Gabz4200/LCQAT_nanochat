@@ -17,9 +17,9 @@ import math
 
 import torch
 
-from nanochat.engine import QuantizedKVCache
-from nanochat.gpt import GPT, GPTConfig
-from nanochat.lcqat.retrofit import PRESETS, get_layer_config, spec_k
+from nanochat.models.backbone import GPT, GPTConfig
+from nanochat.models.quant.retrofit import PRESETS, get_layer_config, spec_k
+from nanochat.modules.engine import QuantizedKVCache
 
 VOCAB = 32768
 KV_CONTEXT = 32768
@@ -81,7 +81,7 @@ def weight_bytes(model: GPT) -> tuple[int, int]:
         if spec is None:
             bf16 += p.numel() * 2  # embeddings / lm_head / gates: bf16
             continue
-        packed += out * bytes_per_index(spec_k(spec[0]))
+        packed += out * bytes_per_index(spec_k(spec.weight))
     return packed, bf16
 
 
@@ -93,9 +93,10 @@ def lut_bytes(model: GPT) -> int:
         spec = get_layer_config(name, PRESETS["prd"])
         if spec is None:
             continue
-        k_weight, k_act, quant_out, out_spec = spec
         total += (
-            spec_k(k_weight) + spec_k(k_act) + (spec_k(out_spec) if quant_out else 0)
+            spec_k(spec.weight)
+            + spec_k(spec.activation)
+            + (spec_k(spec.effective_output) if spec.quantize_output else 0)
         ) * 4
     return total
 

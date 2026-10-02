@@ -40,15 +40,15 @@ import time
 
 import torch
 
-from nanochat.checkpoint_manager import load_model
-from nanochat.common import (
+from nanochat.modules.checkpoint_manager import load_model
+from nanochat.modules.engine import Engine
+from nanochat.utils.common import (
     autodetect_device_type,
     compute_cleanup,
     compute_init,
     get_peak_bandwidth,
     get_peak_flops,
 )
-from nanochat.engine import Engine
 
 # -----------------------------------------------------------------------------
 # Measurement

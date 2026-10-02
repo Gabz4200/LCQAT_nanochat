@@ -29,8 +29,13 @@ import zipfile
 
 import yaml
 
-from nanochat.checkpoint_manager import load_model
-from nanochat.common import (
+from nanochat.data.dataloader import tokenizing_distributed_data_loader_bos_bestfit
+from nanochat.data.tokenizer import get_token_bytes
+from nanochat.modules.checkpoint_manager import load_model
+from nanochat.modules.core_eval import evaluate_task
+from nanochat.modules.engine import Engine
+from nanochat.modules.loss_eval import evaluate_bpb
+from nanochat.utils.common import (
     autodetect_device_type,
     compute_cleanup,
     compute_init,
@@ -38,11 +43,6 @@ from nanochat.common import (
     get_base_dir,
     print0,
 )
-from nanochat.core_eval import evaluate_task
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.engine import Engine
-from nanochat.loss_eval import evaluate_bpb
-from nanochat.tokenizer import get_token_bytes
 
 # -----------------------------------------------------------------------------
 # CORE evaluation

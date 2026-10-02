@@ -8,7 +8,7 @@ python -m pytest tests/test_tokenizer.py -v
 
 import pytest
 
-from nanochat.tokenizer import SPECIAL_TOKENS, RustBPETokenizer
+from nanochat.data.tokenizer import SPECIAL_TOKENS, RustBPETokenizer
 
 # a small corpus is enough to exercise the BPE machinery
 CORPUS = [

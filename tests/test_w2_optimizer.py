@@ -18,16 +18,19 @@ engine's LC-QAT layers were substituted rather than re-parented in place.
 import pytest
 import torch
 
-from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
-from nanochat.lcqat import PRESETS, retrofit_model
-from nanochat.lcqat.optimizer import (
+from nanochat.models.quant import PRESETS, retrofit_model
+from nanochat.models.quant.optimizer import (
     ROLE_ORDER,
     build_qat_param_groups,
     is_codebook_param,
     role_for_name,
     verify_partition,
 )
-from nanochat.lcqat.retrofit import DEFAULT_PRESET
+from nanochat.models.quant.retrofit import DEFAULT_PRESET
+from nanochat.training.diffusion_blocks import (
+    DiffusionBlockEngine,
+    EquiProbabilityPartitioner,
+)
 from tests.conftest import build_active_tiny_gpt
 
 

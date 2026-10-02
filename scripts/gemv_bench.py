@@ -20,9 +20,9 @@ import time
 
 import torch
 
-from nanochat.lcqat.kernels.gpu_loader import vulkan_available
-from nanochat.lcqat.ops import dispatch_gemv, dispatch_index_linear
-from nanochat.lcqat.packing import pack_weight_indices
+from nanochat.models.quant.packing import pack_weight_indices
+from nanochat.ops import dispatch_gemv, dispatch_index_linear
+from nanochat.ops.kernels.gpu_loader import vulkan_available
 
 
 def dequantize(act_indices, act_lut, weight_indices, scale_neg, scale_pos):

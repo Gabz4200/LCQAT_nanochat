@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nanochat.lcqat import LCQATLinear
+from nanochat.models.quant import LCQATLinear
 
 
 def from_float(

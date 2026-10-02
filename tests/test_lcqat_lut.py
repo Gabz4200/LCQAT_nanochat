@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from nanochat.lcqat import compile_activation_lut
+from nanochat.models.quant import compile_activation_lut
 
 
 def make_codebook(K: int, span: float = 2.0) -> torch.Tensor:

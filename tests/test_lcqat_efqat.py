@@ -2,9 +2,9 @@
 
 import torch
 
-from nanochat.gpt import GPT, GPTConfig
-from nanochat.lcqat import PRESETS, retrofit_model
-from nanochat.lcqat.efqat import CRITICAL_PATTERNS, SelectiveFreezer
+from nanochat.models.backbone import GPT, GPTConfig
+from nanochat.models.quant import PRESETS, retrofit_model
+from nanochat.models.quant.efqat import CRITICAL_PATTERNS, SelectiveFreezer
 
 
 def _tiny_lcqat_model():

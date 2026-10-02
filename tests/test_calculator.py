@@ -8,7 +8,7 @@ python -m pytest tests/test_calculator.py -v
 
 import pytest
 
-from nanochat.engine import safe_eval_expression, use_calculator
+from nanochat.modules.engine import safe_eval_expression, use_calculator
 
 
 @pytest.mark.parametrize(

@@ -14,12 +14,12 @@ Covers the two DiffusionBlocks invariants the memory argument rests on:
 
 import torch
 
-from nanochat.diffusion_blocks import (
+from nanochat.models.quant.efqat import SelectiveFreezer
+from nanochat.training.diffusion_blocks import (
     DiffusionBlockEngine,
     EquiProbabilityPartitioner,
     _layer_groups,
 )
-from nanochat.lcqat.efqat import SelectiveFreezer
 from tests.conftest import build_active_tiny_gpt
 
 
@@ -153,7 +153,7 @@ def _fresh_block_like(model, layer_idx: int) -> torch.nn.Module:
     derived by the same `has_ve(layer_idx, n_layer)` rule the model uses, instead
     of being copied from a block that was built for a different index.
     """
-    from nanochat.gpt import Block
+    from nanochat.models.backbone import Block
 
     block = Block(model.config, layer_idx)
     block.to_empty(device=next(model.transformer.h[0].parameters()).device)

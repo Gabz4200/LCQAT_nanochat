@@ -8,7 +8,7 @@ next-token CE with block-isolated gradients) is the escape hatch.
 
 import torch
 
-from nanochat.diffusion_blocks import (
+from nanochat.training.diffusion_blocks import (
     EquiProbabilityPartitioner,
     block_diagonal_mask,
     edm_preconditioning,

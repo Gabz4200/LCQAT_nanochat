@@ -13,11 +13,14 @@ one.
 
 import torch
 
-from nanochat.checkpoint_manager import load_checkpoint, save_checkpoint
-from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
-from nanochat.lcqat import PRESETS, inject_sparseprop_layers, retrofit_model
-from nanochat.lcqat.retrofit import DEFAULT_PRESET
-from nanochat.lcqat.sparseprop import SparsePropLinear
+from nanochat.models.quant import PRESETS, inject_sparseprop_layers, retrofit_model
+from nanochat.models.quant.retrofit import DEFAULT_PRESET
+from nanochat.models.quant.sparseprop import SparsePropLinear
+from nanochat.modules.checkpoint_manager import load_checkpoint, save_checkpoint
+from nanochat.training.diffusion_blocks import (
+    DiffusionBlockEngine,
+    EquiProbabilityPartitioner,
+)
 from tests.conftest import build_active_tiny_gpt
 
 

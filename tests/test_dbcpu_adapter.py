@@ -10,7 +10,7 @@ freshly-built model byte-identical to the unconditioned one.
 import pytest
 import torch
 
-from nanochat.diffusion_blocks import (
+from nanochat.training.diffusion_blocks import (
     NoiseConditionedBlockAdapter,
     sinusoidal_noise_embedding,
 )

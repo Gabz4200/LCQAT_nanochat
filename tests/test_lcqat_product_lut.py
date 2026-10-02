@@ -14,7 +14,7 @@ the fused one is the newer and therefore the more suspect.
 import pytest
 import torch
 
-from nanochat.lcqat.product_lut import (
+from nanochat.models.quant.product_lut import (
     MAX_PRODUCT_TABLE_ENTRIES,
     build_product_table,
     flatten_product_table,

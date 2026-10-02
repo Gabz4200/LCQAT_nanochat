@@ -14,7 +14,7 @@ to the pre-W1.4 block, or every checkpoint and caller breaks.
 
 import torch
 
-from nanochat.diffusion_blocks import NoiseConditionedBlockAdapter
+from nanochat.training.diffusion_blocks import NoiseConditionedBlockAdapter
 from tests.conftest import build_active_tiny_gpt
 
 
@@ -47,7 +47,7 @@ def test_when_cond_is_none_then_the_block_is_the_plain_nanochat_block():
 
 def test_when_cond_is_none_then_it_matches_an_unconditioned_reference():
     """Recompute the block by hand: pre-norm, attn residual, pre-norm, mlp residual."""
-    from nanochat.gpt import norm
+    from nanochat.models.backbone import norm
 
     torch.manual_seed(0)
     model = build_active_tiny_gpt()

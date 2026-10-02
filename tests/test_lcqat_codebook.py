@@ -12,7 +12,7 @@ python -m pytest tests/test_lcqat_codebook.py -v
 import pytest
 import torch
 
-from nanochat.lcqat import MemoryEfficientLearnedCodebook
+from nanochat.models.quant import MemoryEfficientLearnedCodebook
 
 # (m_neg, m_pos) shapes exercised below. The one-sided cases are the ones that
 # motivated the asymmetry: m_neg=0 and m_pos=0 both give even K=8.

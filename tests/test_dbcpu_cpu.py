@@ -2,7 +2,7 @@
 
 import torch
 
-from nanochat.diffusion_blocks import (
+from nanochat.training.diffusion_blocks import (
     DiffusionBlockEngine,
     EquiProbabilityPartitioner,
     configure_cpu_training,

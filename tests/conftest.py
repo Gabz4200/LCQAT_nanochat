@@ -3,9 +3,9 @@
 import pytest
 import torch
 
-from nanochat.gpt import GPT, GPTConfig
-from nanochat.lcqat import PRESETS, retrofit_model
-from nanochat.lcqat.retrofit import DEFAULT_PRESET
+from nanochat.models.backbone import GPT, GPTConfig
+from nanochat.models.quant import PRESETS, retrofit_model
+from nanochat.models.quant.retrofit import DEFAULT_PRESET
 
 
 def build_tiny_gpt() -> GPT:

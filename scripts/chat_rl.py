@@ -24,8 +24,17 @@ import torch
 import torch.distributed as dist
 import wandb
 
-from nanochat.checkpoint_manager import load_model, save_checkpoint
-from nanochat.common import (
+from nanochat.models.quant import lcqat_config_from_args, retrofit_summary
+from nanochat.models.quant.optimizer import build_qat_param_groups, verify_partition
+from nanochat.models.quant.retrofit import LayerKConfig
+from nanochat.modules.checkpoint_manager import load_model, save_checkpoint
+from nanochat.modules.engine import Engine
+from nanochat.tasks.gsm8k import GSM8K
+from nanochat.training.diffusion_blocks import (
+    DiffusionBlockEngine,
+    EquiProbabilityPartitioner,
+)
+from nanochat.utils.common import (
     DummyWandb,
     autodetect_device_type,
     compute_cleanup,
@@ -33,12 +42,6 @@ from nanochat.common import (
     get_base_dir,
     print0,
 )
-from nanochat.diffusion_blocks import DiffusionBlockEngine, EquiProbabilityPartitioner
-from nanochat.engine import Engine
-from nanochat.lcqat import lcqat_config_from_args, retrofit_summary
-from nanochat.lcqat.optimizer import build_qat_param_groups, verify_partition
-from nanochat.lcqat.retrofit import LayerKConfig
-from tasks.gsm8k import GSM8K
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -207,7 +210,7 @@ parser.add_argument(
     default=0.75,
     help="sparsity level for SparseProp (fraction of weights pruned, 0.0-1.0)",
 )
-from nanochat.lcqat.pruning import (  # noqa: E402
+from nanochat.models.quant.pruning import (  # noqa: E402
     add_sparseprop_pruning_args,
     schedule_from_args,
 )
@@ -219,7 +222,7 @@ add_sparseprop_pruning_args(parser)
 # apart. Only the latch and the per-channel quantizer are usable here; the two
 # EDM-only features are rejected at startup by `require_edm_objective` in the
 # guard below, for the same structural reason `--db-objective edm` is.
-from nanochat.lcqat.w6 import (  # noqa: E402
+from nanochat.models.quant.w6 import (  # noqa: E402
     add_w6_args,
     describe_sigma_codebooks,
     make_latch_freezer,

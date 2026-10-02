@@ -10,7 +10,7 @@ import time
 
 import pytest
 
-from nanochat.execution import execute_code
+from nanochat.modules.execution import execute_code
 
 
 def test_happy_path():

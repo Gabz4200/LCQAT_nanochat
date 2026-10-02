@@ -16,8 +16,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nanochat.lcqat.learnable_lut import LearnableIndexLut, bake_learnable_table
-from nanochat.lcqat.linear import LCQATLinear
+from nanochat.models.quant.learnable_lut import LearnableIndexLut, bake_learnable_table
+from nanochat.models.quant.linear import LCQATLinear
 
 
 def build_mlp(k_weight: int = 3, k_act: int = 15, quantize_out: bool = True):

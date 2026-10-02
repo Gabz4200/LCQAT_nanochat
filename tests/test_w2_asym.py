@@ -1,6 +1,6 @@
 """The asymmetric codebook split and the `asym` preset (W2.1-W2.4).
 
-The motivation is concrete and lives in `nanochat/gpt.py`:
+The motivation is concrete and lives in `nanochat/models/backbone.py`:
 
     x = F.relu(x).square()   # MLP.forward
 
@@ -16,9 +16,9 @@ old odd-K constraint made impossible.
 import pytest
 import torch
 
-from nanochat.lcqat import PRESETS, LCQATLinear, retrofit_model
-from nanochat.lcqat.codebook import MemoryEfficientLearnedCodebook
-from nanochat.lcqat.retrofit import (
+from nanochat.models.quant import PRESETS, LCQATLinear, retrofit_model
+from nanochat.models.quant.codebook import MemoryEfficientLearnedCodebook
+from nanochat.models.quant.retrofit import (
     DEFAULT_PRESET,
     get_layer_config,
     prepare_lcqat_before_load,
@@ -41,14 +41,12 @@ def test_when_asym_preset_then_mlp_non_negative_tensors_get_one_sided_codebooks(
     cfg = PRESETS[DEFAULT_PRESET]
     c_fc = get_layer_config("transformer.h.0.mlp.c_fc", cfg)
     assert c_fc is not None
-    _, _, quantize_out, out_spec = c_fc
-    assert quantize_out is True
-    assert out_spec == (0, 7)
+    assert c_fc.quantize_output is True
+    assert c_fc.output == (0, 7)
 
     c_proj = get_layer_config("transformer.h.0.mlp.c_proj", cfg)
     assert c_proj is not None
-    _, act_spec, _, _ = c_proj
-    assert act_spec == (0, 7)
+    assert c_proj.activation == (0, 7)
 
 
 def test_when_asym_preset_then_attention_tensors_keep_both_sides():
@@ -63,8 +61,10 @@ def test_when_asym_preset_then_attention_tensors_keep_both_sides():
     ):
         spec = get_layer_config(name, cfg)
         assert spec is not None
-        assert spec[0][0] > 0, f"{name} weight codebook should have negative levels"
-        assert spec[1][0] > 0, f"{name} activation codebook should have negative levels"
+        assert spec.weight[0] > 0, f"{name} weight codebook should have negative levels"
+        assert spec.activation[0] > 0, (
+            f"{name} activation codebook should have negative levels"
+        )
 
 
 def test_when_one_sided_codebook_then_every_level_is_non_negative():

@@ -48,11 +48,19 @@ errors fail the aislop gate.
 
 ## Engineering guardrails for this repo
 
+- **The core does not import the shell.** `nanochat/models/` must not import from
+  `modules/`, `training/`, `data/`, `callbacks/`, `utils/` or `tasks/`. Report a
+  model-layer fact with `warnings.warn` or by returning a value, not by calling
+  `print0`. A model decision that the layers consume (e.g. `COMPUTE_DTYPE` in
+  `nanochat/models/dtype.py`) belongs in the core, with the shell free to
+  re-export it. `nanochat/models/ -> nanochat/ops/` is the one sanctioned
+  exception: `ops` is the kernel boundary. `nanochat/modules/experiments/` is
+  harness, not model math — measurements there may import `training/`.
 - **Behavior over bytes.** Quantization rewrites of `Linear` must preserve the
   forward value (straight-through estimator) and must pass three-way parity
-  `naive == cpu == gpu` (see `nanochat/lcqat/ops/` references).
+  `naive == cpu == gpu` (see `nanochat/ops/` references).
 - **JIT kernels are cached per user.** Native C++ ops under
-  `nanochat/lcqat/native/cpu/` build into `~/.cache/torch_extensions`. Any
+  `nanochat/ops/native/cpu/` build into `~/.cache/torch_extensions`. Any
   kernel change is a cache-bust for downstream users; keep diffs minimal and
   comment the C++/Python contract.
 - **No silent backend fallback.** `dispatch_gemv`, `dispatch_index_linear`, and
@@ -72,12 +80,32 @@ errors fail the aislop gate.
 
 ## File layout reference
 
+The package follows a functional-core / imperative-shell split:
+
+| Package | Role |
+|---------|------|
+| `nanochat/models/` | **Functional core** — pure tensor math, no I/O or optimizer |
+| `nanochat/models/quant/` | LC-QAT: codebooks, `LCQATLinear`, export, ablation |
+| `nanochat/ops/` | Kernel layer — dispatcher, references, native C++, Taichi |
+| `nanochat/modules/` | Imperative shell — checkpoints, inference engine, eval |
+| `nanochat/training/` | DiffusionBlocks engine + optimizers |
+| `nanochat/data/` | Ingestion boundary — dataloader, dataset, tokenizer |
+| `nanochat/callbacks/` | Side-effect observers — W&B logging, GC, run summary |
+| `nanochat/utils/` | `COMPUTE_DTYPE` and misc helpers |
+
+Specific files:
+
+- Transformer backbone: `nanochat/models/backbone.py` (`GPT`, `GPTConfig`, `Linear`)
+- Typed contracts: `nanochat/models/io.py` (`LayerQuantSpec`, `CodebookSpec`)
 - Training entry points: `scripts/{base_train,chat_sft,chat_rl,base_eval,chat_eval,chat_cli}.py`
-- Quantization core: `nanochat/lcqat/{retrofit,linear,codebook,kd,efqat,lut,packing,export,sparseprop}.py`
-- Native kernels: `nanochat/lcqat/native/cpu/{gemv,index_linear,quant_attn,sparseprop}.cpp`
-- Op dispatch: `nanochat/lcqat/ops/{dispatch,gemv,index_linear,quant_attn,sparseprop}.py` (+ `references/` oracles)
-- Kernel loaders: `nanochat/lcqat/kernels/{cpu_loader,gpu_loader}.py`
-- DiffusionBlocks: `nanochat/diffusion_blocks.py` (`DiffusionBlockEngine`, `EquiProbabilityPartitioner`)
-- Runtime: `nanochat/{gpt,engine,flash_attention,tokenizer,optim,checkpoint_manager}.py`
+- `base_train` internals: `scripts/_train/{build,loop,eval}.py`
+- Quantization core: `nanochat/models/quant/{retrofit,linear,codebook,kd,efqat,lut,packing,export,sparseprop}.py`
+- Ablation experiments: `nanochat/modules/experiments/` (one module each)
+- Native kernels: `nanochat/ops/native/cpu/{gemv,index_linear,quant_attn,sparseprop}.cpp`
+- Op dispatch: `nanochat/ops/{dispatch,gemv,index_linear,quant_attn,sparseprop}.py` (+ `references/` oracles)
+- Kernel loaders: `nanochat/ops/kernels/{cpu_loader,gpu_loader}.py`
+- DiffusionBlocks: `nanochat/training/diffusion_blocks.py` (`DiffusionBlockEngine`, `EquiProbabilityPartitioner`)
 - Tests: `tests/test_lcqat_*` (parity + opcheck + runtime), `tests/test_sparseprop*`,
-  `tests/test_dbcpu_*`, `tests/test_adamw_cpu.py`, `tests/test_calculator.py`
+  `tests/test_dbcpu_*`, `tests/test_numerical_fingerprint.py` (behavior gate),
+  `tests/test_architecture_boundary.py` (core->shell import rule),
+  `tests/test_adamw_cpu.py`, `tests/test_calculator.py`

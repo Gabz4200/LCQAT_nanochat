@@ -9,11 +9,11 @@ python -m pytest tests/test_lcqat_ops.py -v
 import pytest
 import torch
 
-from nanochat.lcqat.kernels.gpu_loader import vulkan_available
-from nanochat.lcqat.ops import dispatch_gemv
-from nanochat.lcqat.ops.gemv import _ensure_cpu_op, ternary_scales
-from nanochat.lcqat.ops.references.gemv_reference import reference_gemv_k3
-from nanochat.lcqat.packing import pack_nibbles, pack_trits
+from nanochat.models.quant.packing import pack_nibbles, pack_trits
+from nanochat.ops import dispatch_gemv
+from nanochat.ops.gemv import _ensure_cpu_op, ternary_scales
+from nanochat.ops.kernels.gpu_loader import vulkan_available
+from nanochat.ops.references.gemv_reference import reference_gemv_k3
 
 requires_vulkan = pytest.mark.skipif(
     not vulkan_available(), reason="Vulkan device unavailable for the Taichi backend"
@@ -134,7 +134,7 @@ def test_when_compile_naive_backend_then_composes() -> None:
 def test_when_compile_codebook_quantization_then_composes() -> None:
     # base_train runs the retrofitted model under torch.compile; bucketize and
     # the STE identity must survive tracing.
-    from nanochat.lcqat import MemoryEfficientLearnedCodebook
+    from nanochat.models.quant import MemoryEfficientLearnedCodebook
 
     cb = MemoryEfficientLearnedCodebook.from_k(15, init_min=-2.0, init_max=2.0)
     x = torch.randn(64)

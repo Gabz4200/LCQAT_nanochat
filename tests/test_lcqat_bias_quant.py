@@ -25,9 +25,9 @@ import pytest
 import torch
 import torch.nn as nn
 
-from nanochat.lcqat.bias_quant import BiasQuantizer, measure_bias_quantization
-from nanochat.lcqat.linear import GRAD_SCALE_NONE, LCQATLinear
-from nanochat.lcqat.retrofit import (
+from nanochat.models.quant.bias_quant import BiasQuantizer, measure_bias_quantization
+from nanochat.models.quant.linear import GRAD_SCALE_NONE, LCQATLinear
+from nanochat.models.quant.retrofit import (
     CODEBOOK_SPEC_FIELDS,
     PRESETS,
     LayerKConfig,
@@ -310,7 +310,7 @@ class TestPersistence:
         is the reason it wraps `MemoryEfficientLearnedCodebook` instead of
         holding its own parameters.
         """
-        from nanochat.lcqat.optimizer import build_qat_param_groups
+        from nanochat.models.quant.optimizer import build_qat_param_groups
 
         linear = quantized(quantize_bias=True)
         groups = build_qat_param_groups(linear, matrix_lr=3e-4, weight_decay=0.1)
@@ -623,7 +623,7 @@ class TestRetrofitPath:
         self,
     ) -> None:
         """A checkpoint saved before this field existed must still load."""
-        from nanochat.lcqat.retrofit import LayerKConfig
+        from nanochat.models.quant.retrofit import LayerKConfig
 
         data = PRESETS["asym"].as_dict()
         data.pop("quantize_bias", None)

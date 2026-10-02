@@ -60,8 +60,8 @@ def validate_quant_attn_inputs(
     if n_head % h_kv != 0:
         raise ValueError(f"n_head {n_head} not divisible by H_kv {h_kv}")
     k = k_lut.shape[1]
-    if k < 3 or k > 15 or k % 2 != 1:
-        raise ValueError(f"LUT K must be odd in [3, 15], got {k}")
+    if k < 3 or k > 15:
+        raise ValueError(f"LUT K must be in [3, 15] (nibble-packed), got {k}")
     for label, x in (("q", q), ("k_lut", k_lut), ("v_lut", v_lut)):
         if x.dtype != torch.float32:
             raise ValueError(f"{label} must be float32, got {x.dtype}")

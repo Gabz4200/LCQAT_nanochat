@@ -170,24 +170,71 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+def maybe_sigma_call(layer, x, sigma):
+    """Call `layer(x)`, passing `sigma` only if the layer wants it.
+
+    The decision is made on the layer's activation quantizer, which is the only
+    thing that can consume sigma. Duck-typing here rather than on the class
+    keeps `gpt.py` free of any import-time dependency on the `lcqat` package,
+    and means a plain `nn.Linear` and a retrofitted `LCQATLinear` both work
+    through the same call site.
+    """
+    quantizer = getattr(layer, "act_quantizer", None)
+    if quantizer is not None and getattr(quantizer, "needs_sigma", False):
+        return layer(x, sigma=sigma)
+    return layer(x)
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
 
-    def forward(self, x):
+    def forward(self, x, sigma=None):
         # Quantized-inference runtime (LC-QAT PRD 6): once export has installed
         # packed weights + the relu^2 index table, the elementwise op runs as
         # an index->index gather instead of float math. Duck-typed so gpt.py
         # keeps no import-time dependency on the lcqat package.
+        #
+        # `sigma` is forwarded only to the float path: the fused index path
+        # reads static LUTs, and a sigma-conditioned codebook would need a
+        # per-sigma table it does not have. Guarded rather than assumed, so a
+        # conditioned codebook + exported buffers fails loudly instead of
+        # silently quantizing with the wrong levels.
         c_fc = self.c_fc
         buffers = getattr(c_fc, "_buffers", {})
         if "activation_lut" in buffers and "packed_weight_indices" in buffers:
+            if getattr(getattr(c_fc, "act_quantizer", None), "needs_sigma", False):
+                raise RuntimeError(
+                    "a sigma-conditioned activation codebook cannot use the fused "
+                    "index path: the exported activation_lut is a single static "
+                    "table, and per-sigma levels would need one table per noise "
+                    "level. Export with a static codebook, or keep this layer in "
+                    "the float path."
+                )
             return c_fc.quantized_mlp_chain(x, self.c_proj)
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
+        # `sigma` is forwarded only to sigma-conditioned layers. A plain
+        # `nn.Linear` does not accept the keyword, and duck-typing on the
+        # quantizer -- not on the class -- is what keeps the float path working
+        # without a second code path here.
+        x = maybe_sigma_call(self.c_fc, x, sigma)
+        # When a *trained* activation table is attached, the elementwise op runs
+        # through it instead of `F.relu(x).square()`. This is what makes
+        # `--lcqat-lut-relaxation` / `--lcqat-act-body` do anything: the table is
+        # only reachable from the export-time fused chain otherwise, so its
+        # parameters would never receive a gradient and training would silently
+        # optimise the float activation while export baked a different one.
+        #
+        # The emitted value is identical either way -- `LearnableIndexLut.forward`
+        # returns exactly what `resolved_table()` gathers -- so switching this on
+        # changes the gradient, not the forward number. A layer without a table
+        # (every layer by default) takes the float path unchanged.
+        if getattr(c_fc, "learnable_activation_lut", None) is not None:
+            x = c_fc.apply_trained_activation(x)
+        else:
+            x = F.relu(x).square()
+        x = maybe_sigma_call(self.c_proj, x, sigma)
         return x
 
 
@@ -197,11 +244,46 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache=None, attn_mask=None):
-        x = x + self.attn(
-            norm(x), ve, cos_sin, window_size, kv_cache, attn_mask=attn_mask
-        )
-        x = x + self.mlp(norm(x))
+    def forward(
+        self,
+        x,
+        ve,
+        cos_sin,
+        window_size,
+        kv_cache=None,
+        attn_mask=None,
+        cond=None,
+        sigma=None,
+    ):
+        """
+        `cond` is an optional `(gamma, beta)` AdaLN pair, each shaped
+        `(B, 1, n_embd)`, applied to the *pre-norm* inputs of both sublayers
+        (DiT-style). DiffusionBlocks uses it to condition each layer on the
+        diffusion noise level, per Step 3 of that paper: conditioning has to live
+        inside the block, because a modulation applied to the block's input
+        stream would normalize the residual stream and destroy the residual
+        identity the method's Euler-step interpretation depends on.
+
+        `sigma` is the raw noise level per batch element, shaped `(B, 1, 1)`. It
+        is passed alongside `cond` rather than being derived from it, because
+        `cond` is an already-projected modulation pair: recovering sigma from it
+        would be an inversion of a learned map, and the two projections are
+        free to become non-injective. Only the LC-QAT sigma-conditioned codebooks
+        read it, and they need the true noise level, not a proxy.
+
+        Defaults `None` are the plain nanochat block, bit for bit, so every
+        existing caller, checkpoint, and test is unaffected.
+        """
+        h = norm(x)
+        if cond is not None:
+            gamma, beta = cond
+            h = h * (1.0 + gamma) + beta
+        x = x + self.attn(h, ve, cos_sin, window_size, kv_cache, attn_mask=attn_mask)
+        m = norm(x)
+        if cond is not None:
+            gamma, beta = cond
+            m = m * (1.0 + gamma) + beta
+        x = x + self.mlp(m, sigma=sigma)
         return x
 
 
@@ -508,7 +590,8 @@ class GPT(nn.Module):
         Returns a dict with counts for each parameter group, so downstream analysis
         can experiment with which combination gives the cleanest scaling laws.
         """
-        # Count each group separately (mirrors the grouping in setup_optimizers)
+        # Count each group separately (mirrors the role split in
+        # nanochat.lcqat.optimizer.build_qat_param_groups)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
@@ -544,126 +627,6 @@ class GPT(nn.Module):
             "scalars": scalars,
             "total": total,
         }
-
-    def setup_optimizer(
-        self,
-        unembedding_lr=0.004,
-        embedding_lr=0.2,
-        matrix_lr=0.02,
-        weight_decay=0.0,
-        scalar_lr=0.5,
-        codebook_lr=1e-3,
-    ):
-        model_dim = self.config.n_embd
-
-        # Separate out all parameters into groups. Codebook step params (LC-QAT PRD
-        # section 5) live inside LCQATLinear modules: they get their own AdamW group
-        # with a dedicated LR and no weight decay, and never reach the matrix AdamW group (they are 1-D).
-        codebook_params = [
-            p for n, p in self.named_parameters() if _is_codebook_param(n)
-        ]
-        codebook_ids = {id(p) for p in codebook_params}
-        matrix_params = [
-            p for p in self.transformer.h.parameters() if id(p) not in codebook_ids
-        ]
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(
-            embedding_params
-        ) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(
-            x0_params
-        ) + len(smear_params) + len(codebook_params)
-
-        # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
-        dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print0(
-            f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}"
-        )
-
-        # Build param_groups with all required fields explicit
-        param_groups = [
-            # AdamW groups (embeddings, lm_head, scalars)
-            dict(
-                kind="adamw",
-                params=lm_head_params,
-                lr=unembedding_lr * dmodel_lr_scale,
-                betas=(0.8, 0.96),
-                eps=1e-10,
-                weight_decay=0.01,
-            ),
-            dict(
-                kind="adamw",
-                params=embedding_params,
-                lr=embedding_lr * dmodel_lr_scale,
-                betas=(0.8, 0.995),
-                eps=1e-10,
-                weight_decay=0.001,
-            ),
-            dict(
-                kind="adamw",
-                params=value_embeds_params,
-                lr=embedding_lr * dmodel_lr_scale * 0.5,
-                betas=(0.8, 0.995),
-                eps=1e-10,
-                weight_decay=0.01,
-            ),
-            dict(
-                kind="adamw",
-                params=resid_params,
-                lr=scalar_lr * 0.01,
-                betas=(0.8, 0.95),
-                eps=1e-10,
-                weight_decay=0.05,
-            ),
-            dict(
-                kind="adamw",
-                params=x0_params,
-                lr=scalar_lr,
-                betas=(0.96, 0.95),
-                eps=1e-10,
-                weight_decay=0.0,
-            ),  # higher beta1 for x0
-            dict(
-                kind="adamw",
-                params=smear_params,
-                lr=0.2,
-                betas=(0.8, 0.95),
-                eps=1e-10,
-                weight_decay=0.0,
-            ),
-        ]
-        # Codebook group (LC-QAT PRD section 5: dedicated LR, no weight decay)
-        if codebook_params:
-            param_groups.append(
-                dict(
-                    kind="adamw",
-                    params=codebook_params,
-                    lr=codebook_lr * dmodel_lr_scale,
-                    betas=(0.8, 0.95),
-                    eps=1e-10,
-                    weight_decay=0.0,
-                )
-            )
-        # Matrix params (all transformer blocks) into AdamW
-        param_groups.append(
-            dict(
-                kind="adamw",
-                params=matrix_params,
-                lr=matrix_lr,
-                betas=(0.8, 0.95),
-                eps=1e-10,
-                weight_decay=weight_decay,
-            )
-        )
-
-        optimizer = torch.optim.AdamW(param_groups)
-        for group in optimizer.param_groups:
-            group["initial_lr"] = group["lr"]
-        return optimizer
 
     def forward(
         self, idx, targets=None, kv_cache=None, loss_reduction="mean", attn_mask=None

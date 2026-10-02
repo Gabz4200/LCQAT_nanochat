@@ -14,7 +14,10 @@ import torch
 import torch.nn.functional as F
 
 _TRIT_POWERS = torch.tensor([1, 3, 9, 27, 81], dtype=torch.int32)
-_TRITS_PER_BYTE = 5
+#: Values packed per byte in the K=3 trit format. Public because the sparse
+#: artifact's byte accounting needs it to compare layouts.
+TRITS_PER_BYTE = 5
+_TRITS_PER_BYTE = TRITS_PER_BYTE
 
 # Storage-format tags for weight indices (dtype chosen from the codebook
 # size K; persisted as a 0-dim int buffer next to each packed weight).
@@ -25,10 +28,15 @@ FORMAT_INT32 = 3  # K > 255: matches codebook.py index dtype
 
 
 def index_format_for_k(k: int) -> int:
-    """Select the weight-index storage format from the codebook size K."""
+    """Select the weight-index storage format from the codebook size K.
+
+    K may be even: the asymmetric split `K = m_neg + 1 + m_pos` is what makes a
+    one-sided codebook (m_neg = 0) and therefore true 2-bit (K=4) / 4-bit (K=16)
+    boundaries possible, so an odd-K requirement would defeat the point.
+    """
     k = int(k)
-    if k < 3 or k % 2 != 1:
-        raise ValueError(f"codebook size K must be an odd integer >= 3, got {k}")
+    if k < 3:
+        raise ValueError(f"codebook size K must be an integer >= 3, got {k}")
     if k == 3:
         return FORMAT_TRITS
     if k <= 15:
@@ -39,21 +47,27 @@ def index_format_for_k(k: int) -> int:
 
 
 def pack_weight_indices(indices: torch.Tensor, k: int) -> tuple[torch.Tensor, int]:
-    """Pack [m, n] weight indices into their K-selected storage format.
+    """Pack `[m, n]` weight indices into their K-selected storage format.
 
     Returns (packed, format_tag) where the tag is one of FORMAT_*.
+
+    A 2-D input keeps its two-dimensional shape in every format, including
+    nibbles: packing `[m, n]` into a flat vector and expecting the caller to
+    reshape back makes `unpack_weight_indices(packed, n, k)` return the wrong
+    shape for exactly the format the exported weights use. A 1-D input stays
+    1-D, which is what the sparse artifact's `nnz` values want.
     """
     fmt = index_format_for_k(k)
     if fmt == FORMAT_TRITS:
+        if indices.ndim == 1:
+            return pack_trits(indices.reshape(1, -1)), fmt
         return pack_trits(indices), fmt
     if fmt == FORMAT_NIBBLES:
         return pack_nibbles(indices), fmt
-    if fmt == FORMAT_UINT8:
-        if indices.numel() and int(indices.max()) >= k:
-            raise ValueError(f"weight index out of range for K={k}")
-        return indices.to(torch.uint8).contiguous(), fmt
     if indices.numel() and int(indices.max()) >= k:
         raise ValueError(f"weight index out of range for K={k}")
+    if fmt == FORMAT_UINT8:
+        return indices.to(torch.uint8).contiguous(), fmt
     return indices.to(torch.int32).contiguous(), fmt
 
 
@@ -136,7 +150,14 @@ def pack_nibbles(indices: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_nibbles(packed: torch.Tensor, n: int) -> torch.Tensor:
-    """Unpack nibble bytes back into [..., n] uint8 indices (even=low nibble)."""
+    """Unpack nibble bytes back into [..., n] uint8 indices (even=low nibble).
+
+    Round-trips `pack_nibbles`: a `[m, n]` input packs to `[m, ceil(n/2)]` and
+    unpacks back to `[m, n]`. The interleaving is applied per leading slice, so
+    each row of a matrix decodes independently -- a row-major decode of the
+    whole buffer would shift every row after the first by half a byte and is the
+    failure mode this reshape guards against.
+    """
     if packed.ndim == 0:
         raise ValueError("unpack_nibbles expects at least a 1-D tensor")
     if packed.shape[-1] * 2 < n:
@@ -144,7 +165,12 @@ def unpack_nibbles(packed: torch.Tensor, n: int) -> torch.Tensor:
             f"packed buffer too small: {packed.shape[-1]} bytes hold "
             f"{packed.shape[-1] * 2} nibbles, need {n}"
         )
-    low = packed & 0x0F
-    high = packed >> 4
-    interleaved = torch.stack([low, high], dim=-1).flatten(-2)[..., :n]
-    return interleaved.to(torch.uint8)
+    stacked = torch.stack([packed & 0x0F, packed >> 4], dim=-1)  # [..., B, 2]
+    if packed.ndim == 2:
+        # `[m, B]` packs interleave row-wise, so decode per row and drop each
+        # row's pad value from the final byte. Decoding the buffer as one flat
+        # stream would shift every row after the first by half a byte.
+        rows, byte_count = packed.shape
+        per_row = stacked.reshape(rows, byte_count * 2)[:, :n]
+        return per_row.to(torch.uint8)
+    return stacked.flatten(-2)[..., :n].to(torch.uint8)

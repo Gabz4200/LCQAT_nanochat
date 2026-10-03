@@ -389,11 +389,39 @@ def test_when_meta_config_present_then_it_wins_over_requested(
 
 
 def test_when_float8_module_then_retrofit_raises(tiny_gpt) -> None:
-    class FakeFloat8Linear(nn.Linear):
-        pass
+    """The mutual-exclusion guard, against the class `--fp8` actually installs.
 
-    tiny_gpt.lm_head = FakeFloat8Linear(256, 128, bias=False)
+    Previously this test used a stand-in that only borrowed the name, so it
+    pinned the name heuristic rather than the contract. Both paths are covered
+    below: the real class, and a look-alike that only carries the name.
+    """
+    from nanochat.models.fp8 import Float8Linear
+
+    tiny_gpt.lm_head = Float8Linear(256, 128, bias=False)
     # route it through a role that would otherwise be converted
-    tiny_gpt.transformer.h[0].mlp.c_fc = FakeFloat8Linear(256, 1024, bias=False)
+    tiny_gpt.transformer.h[0].mlp.c_fc = Float8Linear(256, 1024, bias=False)
     with pytest.raises(ValueError, match="fp8"):
         retrofit_model(tiny_gpt, PRESETS["small"])
+
+
+def test_when_a_lookalike_float8_class_then_retrofit_also_raises(tiny_gpt) -> None:
+    """A class from a build that does not expose `Float8Linear` for import.
+
+    `--fp8` layers are identified by name elsewhere in the codebase
+    (`scripts/_train/build.py`'s `num_fp8` count, `disable_fp8`), so the guard
+    keeps that as a fallback rather than relying on the import alone.
+    """
+
+    class SomeOtherBuildFloat8Linear(nn.Linear):
+        pass
+
+    tiny_gpt.transformer.h[0].mlp.c_fc = SomeOtherBuildFloat8Linear(
+        256, 1024, bias=False
+    )
+    with pytest.raises(ValueError, match="fp8"):
+        retrofit_model(tiny_gpt, PRESETS["small"])
+
+
+def test_when_a_plain_linear_then_the_fp8_guard_does_not_fire(tiny_gpt) -> None:
+    """A class whose name merely resembles fp8 must not be rejected."""
+    assert retrofit_model(tiny_gpt, PRESETS["small"]) is tiny_gpt

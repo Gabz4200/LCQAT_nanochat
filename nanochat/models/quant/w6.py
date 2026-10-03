@@ -272,11 +272,6 @@ def make_latch_freezer(engine, latch_spec: str, num_db_blocks: int):
     return BlockLatchFreezer(engine, engine.block_layers()), targets
 
 
-def latch_threshold(latch_after: int) -> int:
-    """The step at which latching fires; -1 means "immediately, at step 0"."""
-    return max(latch_after, 0)
-
-
 def strip_lcqat(root: nn.Module) -> int:
     """Replace every LC-QAT layer under `root` with a plain float `nn.Linear`.
 
@@ -292,9 +287,12 @@ def strip_lcqat(root: nn.Module) -> int:
     would otherwise stay in `parameters()`, invisible to `verify_partition`,
     which only walks the student.
 
-    `SparsePropLinearLCQAT` subclasses `LCQATLinear`, so it is caught by the
-    same check; the fresh `nn.Linear` also drops the sparse forward, which is the
-    other half of what "float twin" has to mean.
+    KNOWN GAP: this matches `LCQATLinear` only. `SparsePropLinearLCQAT`
+    subclasses `SparsePropLinear`, not `LCQATLinear`, so a sparse LC-QAT
+    layer is NOT stripped and survives into the twin. Widening the isinstance
+    would change what this function returns, so it is recorded here rather
+    than changed inside a behaviour-preserving pass -- the resume path is
+    where the twin is built after the retrofit, and that is where it bites.
     """
     from nanochat.models.quant.linear import LCQATLinear
 

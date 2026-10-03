@@ -42,11 +42,6 @@ LEARNED_LUT_SUFFIXES = (
     "learnable_activation_lut.levels",
 )
 
-#: Name prefixes for engine-owned (DiffusionBlocks) parameters. They train like
-#: matrices but must not fall into a `transformer.h`-derived group.
-ADAPTER_PREFIX = "db_adapters."
-HEAD_PREFIX = "db_denoise_heads."
-
 #: Scalar / gate parameter names, by role. Matched exactly: a `startswith` here
 #: would swallow unrelated submodules.
 _SCALAR_ROLES: dict[str, str] = {
@@ -122,23 +117,6 @@ def role_for_name(name: str) -> str:
     # Everything else: transformer block weights, engine-owned adapters and
     # denoise heads, and any module added later under the model tree.
     return "matrix"
-
-
-def split_codebook_params(
-    model: nn.Module,
-) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
-    """Partition a module's parameters into (matrix_params, codebook_params).
-
-    A parameter is a codebook step parameter iff its name ends with
-    `raw_pos_deltas` or `raw_neg_deltas`. One-sided codebooks (`m_neg=0`, the
-    MLP `relu^2` case) have no `raw_neg_deltas` at all, which is why detection
-    keys on the post side -- see also `retrofit.is_lcqat_state`.
-    """
-    matrix_params: list[nn.Parameter] = []
-    codebook_params: list[nn.Parameter] = []
-    for name, p in model.named_parameters():
-        (codebook_params if is_codebook_param(name) else matrix_params).append(p)
-    return matrix_params, codebook_params
 
 
 def build_qat_param_groups(

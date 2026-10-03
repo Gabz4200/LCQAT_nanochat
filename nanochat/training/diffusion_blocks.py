@@ -69,8 +69,7 @@ class NoiseConditionedBlockAdapter(nn.Module):
         silently skipping sigma would make `--db-sigma-codebook` a no-op on
         these two layers while still reporting itself as enabled.
         """
-        emb = sinusoidal_noise_embedding(torch.log(sigma), self.cond_dim).to(x.dtype)
-        c = emb
+        c = sinusoidal_noise_embedding(torch.log(sigma), self.cond_dim).to(x.dtype)
         for layer in self.mlp:
             if isinstance(layer, nn.Linear):
                 c = maybe_sigma_call(layer, c, sigma)
@@ -114,11 +113,6 @@ class EquiProbabilityPartitioner:
         self.sigma_data = sigma_data
         self.p_mean = p_mean
         self.p_std = p_std
-        self.distribution = distribution
-
-    @property
-    def noise_boundaries(self) -> torch.Tensor:
-        return self.boundaries()
 
     def _cdf(self, sigma: float) -> torch.Tensor:
         return _standard_normal_cdf(
@@ -144,18 +138,8 @@ class EquiProbabilityPartitioner:
         return torch.exp(self.p_mean + self.p_std * _standard_normal_icdf(u)).float()
 
     def boundaries(self) -> torch.Tensor:
-        lo = _standard_normal_cdf(
-            torch.tensor(
-                (math.log(self.sigma_min) - self.p_mean) / self.p_std,
-                dtype=torch.float64,
-            )
-        )
-        hi = _standard_normal_cdf(
-            torch.tensor(
-                (math.log(self.sigma_max) - self.p_mean) / self.p_std,
-                dtype=torch.float64,
-            )
-        )
+        lo = self._cdf(self.sigma_min)
+        hi = self._cdf(self.sigma_max)
         frac = torch.linspace(0.0, 1.0, self.num_blocks + 1, dtype=torch.float64)
         q = lo + frac * (hi - lo)
         q = q.clamp(1e-6, 1.0 - 1e-6)
@@ -406,10 +390,25 @@ class DiffusionBlockEngine:
         # way to tell a working anchor from one that never fired.
         self.last_kd_loss = 0.0
 
+    @property
+    def _owned(self) -> tuple[nn.Module, ...]:
+        """The subtrees this engine owns, in iteration order.
+
+        The single source of truth for "what does this engine contain". Every
+        whole-tree operation (`train`, `zero_grad`, `to`, `parameters`,
+        `modules`, the SparseProp count, `cpu_adamw_for`) iterates exactly
+        these, so adding a fourth owned subtree is a one-line change here
+        rather than a silent omission in one of them -- which is precisely
+        the failure the `modules()` docstring describes. `state_dict`,
+        `load_state_dict` and `named_parameters` deliberately do NOT use it:
+        their per-subtree key prefixes are a contract with the checkpoint and
+        with `_requires_grad_for`'s block routing.
+        """
+        return (self.model, self.adapters, self.denoise_heads)
+
     def train(self, mode: bool = True) -> "DiffusionBlockEngine":
-        self.model.train(mode)
-        self.adapters.train(mode)
-        self.denoise_heads.train(mode)
+        for owned in self._owned:
+            owned.train(mode)
         return self
 
     # aislop-ignore-next-line security/eval -- standard PyTorch nn.Module eval method
@@ -426,17 +425,15 @@ class DiffusionBlockEngine:
         return next(self.model.parameters()).device
 
     def zero_grad(self, set_to_none: bool = True) -> None:
-        self.model.zero_grad(set_to_none=set_to_none)
-        self.adapters.zero_grad(set_to_none=set_to_none)
-        self.denoise_heads.zero_grad(set_to_none=set_to_none)
+        for owned in self._owned:
+            owned.zero_grad(set_to_none=set_to_none)
 
     def __call__(self, *args, **kwargs):
         return self.model(*args, **kwargs)
 
     def to(self, *args, **kwargs) -> "DiffusionBlockEngine":
-        self.model.to(*args, **kwargs)
-        self.adapters.to(*args, **kwargs)
-        self.denoise_heads.to(*args, **kwargs)
+        for owned in self._owned:
+            owned.to(*args, **kwargs)
         return self
 
     def set_distiller(self, distiller) -> "DiffusionBlockEngine":
@@ -563,30 +560,17 @@ class DiffusionBlockEngine:
         # would leave the original reachable at its old path and register every
         # codebook parameter twice -- which AdamW rejects and which silently
         # doubled the codebook count before `verify_partition` existed.
-        for i, adapter in enumerate(self.adapters):
-            for j, linear in enumerate(adapter.mlp):
+        for adapter in self.adapters:
+            for linear in adapter.mlp:
                 if isinstance(linear, SparsePropLinear):
                     continue
                 if isinstance(linear, nn.Linear):
                     _wrap_sparseprop(linear, sparsity, with_lcqat, in_place=True)
-        count = sum(
+        return sum(
             1
-            for root in (self.model, self.adapters, self.denoise_heads)
-            for sub in root.modules()
+            for sub in self.modules()
             if isinstance(sub, (SparsePropLinear, SparsePropLinearLCQAT))
         )
-        return count
-
-    def kv_codebooks(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-(layer, head) K/V codebooks for the QuantizedKVCache (PRD 7.1).
-
-        Reads each block's attn.c_k/c_v out-quantizer. The PRD 7.1 storage
-        layout is per (layer, head), so the module codebook is repeated across
-        that layer's KV heads. Returns fp32 [n_layers, n_kv_head, K].
-        """
-        from nanochat.modules.engine import kv_codebooks_from_model
-
-        return kv_codebooks_from_model(self.model)
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         """Export full engine state (base model + adapters + denoise heads).
@@ -669,11 +653,7 @@ class DiffusionBlockEngine:
 
     def parameters(self) -> list[torch.nn.Parameter]:
         """Model + adapter + denoise head params for the optimizer."""
-        return (
-            list(self.model.parameters())
-            + list(self.adapters.parameters())
-            + list(self.denoise_heads.parameters())
-        )
+        return [p for owned in self._owned for p in owned.parameters()]
 
     def modules(self):
         """Model + adapter + denoise head modules, yielding the three subtrees.
@@ -684,20 +664,11 @@ class DiffusionBlockEngine:
         view, and duplicating the three-way iteration at each call site is how
         the set of owned subtrees drifts.
         """
-        yield from self.model.modules()
-        yield from self.adapters.modules()
-        yield from self.denoise_heads.modules()
+        for owned in self._owned:
+            yield from owned.modules()
 
     def block_layers(self) -> list[list[int]]:
         return _layer_groups(len(self.model.transformer.h), self.partitioner.num_blocks)
-
-    def _block_boundary_indices(self) -> list[int]:
-        """Cumulative layer counts per block (used to build block-diagonal masks)."""
-        groups = self.block_layers()
-        out = [0]
-        for g in groups:
-            out.append(out[-1] + len(g))
-        return out
 
     def _requires_grad_for(self, name: str, block_idx: int) -> bool:
         """Single arbiter for `requires_grad`, per parameter name.
@@ -784,9 +755,7 @@ class DiffusionBlockEngine:
         """Enable gradients for one block and return the block index used."""
         b = self.sample_block() if block_idx is None else int(block_idx)
         self._apply_requires_grad(b)
-        self.model.train()
-        self.adapters.train()
-        self.denoise_heads.train()
+        self.train()
         return b
 
     def train_step(
@@ -1079,9 +1048,13 @@ def configure_cpu_training(num_threads: int = 4) -> None:
 
 
 def cpu_adamw_for(engine: DiffusionBlockEngine, lr: float = 3e-4) -> torch.optim.AdamW:
-    params = list(engine.model.parameters()) + list(engine.adapters.parameters())
-    params += list(engine.denoise_heads.parameters())
-    return torch.optim.AdamW(params, lr=lr, weight_decay=0.01, fused=True)
+    """AdamW over every parameter the engine owns, fused for the CPU path.
+
+    Takes `engine.parameters()` rather than re-listing the owned subtrees: a
+    hand-written list here silently drops the parameters of any subtree added
+    later, and AdamW says nothing when it is handed a short list.
+    """
+    return torch.optim.AdamW(engine.parameters(), lr=lr, weight_decay=0.01, fused=True)
 
 
 def packed_lm_batch(

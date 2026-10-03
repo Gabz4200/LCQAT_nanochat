@@ -100,6 +100,14 @@ class AdamW(torch.optim.Optimizer):
     ) -> None:
         """Wait for reduce, compute AdamW updates, launch gather."""
         param_infos = info["param_infos"]
+        # The five group-level scalars are the same for every parameter in this
+        # group, so they are filled once here rather than per parameter: only
+        # `step` below is per-parameter.
+        self._adamw_lr_t.fill_(group["lr"])
+        self._adamw_beta1_t.fill_(group["betas"][0])
+        self._adamw_beta2_t.fill_(group["betas"][1])
+        self._adamw_eps_t.fill_(group["eps"])
+        self._adamw_wd_t.fill_(group["weight_decay"])
         for p, pinfo in param_infos.items():
             if pinfo["future"] is not None:
                 pinfo["future"].wait()
@@ -119,11 +127,6 @@ class AdamW(torch.optim.Optimizer):
             exp_avg_sq = state["exp_avg_sq"]
 
             self._adamw_step_t.fill_(step)
-            self._adamw_lr_t.fill_(group["lr"])
-            self._adamw_beta1_t.fill_(group["betas"][0])
-            self._adamw_beta2_t.fill_(group["betas"][1])
-            self._adamw_eps_t.fill_(group["eps"])
-            self._adamw_wd_t.fill_(group["weight_decay"])
 
             if is_small:
                 adamw_step_fused(
@@ -156,13 +159,12 @@ class AdamW(torch.optim.Optimizer):
                 future = dist.all_gather_into_tensor(
                     p, p_slice, async_op=True
                 ).get_future()
-                gather_list.append(dict(future=future, params=None))
+                gather_list.append(future)
 
     def _finish_gathers(self, gather_list: list) -> None:
         """Wait for all gathers to complete."""
-        for info in gather_list:
-            if info["future"] is not None:
-                info["future"].wait()
+        for future in gather_list:
+            future.wait()
 
     @torch.no_grad()
     def step(self, closure=None) -> float | None:  # type: ignore[override]
@@ -179,10 +181,9 @@ class AdamW(torch.optim.Optimizer):
 
         reduce_infos: list[dict] = []
         for group in self.param_groups:
-            # All groups are AdamW; 'kind' key tolerated for backward compatibility
             reduce_infos.append(self._reduce_adamw(group, world_size))
 
-        gather_list: list[dict] = []
+        gather_list: list = []
         for group, info in zip(self.param_groups, reduce_infos):
             self._compute_adamw(group, info, gather_list, rank, world_size)
 

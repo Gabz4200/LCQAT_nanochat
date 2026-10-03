@@ -19,6 +19,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 import argparse
 import itertools
 import os
+from dataclasses import asdict
 
 import torch
 import torch.distributed as dist
@@ -26,7 +27,7 @@ import wandb
 
 from nanochat.models.quant import lcqat_config_from_args, retrofit_summary
 from nanochat.models.quant.optimizer import build_qat_param_groups, verify_partition
-from nanochat.models.quant.retrofit import LayerKConfig
+from nanochat.models.quant.retrofit import LayerKConfig, add_lcqat_args
 from nanochat.modules.checkpoint_manager import load_model, save_checkpoint
 from nanochat.modules.engine import Engine
 from nanochat.tasks.gsm8k import GSM8K
@@ -64,52 +65,7 @@ parser.add_argument(
 parser.add_argument(
     "--model-step", type=int, default=None, help="model step to load from"
 )
-parser.add_argument(
-    "--no-lcqat",
-    action="store_false",
-    dest="lcqat",
-    default=True,
-    help="disable LC-QAT (default: LC-QAT is always on; pass this to run plain float training)",
-)
-parser.add_argument(
-    "--lcqat-preset",
-    type=str,
-    default="asym",
-    choices=["asym", "small", "prd"],
-    help=(
-        "per-layer K allocation. 'asym' (default) splits each codebook by sign, "
-        "giving m_neg=0 to the two non-negative MLP tensors so no level is spent "
-        "on a sign they never take. 'small' is the symmetric max-compression "
-        "table, 'prd' the PRD table."
-    ),
-)
-parser.add_argument(
-    "--lcqat-k-map",
-    type=str,
-    default="",
-    help="override K per module substring, e.g. 'mlp.c_proj:255/255'",
-)
-parser.add_argument(
-    "--codebook-lr",
-    type=float,
-    default=1e-3,
-    help="learning rate for codebook step parameters (PRD: 10-50x network weights)",
-)
-parser.add_argument(
-    "--codebook-grad-scale",
-    type=str,
-    default="inv_sqrt_n",
-    choices=["none", "inv_sqrt_n"],
-    help=(
-        "PRD 2.4 codebook gradient scaling. 'inv_sqrt_n' (default) scales the "
-        "codebook gradient by 1/sqrt(numel) -- in a 4096x4096 layer 16.7M "
-        "elements pool into one K-entry codebook, and unscaled the step "
-        "parameters oscillate relative to the weights. 'none' uses the plain "
-        "STE. Note the two interact multiplicatively with --codebook-lr: with "
-        "N = B*T*D in the millions the activation codebook gradient is ~1000x "
-        "smaller under 'inv_sqrt_n', so this is a real trade, not a free win."
-    ),
-)
+add_lcqat_args(parser)
 # Training horizon
 parser.add_argument(
     "--num-epochs", type=int, default=1, help="number of epochs over GSM8K"
@@ -317,7 +273,7 @@ if args.sparseprop:
             f"(scope={sparse_schedule.scope})"
         )
 
-engine = Engine(base_model, tokenizer)  # for sampling rollouts
+ar_engine = Engine(base_model, tokenizer)  # for sampling rollouts
 
 # -----------------------------------------------------------------------------
 # Rollout / sampling generator loop that yields batches of examples for training
@@ -356,7 +312,7 @@ def get_batch():
             seed = (
                 hash((step, example_idx, sampling_step)) & 0x7FFFFFFF
             )  # positive half of int32
-            generated_token_sequences_batch, masks_batch = engine.generate_batch(
+            generated_token_sequences_batch, masks_batch = ar_engine.generate_batch(
                 tokens,
                 num_samples=args.device_batch_size,
                 max_tokens=args.max_new_tokens,
@@ -411,7 +367,7 @@ def get_batch():
 def run_gsm8k_eval(
     task,
     tokenizer,
-    engine,
+    ar_engine,
     max_examples=None,
     num_samples=1,
     max_completion_tokens=256,
@@ -435,7 +391,7 @@ def run_gsm8k_eval(
         assert (
             num_samples <= args.device_batch_size
         )  # usually this is true. we can add a loop if not...
-        generated_token_sequences, masks = engine.generate_batch(
+        generated_token_sequences, masks = ar_engine.generate_batch(
             tokens,
             num_samples=num_samples,
             max_tokens=max_completion_tokens,
@@ -549,7 +505,7 @@ for step in range(num_steps):
         records_iter = run_gsm8k_eval(
             val_task,
             tokenizer,
-            engine,
+            ar_engine,
             num_samples=args.device_batch_size,
             max_examples=args.eval_examples,
             temperature=1.0,
@@ -680,9 +636,10 @@ for step in range(num_steps):
             args.model_tag if args.model_tag else f"d{depth}"
         )  # base the model tag on the depth of the base model
         checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
-        model_config_kwargs = (
-            model.config.__dict__
-        )  # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
+        # `asdict` (already used for the same meta key in `_train/build.py`)
+        # rather than `config.__dict__`, which hands the caller a live alias
+        # into the model's own config object.
+        model_config_kwargs = asdict(model.config)
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -714,7 +671,7 @@ for step in range(num_steps):
                 },
             },
         )
-        print(f"✅ Saved model checkpoint to {checkpoint_dir}")
+        print0(f"✅ Saved model checkpoint to {checkpoint_dir}")
 
 wandb_run.finish()  # wandb run finish
 compute_cleanup()

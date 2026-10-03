@@ -626,68 +626,99 @@ def build_optimizer(
     # (which is what happened to --embedding-lr/--unembedding-lr/--scalar-lr while
     # the group builder emitted only matrix + codebook).
     verify_partition(trainable_root, param_groups)
-    print0(
-        "Optimizer groups: "
-        + ", ".join(f"{g['role']}={len(g['params'])}" for g in param_groups)
-    )
-    optimizer = torch.optim.AdamW(
-        param_groups,
-        fused=(device_type == "cpu"),
-    )
-    for group in optimizer.param_groups:
-        group["initial_lr"] = group["lr"]
+    optimizer = make_adamw(param_groups, device_type)
 
     if resuming:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
-        try:
-            optimizer.load_state_dict(optimizer_data)
-        except ValueError:
-            # The saved optimizer was produced by an older code path whose
-            # parameter grouping differs from the current one (e.g. a Muon
-            # stage that has since been removed, or duplicate codebook params
-            # from a non-flattened SparsePropLinearLCQAT). load_state_dict
-            # hard-fails on group-count mismatch.
-            saved_param_count = sum(
-                len(g["params"]) for g in optimizer_data.get("param_groups", [])
-            )
-            current_param_count = sum(len(g["params"]) for g in optimizer.param_groups)
-            if saved_param_count != current_param_count:
-                # Different param count (different architecture/stage, e.g. a
-                # Muon-based pretrain checkpoint vs. the current AdamW-only
-                # model). The saved state's integer param indices map onto the
-                # old flat param list, not the current Parameter objects, so any
-                # positional copy would attach momentum to the wrong params.
-                # Warm-start is unsafe here; start fresh.
-                print0(
-                    f"Pretrained optimizer skipped: saved {saved_param_count} params "
-                    f"vs. current {current_param_count} (architecture mismatch); "
-                    f"starting with a fresh optimizer"
-                )
-            else:
-                # Same param count, different grouping: copy momentum buffers
-                # per Parameter identity and keep our fresh param groups
-                # (LRs, betas, weight decay) intact.
-                id_to_param = {
-                    id(p): p
-                    for group in optimizer.param_groups
-                    for p in group["params"]
-                }
-                copied = 0
-                for pid, state in optimizer_data.get("state", {}).items():
-                    target = id_to_param.get(pid)
-                    if target is None:
-                        continue
-                    optimizer.state[id(target)] = state
-                    copied += 1
-                print0(
-                    f"Loaded optimizer momentum for {copied}/{len(id_to_param)} params "
-                    f"from checkpoint (group layout mismatch; LRs reset)"
-                )
+        restore_optimizer_momentum(optimizer, optimizer_data)
         del optimizer_data
         for group, base_lr in zip(optimizer.param_groups, base_lrs):
             group["lr"] = base_lr
 
     return optimizer, trainable_root
+
+
+def make_adamw(param_groups, device_type: str):
+    """AdamW over `param_groups`, fused on CPU, with each group's LR recorded.
+
+    `initial_lr` is what a resume restores: `load_state_dict` overwrites
+    param_group LRs with the saved values, and a stage that wants its own
+    schedule (SFT, or a warm start at a different horizon) has to put them back
+    afterwards. Recording them at construction is the only place the fresh value
+    is still known.
+    """
+    print0(
+        "Optimizer groups: "
+        + ", ".join(f"{g['role']}={len(g['params'])}" for g in param_groups)
+    )
+    optimizer = torch.optim.AdamW(param_groups, fused=(device_type == "cpu"))
+    for group in optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
+    return optimizer
+
+
+def restore_optimizer_momentum(
+    optimizer, optimizer_data, source: str = "checkpoint"
+) -> bool:
+    """Warm-start `optimizer` from `optimizer_data`, or start fresh.
+
+    `load_state_dict` overwrites param_group metadata (LRs, betas, weight
+    decay) with the saved values. Callers that built fresh LRs must save them
+    via `initial_lr` and restore them after this returns; see
+    `build_optimizer` for the full sequence.
+
+    `source` names the checkpoint in the one message that quotes it, so the
+    base-train and chat-SFT callers keep their existing wording.
+
+    Returns whether momentum was actually loaded. Two failure shapes are
+    handled, and they are not the same:
+
+    * A saved state whose total parameter count differs from the current model
+      (a different stage or architecture -- e.g. a Muon-based pretrain
+      checkpoint). The saved state's integer parameter indices map onto the
+      *old* flat parameter list, not the current `Parameter` objects, so any
+      positional copy would attach momentum to the wrong parameters. Start
+      fresh.
+    * The same parameter count under a different grouping. Copy the momentum
+      buffers by `Parameter` identity and leave the current groups (and their
+      LRs) intact.
+    """
+    try:
+        optimizer.load_state_dict(optimizer_data)
+        return True
+    except ValueError:
+        # Expected, not exceptional: a state saved under a different param
+        # grouping cannot be loaded positionally, and that is one of the two
+        # cases this function exists to handle. Both recovery paths below check
+        # the parameter counts before any momentum is copied.
+        pass
+
+    saved_param_count = sum(
+        len(g["params"]) for g in optimizer_data.get("param_groups", [])
+    )
+    current_param_count = sum(len(g["params"]) for g in optimizer.param_groups)
+    if saved_param_count != current_param_count:
+        print0(
+            f"Pretrained optimizer skipped: saved {saved_param_count} params "
+            f"vs. current {current_param_count} (architecture mismatch); "
+            f"starting with a fresh optimizer"
+        )
+        return False
+    id_to_param = {
+        id(p): group for group in optimizer.param_groups for p in group["params"]
+    }
+    copied = 0
+    for pid, state in optimizer_data.get("state", {}).items():
+        target = id_to_param.get(pid)
+        if target is None:
+            continue
+        optimizer.state[id(target)] = state
+        copied += 1
+    print0(
+        f"Loaded optimizer momentum for {copied}/{len(id_to_param)} params "
+        f"from {source} (group layout mismatch; LRs reset)"
+    )
+    return True
 
 
 def build_kd_loss_fn(args, device, lcqat_active):

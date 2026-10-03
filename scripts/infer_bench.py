@@ -36,6 +36,7 @@ Examples:
 
 import argparse
 import json
+import statistics
 import time
 
 import torch
@@ -277,7 +278,7 @@ def main():
         if num_steps == 0:
             print(f"{batch_size:>6}  all rows terminated during warmup?! skipping")
             continue
-        tpot = sorted(step_times)[num_steps // 2]  # median decode step time
+        tpot = statistics.median(step_times)  # median decode step time
         tok_per_sec = batch_size * num_steps / sum(step_times)
         # MBU: bytes each decode step must move, over what the GPU can move
         bytes_per_step = w_bytes + batch_size * kv_read

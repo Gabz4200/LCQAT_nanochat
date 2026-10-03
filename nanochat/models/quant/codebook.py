@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nanochat.models.quant.packing import index_dtype_for_k
+
 #: Smallest legal level count. K = m_neg + 1 + m_pos with both sides >= 1 gives
 #: K >= 3; a one-sided codebook (m_neg = 0) needs m_pos >= 2 so the zero anchor
 #: is not also the maximum level (which would make every positive input clamp).
@@ -56,10 +58,42 @@ def _inverse_softplus(delta: torch.Tensor) -> torch.Tensor:
     """Return `rho` such that `F.softplus(rho) == delta`, for `delta > 0`.
 
     Uses `delta + log(-expm1(-delta))` rather than `log(expm1(delta))` so spans
-    above ~88 in FP32 (where `expm1` overflows to inf) stay finite. Mirrors
-    `nanochat.models.quant.ablation._inverse_softplus`.
+    above ~88 in FP32 (where `expm1` overflows to inf) stay finite.
+
+    Callers whose target can be an exact zero need their own zero handling --
+    see `per_channel.raw_for_magnitudes`, which maps a zero target onto the raw
+    whose softplus is `ln 2`.
     """
     return delta + torch.log(-torch.expm1(-delta))
+
+
+def split_from_k(K: int) -> tuple[int, int]:
+    """The `(m_neg, m_pos)` an integer cardinality `K` splits into.
+
+    An odd K splits symmetrically (`m_neg == m_pos`); an even K cannot, so the
+    extra level goes to the positive side. This is the pre-asymmetric API's one
+    rule, shared by `from_k` and by `retrofit.spec_split`, which has to answer
+    the same question about a config value without building a codebook.
+    """
+    if isinstance(K, bool) or not isinstance(K, int):
+        raise ValueError(f"K must be an int, got {K!r}")
+    if K < MIN_CODEBOOK_K:
+        raise ValueError(f"Codebook size K must be >= {MIN_CODEBOOK_K}, got {K}")
+    m_neg = (K - 1) // 2
+    return m_neg, K - 1 - m_neg
+
+
+def codebook_midpoints(codebook: torch.Tensor) -> torch.Tensor:
+    """Bucketize boundaries of a `[K]` level table: the `[K-1]` midpoints.
+
+    One definition of the boundary set, because the zero-anchor guarantee is a
+    property of *these* values: with `m_neg` levels below zero and the anchor
+    at index `m_neg`, `bucketize(0.0, midpoints)` returns exactly `m_neg` for
+    any K, and that is what makes a pruned (exactly 0.0) shadow weight a
+    structural zero with no post-hoc mask multiply. A second copy of the
+    expression is a second chance to spell it differently.
+    """
+    return (codebook[:-1] + codebook[1:]) * 0.5
 
 
 @dataclass
@@ -202,8 +236,7 @@ class MemoryEfficientLearnedCodebook(nn.Module):
         codebook = self.get_codebook().to(torch.float32)
         x_fp32 = x.to(torch.float32)
 
-        midpoints = (codebook[:-1] + codebook[1:]) * 0.5
-        indices = torch.bucketize(x_fp32.detach(), midpoints)
+        indices = torch.bucketize(x_fp32.detach(), codebook_midpoints(codebook))
         x_dequant = codebook[indices]
         if scale != 1.0:
             x_dequant = x_dequant * scale + (x_dequant * (1.0 - scale)).detach()
@@ -214,7 +247,7 @@ class MemoryEfficientLearnedCodebook(nn.Module):
         # the codebook gradient.
         x_q = x_dequant + (x_fp32 - x_fp32.detach())
 
-        idx_dtype = torch.uint8 if self.K <= 255 else torch.int32
+        idx_dtype = index_dtype_for_k(self.K)
         return QuantizedOutput(
             value=x_q.to(x.dtype),
             indices=indices.to(idx_dtype),
@@ -232,8 +265,9 @@ class MemoryEfficientLearnedCodebook(nn.Module):
         a structural zero with no post-hoc mask multiply.
         """
         codebook = self.get_codebook().to(torch.float32)
-        midpoints = (codebook[:-1] + codebook[1:]) * 0.5
-        return torch.bucketize(x.detach().to(torch.float32), midpoints)
+        return torch.bucketize(
+            x.detach().to(torch.float32), codebook_midpoints(codebook)
+        )
 
     @classmethod
     def from_k(
@@ -249,14 +283,10 @@ class MemoryEfficientLearnedCodebook(nn.Module):
         the extra level goes to the positive side. Preserved so existing callers
         and checkpoints that speak in `K` keep working unchanged.
         """
-        if isinstance(K, bool) or not isinstance(K, int):
-            raise ValueError(f"K must be an int, got {K!r}")
-        if K < MIN_CODEBOOK_K:
-            raise ValueError(f"Codebook size K must be >= {MIN_CODEBOOK_K}, got {K}")
-        m_neg = (K - 1) // 2
+        m_neg, m_pos = split_from_k(K)
         return cls(
             m_neg=m_neg,
-            m_pos=K - 1 - m_neg,
+            m_pos=m_pos,
             init_min=init_min,
             init_max=init_max,
             device=device,

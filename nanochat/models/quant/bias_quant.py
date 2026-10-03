@@ -44,6 +44,7 @@ from nanochat.models.quant.codebook import (
     MemoryEfficientLearnedCodebook,
     QuantizedOutput,
 )
+from nanochat.models.quant.packing import index_dtype_for_k
 
 if TYPE_CHECKING:
     from nanochat.models.quant.ablation_metrics import ReconstructionResult
@@ -110,18 +111,13 @@ class BiasQuantizer(nn.Module):
             )
         self.grad_scale = grad_scale
         self.out_features = out_features
-        if K_bias_split is None:
-            self.codebook = MemoryEfficientLearnedCodebook.from_k(
-                K_bias, init_min=init_min, init_max=init_max, device=device
-            )
-        else:
-            self.codebook = MemoryEfficientLearnedCodebook(
-                m_neg=int(K_bias_split[0]),
-                m_pos=int(K_bias_split[1]),
-                init_min=init_min,
-                init_max=init_max,
-                device=device,
-            )
+        # `linear.py` imports this module, so the codebook factory is imported
+        # lazily for the same reason the grad-scale table is.
+        from nanochat.models.quant.linear import _make_codebook
+
+        self.codebook = _make_codebook(
+            K_bias, K_bias_split, (init_min, init_max), device=device
+        )
         self.m_neg = self.codebook.m_neg
         self.m_pos = self.codebook.m_pos
         self.K = self.codebook.K
@@ -147,7 +143,7 @@ class BiasQuantizer(nn.Module):
                 "codebook, not the layer's shadow bias"
             )
         indices = self.bucketize(bias)
-        return indices.to(torch.uint8 if self.K <= 255 else torch.int32)
+        return indices.to(index_dtype_for_k(self.K))
 
     def forward(self, bias: torch.Tensor) -> QuantizedOutput:
         """Dequantize `bias` through the codebook, with the STE intact.
@@ -168,21 +164,12 @@ class BiasQuantizer(nn.Module):
         """
         self._check_shape(bias)
         # Imported lazily: `linear.py` imports this module, so a module-level
-        # import would be circular. The STE itself is shared rather than
-        # reimplemented -- a second copy of the dual-gradient expression would
-        # be free to drift from the weight path's.
-        from nanochat.models.quant.linear import GRAD_SCALE_INV_SQRT_N, _CodebookSTE
+        # import would be circular. The quantizer body itself is shared rather
+        # than reimplemented -- a second copy of the dual-gradient expression
+        # would be free to drift from the weight path's.
+        from nanochat.models.quant.linear import quantize_with_ste
 
-        if self.grad_scale != GRAD_SCALE_INV_SQRT_N:
-            return self.codebook(bias)
-        codebook = self.codebook.get_codebook()
-        value = _CodebookSTE.apply(bias.to(torch.float32), codebook, bias.numel())
-        indices = self.bucketize(bias)
-        return QuantizedOutput(
-            value=value.to(bias.dtype),
-            indices=indices.to(torch.uint8 if self.K <= 255 else torch.int32),
-            codebook=codebook,
-        )
+        return quantize_with_ste(self.codebook, bias, bias.numel(), self.grad_scale)
 
     @torch.no_grad()
     def init_from_tensor(self, x: torch.Tensor, percentile: float = 100.0) -> None:

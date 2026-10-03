@@ -183,17 +183,7 @@ class SmoothPWL(nn.Module):
             fit optimizes the wrong objective -- measured 0.99 max abs error on
             relu^2 against 0.025 for the reference basis.
             """
-            index = self._pinned_index()
-            diff = x.unsqueeze(-1) - index
-            weights = 1.0 / (diff.pow(2) + self.eps)
-            if FIT_SHARPNESS_REFERENCE != 0.0:
-                scale = self._spacing()
-                if scale > 0.0:
-                    weights = weights * (FIT_SHARPNESS_REFERENCE * scale**2)
-            basis = torch.softmax(weights, dim=-1)
-            return (self.weights * basis).sum(dim=-1) * x + (
-                self._pinned_bias() * basis
-            ).sum(dim=-1)
+            return self._apply_basis(self._basis(x, FIT_SHARPNESS_REFERENCE), x)
 
         if exact:
             opt = torch.optim.Adam(self.parameters(), lr=lr)
@@ -222,15 +212,24 @@ class SmoothPWL(nn.Module):
             self.bias.copy_(sol[self.knots_count :])
         return self
 
-    def _basis(self, x: torch.Tensor, sharpness: float | None = None) -> torch.Tensor:
+    def _basis(
+        self,
+        x: torch.Tensor,
+        sharpness: float | None = None,
+        index: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Softmax assignment of each `x` to each knot, shape `(*x.shape, knots)`.
 
         `sharpness` is the grid-relative selector scale, defaulting to the
         training scale. Pass `FIT_SHARPNESS_REFERENCE` to get the near-delta
         basis the initializer fits at -- see that constant for why the two
         regimes must not share a value.
+
+        `index` defaults to the pinned knot grid, which is what both the
+        forward pass and the initializer's fit objective evaluate at; pass
+        `self.index` explicitly to fit at the raw grid instead.
         """
-        diff = x.unsqueeze(-1) - self.index
+        diff = x.unsqueeze(-1) - (self._pinned_index() if index is None else index)
         weights = 1.0 / (diff.pow(2) + self.eps)
         if sharpness is None:
             sharpness = RBF_SCALE_GRID_UNITS
@@ -239,6 +238,16 @@ class SmoothPWL(nn.Module):
             if scale > 0.0:
                 weights = weights * (sharpness * scale**2)
         return torch.softmax(weights, dim=-1)
+
+    def _apply_basis(self, basis: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """Collapse a basis over the knot axis into the activation's value.
+
+        Shared by `forward` and the initializer's fit objective: the map is
+        linear in `(weights, bias)`, so both need the identical contraction.
+        """
+        return (self.weights * basis).sum(dim=-1) * x + (
+            self._pinned_bias() * basis
+        ).sum(dim=-1)
 
     def _spacing(self) -> float:
         """Median local knot gap, read detached.
@@ -252,38 +261,25 @@ class SmoothPWL(nn.Module):
             gaps = (self.index[1:] - self.index[:-1]).abs()
             return float(gaps.median())
 
-    def _pinned_bias(self) -> torch.Tensor:
-        """`bias` with the pinned knot forced to exactly 0.0."""
+    def _pin(self, param: torch.Tensor) -> torch.Tensor:
+        """`param` with the pinned knot forced to exactly 0.0."""
         if not self.zero_pin:
-            return self.bias
+            return param
         return torch.where(
-            self.pin_mask.to(self.bias.device),
-            torch.zeros((), dtype=self.bias.dtype, device=self.bias.device),
-            self.bias,
+            self.pin_mask.to(param.device),
+            torch.zeros((), dtype=param.dtype, device=param.device),
+            param,
         )
 
+    def _pinned_bias(self) -> torch.Tensor:
+        return self._pin(self.bias)
+
     def _pinned_index(self) -> torch.Tensor:
-        """`index` with the pinned knot held at exactly 0.0."""
-        if not self.zero_pin:
-            return self.index
-        return torch.where(
-            self.pin_mask.to(self.index.device),
-            torch.zeros((), dtype=self.index.dtype, device=self.index.device),
-            self.index,
-        )
+        return self._pin(self.index)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Evaluate the activation on any shape; the knot axis is appended."""
-        index = self._pinned_index()
-        diff = x.unsqueeze(-1) - index
-        weights = 1.0 / (diff.pow(2) + self.eps)
-        scale = self._spacing()
-        if scale > 0.0:
-            weights = weights * (RBF_SCALE_GRID_UNITS * scale**2)
-        basis = torch.softmax(weights, dim=-1)
-        return (self.weights * basis).sum(dim=-1) * x + (
-            self._pinned_bias() * basis
-        ).sum(dim=-1)
+        return self._apply_basis(self._basis(x), x)
 
     def extra_repr(self) -> str:
         return (

@@ -8,6 +8,7 @@ detection helpers shared by scripts/base_train.py and checkpoint_manager.
 
 from __future__ import annotations
 
+import argparse
 import warnings
 from dataclasses import dataclass, fields, replace
 
@@ -16,20 +17,19 @@ import torch.nn as nn
 
 from nanochat.models.io import CodebookSpec, LayerQuantSpec
 from nanochat.models.quant.activation import ACT_BODIES, ACT_BODY_PWL
+from nanochat.models.quant.codebook import split_from_k
 from nanochat.models.quant.codebook import validate_split as _validate_split
 from nanochat.models.quant.learnable_lut import RELAXATION_LOGITS, RELAXATIONS
 from nanochat.models.quant.linear import GRAD_SCALE_INV_SQRT_N, GRAD_SCALES, LCQATLinear
 
 #: The exact set of `LayerKConfig` fields whose value is a `CodebookSpec`.
 #:
-#: This is an explicit list rather than a suffix heuristic (`name.endswith(("_weight",
-#: "_act"))`) because the heuristic is a landmine: `per_channel_weight: bool` ends
-#: in `_weight` and was therefore fed to `_validate_codebook_spec` as a codebook
-#: spec, raising `ValueError` on every `retrofit_model` call with no per-channel
-#: flag anywhere in play (dev/HANDOFF_symbiosis.md §9.3 Defect 1). Any future field
-#: named `*_weight` or `*_act` would reproduce the bug silently, and the fix in
-#: §9.3 ("rename the field") would have churned every checkpoint's `meta["lcqat"]`.
-#: Naming the fields makes the class of bug impossible rather than merely absent.
+#: An explicit list, not a suffix heuristic (`name.endswith(("_weight", "_act"))`).
+#: The heuristic cannot work here: `per_channel_weight` is a `bool` whose name
+#: ends in `_weight`, so it is fed to `_validate_codebook_spec` as a codebook
+#: spec. A bool IS an int in Python, and `False <= 3`, so it raises. Naming the
+#: fields makes that class of mistake impossible; a suffix rule would also break
+#: every existing checkpoint's `meta["lcqat"]` if the field were ever renamed.
 CODEBOOK_SPEC_FIELDS: frozenset[str] = frozenset(
     {
         "qk_weight",
@@ -100,12 +100,7 @@ def spec_split(spec: CodebookSpec) -> tuple[int, int]:
         m_neg, m_pos = spec
         _validate_split(m_neg, m_pos)
         return m_neg, m_pos
-    k = int(spec)
-    if k < 3:
-        raise ValueError(f"codebook K must be >= 3, got {k}")
-    half = (k - 1) // 2
-    # An odd K gets the extra level on the positive side; an even K splits evenly.
-    return half, k - 1 - half
+    return split_from_k(int(spec))
 
 
 def _as_spec(value) -> CodebookSpec:
@@ -205,20 +200,7 @@ class LayerKConfig:
             kwargs["k_map"] = tuple(
                 (str(s), _as_spec(kw), _as_spec(ka)) for s, kw, ka in kwargs["k_map"]
             )
-        for name in (
-            "qk_weight",
-            "qk_act",
-            "v_weight",
-            "v_act",
-            "o_weight",
-            "o_act",
-            "fc_weight",
-            "fc_act",
-            "down_weight",
-            "down_act",
-            "qkv_out",
-            "fc_out",
-        ):
+        for name in sorted(CODEBOOK_SPEC_FIELDS):
             if name in kwargs:
                 kwargs[name] = _as_spec(kwargs[name])
         known = {f.name for f in fields(cls)}
@@ -275,20 +257,7 @@ class LayerKConfig:
             )
             for s, kw, ka in self.k_map
         ]
-        for name in (
-            "qk_weight",
-            "qk_act",
-            "v_weight",
-            "v_act",
-            "o_weight",
-            "o_act",
-            "fc_weight",
-            "fc_act",
-            "down_weight",
-            "down_act",
-            "qkv_out",
-            "fc_out",
-        ):
+        for name in sorted(CODEBOOK_SPEC_FIELDS):
             if isinstance(data[name], tuple):
                 data[name] = list(data[name])
         return data
@@ -372,6 +341,67 @@ def parse_k_map(spec: str) -> tuple[tuple[str, CodebookSpec, CodebookSpec], ...]
     return tuple(rules)
 
 
+def add_lcqat_args(parser: argparse.ArgumentParser) -> None:
+    """Register the `--lcqat-*` / `--codebook-*` flags on `parser`.
+
+    Lives here, next to `lcqat_config_from_args` which reads them, and beside
+    `add_sparseprop_pruning_args` / `add_w6_args` which exist for the same
+    reason: `base_train`, `chat_sft` and `chat_rl` each spell this block out,
+    and a flag added to one but not another would make the three disagree about
+    what a run means. Every default here matches the argparse default each
+    script had, and `lcqat_config_from_args` reads the rest via `getattr`, so a
+    caller that registers a subset still works.
+
+    LC-QAT is ON by default; `--no-lcqat` is the opt-out.
+    """
+    parser.add_argument(
+        "--no-lcqat",
+        action="store_false",
+        dest="lcqat",
+        default=True,
+        help="disable LC-QAT (default: LC-QAT is always on; pass this to run plain float training)",
+    )
+    parser.add_argument(
+        "--lcqat-preset",
+        type=str,
+        default=DEFAULT_PRESET,
+        choices=sorted(PRESETS),
+        help=(
+            "per-layer K allocation. 'asym' (default) splits each codebook by sign, "
+            "giving m_neg=0 to the two non-negative MLP tensors so no level is spent "
+            "on a sign they never take. 'small' is the symmetric max-compression "
+            "table, 'prd' the PRD table."
+        ),
+    )
+    parser.add_argument(
+        "--lcqat-k-map",
+        type=str,
+        default="",
+        help="override K per module substring, e.g. 'mlp.c_proj:255/255,attn.c_v:15/15'",
+    )
+    parser.add_argument(
+        "--codebook-lr",
+        type=float,
+        default=1e-3,
+        help="learning rate for codebook step parameters (PRD: 10-50x network weights)",
+    )
+    parser.add_argument(
+        "--codebook-grad-scale",
+        type=str,
+        default=GRAD_SCALE_INV_SQRT_N,
+        choices=list(GRAD_SCALES),
+        help=(
+            "PRD 2.4 codebook gradient scaling. 'inv_sqrt_n' (default) scales the "
+            "codebook gradient by 1/sqrt(numel) -- in a 4096x4096 layer 16.7M "
+            "elements pool into one K-entry codebook, and unscaled the step "
+            "parameters oscillate relative to the weights. 'none' uses the plain "
+            "STE. Note the two interact multiplicatively with --codebook-lr: with "
+            "N = B*T*D in the millions the activation codebook gradient is ~1000x "
+            "smaller under 'inv_sqrt_n', so this is a real trade, not a free win."
+        ),
+    )
+
+
 def lcqat_config_from_args(args) -> LayerKConfig:
     """Build the LayerKConfig from the `--lcqat-*` flags.
 
@@ -380,12 +410,10 @@ def lcqat_config_from_args(args) -> LayerKConfig:
     with a default, so a caller that registers a subset of the flags still
     works -- `chat_rl` does not register `--lcqat-channel-center` at all.
 
-    `--lcqat-channel-center` is the flag that was previously registered but
-    never consumed (dev/HANDOFF_symbiosis.md §13: "a CLI flag that is registered
-    but not consumed is worse than an absent flag"). It is consumed here, and
-    the resulting config is what the three training scripts persist to
-    `meta["lcqat"]`, so a resume rebuilds per-channel tables instead of
-    silently reverting to shared ones and orphaning the saved per-channel
+    `--lcqat-channel-center` sets `per_channel_weight`, and the resulting config
+    is what the three training scripts persist to `meta["lcqat"]`, so a resume
+    rebuilds per-channel tables instead of silently reverting to shared ones
+    and orphaning the saved per-channel
     parameters.
     """
     if args.lcqat_preset not in PRESETS:
@@ -492,6 +520,10 @@ def retrofit_model(model: nn.Module, config: LayerKConfig) -> nn.Module:
         spec = get_layer_config(full_name, config)
         if spec is None:
             continue
+        # Name-based, not isinstance: the guard is a contract about any
+        # Linear that claims to be an fp8 layer (a Float8Linear subclass from
+        # another build included), and `tests/test_lcqat_retrofit.py` pins it
+        # with a stand-in class that only borrows the name.
         if "Float8" in type(child).__name__:
             raise ValueError(
                 f"--fp8 and --lcqat are mutually exclusive (both convert Linear): {full_name}"

@@ -17,7 +17,9 @@ from nanochat.models.quant.bias_quant import BiasQuantizer
 from nanochat.models.quant.codebook import (
     MemoryEfficientLearnedCodebook,
     QuantizedOutput,
+    codebook_midpoints,
 )
+from nanochat.models.quant.packing import index_dtype_for_k
 from nanochat.models.quant.per_channel import PerChannelValueCenteredQuantizer
 
 #: PRD 2.4 gradient-scaling modes for the codebook step parameters.
@@ -44,21 +46,24 @@ class _CodebookSTE(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, codebook, numel: int) -> torch.Tensor:
+    def forward(ctx, x, codebook, numel: int) -> tuple[torch.Tensor, torch.Tensor]:
         # Flatten for the gather: the codebook is 1-D, so `codebook[indices]`
         # requires a 1-D index regardless of how x is shaped. The flat index is
         # carried on ctx and reshaped back in backward.
         x_flat = x.detach().reshape(-1).to(torch.float32)
-        midpoints = (codebook[:-1] + codebook[1:]) * 0.5
+        midpoints = codebook_midpoints(codebook)
         # Detach for the index: the assignment is discrete and carries no
         # gradient, exactly as in the plain-STE path.
         indices = torch.bucketize(x_flat, midpoints)
         ctx.save_for_backward(codebook, indices)
         ctx.scale = numel**-0.5
-        return codebook[indices].reshape(x.shape)
+        # The indices are returned as a second output so callers that need them
+        # (the fused inference path) reuse this bucketize instead of paying for
+        # an identical second one over the same tensor.
+        return codebook[indices].reshape(x.shape), indices
 
     @staticmethod
-    def backward(ctx, grad_out):
+    def backward(ctx, grad_out, grad_indices):
         codebook, indices = ctx.saved_tensors
         # STE identity: the forward value is C[Q], a step function, so the
         # gradient w.r.t. the continuous input passes through unattenuated.
@@ -72,7 +77,72 @@ class _CodebookSTE(torch.autograd.Function):
             .scatter_add_(0, indices, grad_out.reshape(-1))
             .mul_(ctx.scale)
         )
-        return grad_x, grad_codebook, None
+        return grad_x, grad_codebook, None, None
+
+
+def quantize_with_ste(
+    quantizer: MemoryEfficientLearnedCodebook,
+    x: torch.Tensor,
+    numel: int,
+    grad_scale: str,
+) -> QuantizedOutput:
+    """Quantize `x` through `quantizer`, honoring the PRD 2.4 gradient scale.
+
+    Under `inv_sqrt_n` the codebook gradient is routed through `_CodebookSTE`,
+    which scales it by `1/sqrt(numel)`. Under `none` the codebook's own forward
+    is used, whose STE expression is equivalent apart from the scaling -- which
+    is exactly the difference being ablated.
+
+    Shared by `LCQATLinear` and `SparsePropLinearLCQAT`: SparseProp re-parents the
+    quantizers off the wrapped layer without inheriting its methods, so both
+    classes need this body and it must not drift between them.
+    """
+    if grad_scale != GRAD_SCALE_INV_SQRT_N:
+        return quantizer(x)
+    codebook = quantizer.get_codebook()
+    value, indices = _CodebookSTE.apply(x.to(torch.float32), codebook, numel)
+    return QuantizedOutput(
+        value=value.to(x.dtype),
+        indices=indices.to(index_dtype_for_k(quantizer.K)),
+        codebook=codebook,
+    )
+
+
+def apply_trained_activation(lut, out_quantizer, y: torch.Tensor) -> torch.Tensor:
+    """Map `y` through a *trained* activation table, indexed by the out-codebook.
+
+    The training-side counterpart to `_apply_activation_lut`. Shared by
+    `LCQATLinear` and `SparsePropLinearLCQAT`: SparseProp re-parents the
+    quantizer off the wrapped layer without inheriting its methods, so both
+    classes need this body and the two must not drift.
+
+    The gather goes through the table's own `forward`, not
+    `lut.resolved_table()[indices]`. The forward *value* is identical, but the
+    table's forward is `soft + hard - soft.detach()` while a manual gather
+    returns `hard` alone -- so the manual version silently disabled
+    `--lcqat-lut-relaxation` and `--lcqat-act-body` on every SparseProp run and
+    the trained table's parameters received no gradient at all. It was also
+    the slower of the two, being a cheaper computation than the one it stood
+    in for.
+
+    `resolved_table()` stays the right accessor for an *integer* gather (the
+    export-time `quantized_mlp_chain`); it is the wrong one when the point is
+    to train the table.
+    """
+    if lut is None:
+        raise RuntimeError(
+            "apply_trained_activation requires a learnable_activation_lut; "
+            "call attach_learnable_activation_luts() first, or use the "
+            "float activation."
+        )
+    if out_quantizer is None:
+        raise RuntimeError(
+            "apply_trained_activation needs c_fc.out_quantizer: the "
+            "trained table is indexed by this layer's *output* codebook."
+        )
+    with torch.no_grad():
+        indices = out_quantizer.bucketize(y).reshape(-1)
+    return lut(indices).reshape(y.shape).to(dtype=y.dtype)
 
 
 def _make_codebook(
@@ -252,23 +322,8 @@ class LCQATLinear(Linear):
         self.matmul_backend = "cpu"
 
     def _quantize(self, quantizer: MemoryEfficientLearnedCodebook, x, numel: int):
-        """Quantize `x` through `quantizer`, honoring the PRD 2.4 gradient scale.
-
-        Under `inv_sqrt_n` the codebook gradient is routed through
-        `_CodebookSTE`, which scales it by `1/sqrt(numel)`. Under `none` the
-        codebook's own forward is used, whose STE expression is equivalent apart
-        from the scaling -- which is exactly the difference being ablated.
-        """
-        if self.grad_scale == GRAD_SCALE_INV_SQRT_N:
-            codebook = quantizer.get_codebook()
-            value = _CodebookSTE.apply(x.to(torch.float32), codebook, numel)
-            indices = quantizer.bucketize(x)
-            return QuantizedOutput(
-                value=value.to(x.dtype),
-                indices=indices.to(torch.uint8 if quantizer.K <= 255 else torch.int32),
-                codebook=codebook,
-            )
-        return quantizer(x)
+        """Quantize `x` through `quantizer`, honoring the PRD 2.4 gradient scale."""
+        return quantize_with_ste(quantizer, x, numel, self.grad_scale)
 
     def _quantize_conditioned(self, quantizer, x, sigma):
         """Quantize through a sigma-conditioned codebook, with PRD 2.4 scaling.
@@ -467,22 +522,9 @@ class LCQATLinear(Linear):
         Falls back to the caller's own activation when no table is attached, so
         the float path is unchanged by default.
         """
-        lut = getattr(self, "learnable_activation_lut", None)
-        if lut is None:
-            raise RuntimeError(
-                "apply_trained_activation requires a learnable_activation_lut; "
-                "call attach_learnable_activation_luts() first, or use the "
-                "float activation."
-            )
-        if self.out_quantizer is None:
-            raise RuntimeError(
-                "apply_trained_activation needs c_fc.out_quantizer: the "
-                "trained table is indexed by this layer's *output* codebook."
-            )
-        with torch.no_grad():
-            indices = self.out_quantizer.bucketize(y).reshape(-1)
-        values = lut(indices)
-        return values.reshape(y.shape).to(dtype=y.dtype)
+        return apply_trained_activation(
+            getattr(self, "learnable_activation_lut", None), self.out_quantizer, y
+        )
 
     def _apply_activation_lut(self, y_ids: torch.Tensor) -> torch.Tensor:
         """Map c_fc output indices through the activation table.
@@ -556,12 +598,10 @@ class LCQATLinear(Linear):
             K_act_split=K_act_split,
             out_split=out_split,
             grad_scale=grad_scale,
-            # Forwarded verbatim. `retrofit_model` passes this through, and
-            # omitting it here made every LC-QAT retrofit raise
-            # "unexpected keyword argument 'per_channel_weight'" at model build
-            # time -- i.e. base_train could not start at all, with no per-channel
-            # flag set (dev/HANDOFF_symbiosis.md §9.3 Defect 2). `pyrefly`
-            # catches it statically, which is how it was found.
+            # Forwarded verbatim: `retrofit_model` passes it through, and
+            # dropping it here breaks every LC-QAT retrofit at model-build time
+            # on an unexpected keyword, with no per-channel flag even set.
+            # `pyrefly` catches a dropped keyword statically.
             per_channel_weight=per_channel_weight,
             quantize_bias=quantize_bias,
             K_bias=K_bias,

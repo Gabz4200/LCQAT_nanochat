@@ -18,8 +18,32 @@ from nanochat.models.quant.learnable_lut import (
 )
 from nanochat.models.quant.linear import LCQATLinear
 from nanochat.models.quant.lut import ACTIVATION_LUTS, compile_activation
-from nanochat.models.quant.packing import pack_weight_indices
+from nanochat.models.quant.packing import index_dtype_for_k, pack_weight_indices
 from nanochat.models.quant.sparse_artifact import pack_sparse_plan, plan_sparse_export
+
+
+def _activation_pairs(model: nn.Module, table: tuple):
+    """Yield `(module, parent_name, substr, act_name, kwargs)` for every wiring site.
+
+    Both the learnable and the frozen attachment walk the model the same way:
+    find an out-quantized LCQATLinear whose name ends in a declared activation
+    substring, then resolve the quantized sibling that consumes its output.
+    Keeping the walk in one generator is what stops the two attachment modes
+    from disagreeing about which layers get a table.
+    """
+    for name, module in model.named_modules():
+        if not isinstance(module, LCQATLinear) or module.out_quantizer is None:
+            continue
+        for substr, act_name, kwargs in table:
+            if not name.endswith(substr):
+                continue
+            # Parent is the dotted path up to (but excluding) the leaf suffix.
+            parent_name = name[: -len(substr)]
+            parent_name = parent_name[:-1] if parent_name.endswith(".") else parent_name
+            sibling = _next_quantized_sibling(model, parent_name, substr.split(".")[-1])
+            if sibling is None or sibling.act_quantizer is None:
+                continue
+            yield module, sibling, act_name, kwargs
 
 
 @torch.no_grad()
@@ -53,52 +77,40 @@ def attach_learnable_activation_luts(
     """
     table = activations if activations is not None else ACTIVATION_LUTS
     count = 0
-    for name, module in model.named_modules():
-        if not isinstance(module, LCQATLinear) or module.out_quantizer is None:
-            continue
-        for substr, act_name, kwargs in table:
-            if not name.endswith(substr):
-                continue
-            parent_name = name[: -len(substr)]
-            parent_name = parent_name[:-1] if parent_name.endswith(".") else parent_name
-            sibling = _next_quantized_sibling(model, parent_name, substr.split(".")[-1])
-            if sibling is None or sibling.act_quantizer is None:
-                continue
-            input_codebook = module.out_quantizer.get_codebook()
-            output_codebook = sibling.act_quantizer.get_codebook()
-            body = None
-            if act_body == ACT_BODY_SMOOTHPWL:
-                if kwargs:
-                    raise ValueError(
-                        f"--lcqat-act-body=smoothpwl cannot fit activation "
-                        f"{act_name!r} with kwargs={kwargs!r}: SmoothPWL takes no "
-                        f"activation kwargs. Use --lcqat-act-body=pwl for "
-                        f"parameterized activations."
-                    )
-                body = SmoothPWL(
-                    knots=int(input_codebook.numel()),
-                    zero_pin=True,
-                    act_name=act_name,
-                ).fit_from_callable()
-            lut = LearnableIndexLut(
-                input_codebook,
-                output_codebook,
+    for module, sibling, act_name, kwargs in _activation_pairs(model, table):
+        input_codebook = module.out_quantizer.get_codebook()
+        output_codebook = sibling.act_quantizer.get_codebook()
+        body = None
+        if act_body == ACT_BODY_SMOOTHPWL:
+            if kwargs:
+                raise ValueError(
+                    f"--lcqat-act-body=smoothpwl cannot fit activation "
+                    f"{act_name!r} with kwargs={kwargs!r}: SmoothPWL takes no "
+                    f"activation kwargs. Use --lcqat-act-body=pwl for "
+                    f"parameterized activations."
+                )
+            body = SmoothPWL(
+                knots=int(input_codebook.numel()),
+                zero_pin=True,
                 act_name=act_name,
-                relaxation=relaxation,
-                smooth_body=body,
-            )
-            module.learnable_activation_lut = lut
-            # Install the frozen table too, at the same dtype the non-learnable
-            # path would have produced. Hardcoding uint8 truncates for K_act >
-            # 255, where `compile_activation` yields int32 and the fused chain's
-            # `activation_lut.dtype != torch.uint8` guard then rejects a table
-            # this function just built. Bound to a distinct name: reusing `table`
-            # here rebinds the loop's iteration variable mid-loop.
-            resolved = lut.resolved_table()
-            _install_lut(
-                module, resolved.to(torch.uint8 if lut.k_out <= 255 else torch.int32)
-            )
-            count += 1
+            ).fit_from_callable()
+        lut = LearnableIndexLut(
+            input_codebook,
+            output_codebook,
+            act_name=act_name,
+            relaxation=relaxation,
+            smooth_body=body,
+        )
+        module.learnable_activation_lut = lut
+        # Install the frozen table too, at the same dtype the non-learnable
+        # path would have produced. Hardcoding uint8 truncates for K_act >
+        # 255, where `compile_activation` yields int32 and the fused chain's
+        # `activation_lut.dtype != torch.uint8` guard then rejects a table
+        # this function just built. Bound to a distinct name: reusing `table`
+        # here rebinds the loop's iteration variable mid-loop.
+        resolved = lut.resolved_table()
+        _install_lut(module, resolved.to(index_dtype_for_k(lut.k_out)))
+        count += 1
     return count
 
 
@@ -120,26 +132,15 @@ def wire_activation_luts(model: nn.Module, activations: tuple | None = None) -> 
     """
     table = activations if activations is not None else ACTIVATION_LUTS
     count = 0
-    for name, module in model.named_modules():
-        if not isinstance(module, LCQATLinear) or module.out_quantizer is None:
-            continue
-        for substr, act_name, kwargs in table:
-            if not name.endswith(substr):
-                continue
-            # Parent is the dotted path up to (but excluding) the leaf suffix.
-            parent_name = name[: -len(substr)]
-            parent_name = parent_name[:-1] if parent_name.endswith(".") else parent_name
-            sibling = _next_quantized_sibling(model, parent_name, substr.split(".")[-1])
-            if sibling is None or sibling.act_quantizer is None:
-                continue
-            lut = compile_activation(
-                act_name,
-                module.out_quantizer.get_codebook(),
-                sibling.act_quantizer.get_codebook(),
-                kwargs,
-            )
-            _install_lut(module, lut)
-            count += 1
+    for module, sibling, act_name, kwargs in _activation_pairs(model, table):
+        lut = compile_activation(
+            act_name,
+            module.out_quantizer.get_codebook(),
+            sibling.act_quantizer.get_codebook(),
+            kwargs,
+        )
+        _install_lut(module, lut)
+        count += 1
     return count
 
 

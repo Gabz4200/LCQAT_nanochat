@@ -12,10 +12,12 @@ table fetches + FMA).
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+
+from nanochat.models.quant.codebook import codebook_midpoints
+from nanochat.models.quant.packing import index_dtype_for_k
 
 
 @torch.no_grad()
@@ -44,8 +46,8 @@ def compile_activation_lut(
         raise ValueError("codebooks must have at least 3 entries (odd K >= 3)")
 
     transformed = act_fn(input_codebook.to(torch.float32))
-    midpoints = (output_codebook[:-1] + output_codebook[1:]) * 0.5
-    target_dtype = torch.uint8 if output_codebook.numel() <= 255 else torch.int32
+    midpoints = codebook_midpoints(output_codebook.to(torch.float32))
+    target_dtype = index_dtype_for_k(output_codebook.numel())
     return torch.bucketize(transformed, midpoints).to(target_dtype)
 
 
@@ -57,24 +59,6 @@ _ACTIVATIONS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "tanh": torch.tanh,
     "sigmoid": torch.sigmoid,
 }
-
-
-@dataclass
-class ActivationSpec:
-    """Where an activation LUT lives in a module tree."""
-
-    # Dotted parent path relative to the retrofitted module, or "" for root.
-    parent_suffix: str
-    # Attribute path from the parent down to the activation's *input*
-    # quantizer (the quantizer whose codebook feeds the activation).
-    input_quantizer_attr: str
-    # Attribute path from the parent down to the activation's *output*
-    # quantizer (the next layer's act_quantizer).
-    output_quantizer_attr: str
-    # Callable or registry name.
-    activation: str
-    # Optional keyword args for the callable (e.g. softcap).
-    kwargs: dict | None = None
 
 
 def get_activation(name: str) -> Callable[[torch.Tensor], torch.Tensor]:

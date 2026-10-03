@@ -33,7 +33,33 @@ import math
 import torch
 import torch.nn as nn
 
-from nanochat.models.quant.codebook import QuantizedOutput, validate_split
+from nanochat.models.quant.codebook import (
+    QuantizedOutput,
+    _inverse_softplus,
+    validate_split,
+)
+from nanochat.models.quant.packing import index_dtype_for_k
+
+#: Guard for the inverse-softplus branch: `_inverse_softplus` takes a log of a
+#: quantity that goes to 0 as the target does, so an exact-zero target would
+#: produce -inf. That never reaches the result (see `raw_for_magnitudes`), but
+#: computing it would poison any gradient flowing through the masked branch.
+_MAGNITUDE_EPS = 1e-12
+
+
+def raw_for_magnitudes(target: torch.Tensor) -> torch.Tensor:
+    """Raw parameters whose `softplus` reconstructs the `target` magnitudes.
+
+    `target` holds absolute magnitudes with a leading exact zero per row --
+    `_magnitudes` forces that zero so the per-channel table has an exact centre
+    -- but `softplus(0) = ln 2`, not `0`. So the zero target maps to the raw
+    whose softplus is `ln 2` and every other target to the plain inverse.
+    """
+    return torch.where(
+        target == 0,
+        torch.full_like(target, math.log(2.0)),
+        _inverse_softplus(target.clamp_min(_MAGNITUDE_EPS)),
+    )
 
 
 class PerChannelValueCenteredQuantizer(nn.Module):
@@ -125,11 +151,7 @@ class PerChannelValueCenteredQuantizer(nn.Module):
             .reshape(1, -1)
             .repeat(num_channels, 1)
         )
-        return torch.where(
-            target == 0,
-            torch.full_like(target, math.log(2.0)),
-            target + torch.log(-torch.expm1(-target.clamp_min(1e-12))),
-        )
+        return raw_for_magnitudes(target)
 
     def get_codebook(self) -> torch.Tensor:
         """The `[C, K]` per-channel codebook.
@@ -187,8 +209,8 @@ class PerChannelValueCenteredQuantizer(nn.Module):
         Returns a `QuantizedOutput` whose `codebook` is `[C, K]`. That shape is
         what the existing index kernels can consume unchanged when the channel
         axis is the reduction-free trailing axis; callers that reduce over
-        channels (the usual `F.linear` contraction) must gather per channel
-        explicitly, which is what `quantized_value` does.
+        channels (the usual `F.linear` contraction) cannot consume a `[C, K]`
+        table that way and gather per channel explicitly instead.
         """
         self._validate(x)
         x_fp32 = x.to(torch.float32)
@@ -196,13 +218,16 @@ class PerChannelValueCenteredQuantizer(nn.Module):
         # Per-row boundaries: `[C, K-1]`, broadcast over the leading axes.
         mids = (codebook[:, :-1] + codebook[:, 1:]) * 0.5
         flat = x_fp32.reshape(-1, self.num_channels)
-        idx_flat = torch.empty(flat.shape, dtype=torch.int64, device=x.device)
-        for c in range(self.num_channels):
-            # `.contiguous()` on the column: `searchsorted` copies a strided
-            # column internally and warns about it once per process, which in a
-            # test run surfaces as a stray warning attributed to this module.
-            col = flat[:, c].detach().contiguous()
-            idx_flat[:, c] = torch.bucketize(col, mids[c].detach().contiguous())
+        # One batched search over `[C]` boundary sets rather than `C` calls:
+        # `torch.searchsorted` takes a batched `sorted_sequence` (one `[K-1]`
+        # boundary row per channel) against a `[C, N]` value matrix, which
+        # `torch.bucketize` cannot express. `.t()` puts the channel axis first;
+        # both operands are made contiguous because searchsorted copies strided
+        # inputs internally, which warns once per process and in a test run
+        # surfaces as a stray warning attributed to this module.
+        idx_flat = torch.searchsorted(
+            mids.detach().contiguous(), flat.detach().t().contiguous()
+        ).t()
         idx = idx_flat.reshape(x_fp32.shape)
 
         # Row-wise gather: `codebook[c, idx[..., c]]` for every element. The
@@ -217,13 +242,9 @@ class PerChannelValueCenteredQuantizer(nn.Module):
         x_q = dequant + (x_fp32 - x_fp32.detach())
         return QuantizedOutput(
             value=x_q.to(x.dtype),
-            indices=idx.to(torch.uint8 if self.K <= 255 else torch.int32),
+            indices=idx.to(index_dtype_for_k(self.K)),
             codebook=codebook,
         )
-
-    def quantized_value(self, x: torch.Tensor) -> torch.Tensor:
-        """Just the dequantized values, for callers that do not need indices."""
-        return self.forward(x).value
 
     @torch.no_grad()
     def init_from_tensor(self, x: torch.Tensor, percentile: float = 100.0) -> None:
@@ -264,13 +285,7 @@ class PerChannelValueCenteredQuantizer(nn.Module):
         """Overwrite `raw` with raws whose softplus spans `0..highs[c]` per row."""
         count = raw.shape[1]
         target = torch.linspace(0.0, 1.0, count).reshape(1, -1) * highs.reshape(-1, 1)
-        raw.copy_(
-            torch.where(
-                target == 0,
-                torch.full_like(target, math.log(2.0)),
-                target + torch.log(-torch.expm1(-target.clamp_min(1e-12))),
-            )
-        )
+        raw.copy_(raw_for_magnitudes(target))
 
     def extra_repr(self) -> str:
         return (

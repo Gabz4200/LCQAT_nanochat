@@ -25,6 +25,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from nanochat.models.quant.codebook import _inverse_softplus
+
 
 def _finite_float(name: str, value: float) -> float:
     """Validate that `value` is a finite real number. Returns it as a float."""
@@ -35,15 +37,6 @@ def _finite_float(name: str, value: float) -> float:
     ):
         raise ValueError(f"{name} must be a finite number, got {value!r}")
     return float(value)
-
-
-def _inverse_softplus(value: torch.Tensor) -> torch.Tensor:
-    """Return `x` such that `F.softplus(x) == value`, for `value > 0`.
-
-    Uses `log(-expm1(-value))` rather than `log(expm1(value))` so that large
-    spans (above ~88 in FP32, where `expm1` overflows to inf) stay finite.
-    """
-    return value + torch.log(-torch.expm1(-value))
 
 
 class StrictLearnableGrid(nn.Module):

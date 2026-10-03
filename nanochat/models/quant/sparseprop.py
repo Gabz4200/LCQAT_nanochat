@@ -12,9 +12,11 @@ import torch
 import torch.nn as nn
 
 from nanochat.models.backbone import Linear
-from nanochat.models.quant.linear import _CodebookSTE
+from nanochat.models.quant.linear import (
+    apply_trained_activation,
+    quantize_with_ste,
+)
 from nanochat.ops.sparseprop import (
-    _nnz_row_indices,
     build_csr_csc_from_mask,
 )
 
@@ -38,9 +40,7 @@ class SparsePropLinearFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(
-        ctx, x, weight, bias, mask, w_ptr, w_col, w_ptr_csc, w_row, csr_gidx, csc_gidx
-    ):
+    def forward(ctx, x, weight, bias, mask):
         """Forward: y = SpMM(W * mask, x) + bias.
 
         Layout: x [*, in], weight [out, in], y [*, out].
@@ -57,9 +57,9 @@ class SparsePropLinearFunction(torch.autograd.Function):
         ctx.B = B
         ctx.has_bias = bias is not None
         ctx.x_shape = x.shape  # save original batch shape for backward reshape
-        # Only x and weight are needed by the dense backward below. The CSR/CSC
-        # structure is accepted on the signature for callers that pass it, but
-        # a dense matmul reads none of it.
+        # Only x and weight are needed by the dense backward below, so the
+        # signature carries no CSR/CSC structure: a dense matmul reads none of
+        # it. The structure buffers live on the module for the sparse export.
         ctx.save_for_backward(x_flat, weight)
         ctx.mask = mask
 
@@ -117,8 +117,10 @@ class SparsePropLinearFunction(torch.autograd.Function):
         # re-walks a B-element row with a stride that defeats the cache, while
         # the GEMM streams both operands once through a packed micro-kernel.
         # Arithmetic count is the wrong thing to optimize on this hardware --
-        # achieved FLOPs is. The forward keeps the sparse kernel, where the
-        # SpMM is a pure gather-and-accumulate with no reusable packed panel.
+        # achieved FLOPs is. The forward took the same view (see the measurement
+        # there): the SpMM does 4x fewer multiply-accumulates and still loses,
+        # because a per-nnz gather of a B-float row cannot be vectorized the way
+        # a packed GEMM micro-kernel is.
         #
         # Equivalence is exact in structure, not approximate. In the [B, *]
         # layout the tensors are already saved in:
@@ -144,7 +146,7 @@ class SparsePropLinearFunction(torch.autograd.Function):
 
         grad_bias = grad_y.sum(dim=0) if ctx.has_bias else None
 
-        return grad_x, grad_w, grad_bias, None, None, None, None, None, None, None
+        return grad_x, grad_w, grad_bias, None
 
 
 class SparsePropLinear(Linear):
@@ -196,20 +198,6 @@ class SparsePropLinear(Linear):
         self.register_buffer(
             "w_row", torch.zeros(0, dtype=torch.int32, device=device), persistent=True
         )
-        # Gather indices into the flattened dense weight, in CSR and CSC nnz
-        # order. Derived from the mask alone, so persistent=False: they are
-        # rebuilt in _build_sparse_structure and must not enter the checkpoint.
-        # Rebuilt on every .to(device) via the buffer registration.
-        self.register_buffer(
-            "_csr_gather_index",
-            torch.zeros(0, dtype=torch.int32, device=device),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_csc_gather_index",
-            torch.zeros(0, dtype=torch.int32, device=device),
-            persistent=False,
-        )
         self._init_sparsity()
 
     def _init_sparsity(self) -> None:
@@ -231,24 +219,6 @@ class SparsePropLinear(Linear):
         self.w_col = w_col
         self.w_ptr_csc = w_ptr_csc
         self.w_row = w_row
-        # The gather index for `gather_values_from_dense` depends only on the
-        # sparsity pattern, which is static between mask updates. Recomputing it
-        # per call cost a `repeat_interleave` over the full row dimension on
-        # every forward AND twice per backward (CSR and CSC orders), which
-        # profiling showed was comparable to the AVX2 kernel's own time. Build
-        # it here, where the mask actually changes, and reuse it.
-        #
-        # Registered with register_buffer(..., persistent=False) so it moves with
-        # .to(device) like the other structure buffers, but stays out of the
-        # checkpoint: it is fully derivable from w_ptr/w_col.
-        M, K = mask.shape
-        row_idx = _nnz_row_indices(w_ptr, M)
-        counts = w_ptr_csc[1:] - w_ptr_csc[:-1]
-        col_idx_csc = torch.repeat_interleave(
-            torch.arange(K, device=w_ptr_csc.device), counts.to(torch.int64)
-        ).to(torch.int32)
-        self._csr_gather_index = (row_idx * K + w_col).to(torch.int32)
-        self._csc_gather_index = (w_row * K + col_idx_csc).to(torch.int32)
 
     def _apply_mask(self):
         """Enforce sparsity: zero masked weight entries, rebuild structure."""
@@ -269,16 +239,7 @@ class SparsePropLinear(Linear):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward: y = SpMM(W * mask, x) + bias."""
         return SparsePropLinearFunction.apply(
-            x,
-            self.weight,
-            self.bias,
-            self.sparsity_mask,
-            self.w_ptr,
-            self.w_col,
-            self.w_ptr_csc,
-            self.w_row,
-            self._csr_gather_index,
-            self._csc_gather_index,
+            x, self.weight, self.bias, self.sparsity_mask
         )
 
     @classmethod
@@ -413,37 +374,9 @@ class SparsePropLinearLCQAT(SparsePropLinear):
         and a table that can never be reached never receives a gradient, which
         is the exact failure `LCQATLinear.apply_trained_activation` prevents.
         """
-        lut = getattr(self, "learnable_activation_lut", None)
-        if lut is None:
-            raise RuntimeError(
-                "apply_trained_activation requires a learnable_activation_lut; "
-                "call attach_learnable_activation_luts() first, or use the "
-                "float activation."
-            )
-        if self.out_quantizer is None:
-            raise RuntimeError(
-                "apply_trained_activation needs c_fc.out_quantizer: the "
-                "trained table is indexed by this layer's *output* codebook."
-            )
-        with torch.no_grad():
-            indices = self.out_quantizer.bucketize(y).reshape(-1)
-        # Delegate to the table's own forward, exactly as `LCQATLinear` does.
-        #
-        # This used to re-implement the gather as
-        # `lut.resolved_table()[indices]`, which is ~3x cheaper (14 ms vs 45 ms
-        # at [4,512,1536]) and measurably faster -- because it drops the
-        # straight-through relaxation. `LearnableIndexLut.forward` returns
-        # `soft + hard - soft.detach()`: the forward value equals the hard
-        # gather, but the *gradient* reaches `logits` / `relaxed()`. The manual
-        # gather returns `hard` alone, so `--lcqat-lut-relaxation` and
-        # `--lcqat-act-body` silently did nothing on every SparseProp run, and
-        # the trained table's parameters received no gradient at all. Faster
-        # because it was doing less work than the layer it was replacing.
-        #
-        # `resolved_table()` remains the right accessor for an *integer* gather
-        # (the export-time `quantized_mlp_chain`); it is the wrong one when the
-        # caller wants a differentiable training-side value.
-        return lut(indices).reshape(y.shape).to(y.dtype)
+        return apply_trained_activation(
+            getattr(self, "learnable_activation_lut", None), self.out_quantizer, y
+        )
 
     def _quantize(self, quantizer, x, numel: int):
         """Quantize `x` through `quantizer` via the LC-QAT STE path.
@@ -466,20 +399,10 @@ class SparsePropLinearLCQAT(SparsePropLinear):
             gradient scale, so a SparseProp layer's codebook received gradients
             `sqrt(numel)` times larger than the same layer un-sparsified.
 
-        Mirrors `LCQATLinear._quantize`; keep the two in step.
+        Mirrors `LCQATLinear._quantize` by delegating to the same
+        `quantize_with_ste` helper, so the two cannot drift apart.
         """
-        from nanochat.models.quant.linear import GRAD_SCALE_INV_SQRT_N, QuantizedOutput
-
-        if self.grad_scale == GRAD_SCALE_INV_SQRT_N:
-            codebook = quantizer.get_codebook()
-            value = _CodebookSTE.apply(x.to(torch.float32), codebook, numel)
-            indices = quantizer.bucketize(x)
-            return QuantizedOutput(
-                value=value.to(x.dtype),
-                indices=indices.to(torch.uint8 if quantizer.K <= 255 else torch.int32),
-                codebook=codebook,
-            )
-        return quantizer(x)
+        return quantize_with_ste(quantizer, x, numel, self.grad_scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward: quantize through codebooks (STE), then sparse matmul.
@@ -509,12 +432,6 @@ class SparsePropLinearLCQAT(SparsePropLinear):
             w_q.value,
             bias,
             self.sparsity_mask,
-            self.w_ptr,
-            self.w_col,
-            self.w_ptr_csc,
-            self.w_row,
-            self._csr_gather_index,
-            self._csc_gather_index,
         )
 
         if orig_shape[:-1] != out.shape[:-1] or out.shape[-1] != self.out_features:

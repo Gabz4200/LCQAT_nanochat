@@ -17,14 +17,46 @@ _TRIT_POWERS = torch.tensor([1, 3, 9, 27, 81], dtype=torch.int32)
 #: Values packed per byte in the K=3 trit format. Public because the sparse
 #: artifact's byte accounting needs it to compare layouts.
 TRITS_PER_BYTE = 5
-_TRITS_PER_BYTE = TRITS_PER_BYTE
+
+#: Largest codebook size whose indices still fit in one unsigned byte. This is
+#: the single boundary behind both the packed storage format
+#: (`FORMAT_UINT8`/`FORMAT_INT32`) and the in-memory index dtype
+#: (`index_dtype_for_k`), so the two can never disagree.
+MAX_UINT8_CODEBOOK_K = 255
 
 # Storage-format tags for weight indices (dtype chosen from the codebook
 # size K; persisted as a 0-dim int buffer next to each packed weight).
 FORMAT_TRITS = 0  # K = 3: 5 trits/byte
 FORMAT_NIBBLES = 1  # K <= 15: 2 values/byte
-FORMAT_UINT8 = 2  # K <= 255: one byte/value
-FORMAT_INT32 = 3  # K > 255: matches codebook.py index dtype
+FORMAT_UINT8 = 2  # K <= MAX_UINT8_CODEBOOK_K: one byte/value
+FORMAT_INT32 = 3  # K > MAX_UINT8_CODEBOOK_K: matches the in-memory index dtype
+
+
+def index_dtype_for_k(k: int) -> torch.dtype:
+    """Return the dtype index tensors of cardinality `k` are stored in.
+
+    Deliberately total (no minimum-K guard): this is the dtype half of the
+    `K <= MAX_UINT8_CODEBOOK_K` rule and is called from every quantizer, where
+    `K` has already been validated. Raising here would turn a dtype lookup into
+    a second validation point.
+    """
+    return torch.int32 if int(k) > MAX_UINT8_CODEBOOK_K else torch.uint8
+
+
+def index_bytes_for_k(k: int) -> float:
+    """Bytes per weight index at cardinality `k`, after packing.
+
+    Derived from the `FORMAT_*` tags rather than restated, so a format change
+    here cannot leave a budget table quoting stale numbers.
+    """
+    fmt = index_format_for_k(k)
+    if fmt == FORMAT_TRITS:
+        return 1.0 / TRITS_PER_BYTE
+    if fmt == FORMAT_NIBBLES:
+        return 1.0 / 2
+    if fmt == FORMAT_UINT8:
+        return 1.0
+    return 4.0  # FORMAT_INT32
 
 
 def index_format_for_k(k: int) -> int:
@@ -41,7 +73,7 @@ def index_format_for_k(k: int) -> int:
         return FORMAT_TRITS
     if k <= 15:
         return FORMAT_NIBBLES
-    if k <= 255:
+    if k <= MAX_UINT8_CODEBOOK_K:
         return FORMAT_UINT8
     return FORMAT_INT32
 
@@ -102,9 +134,9 @@ def pack_trits(trits: torch.Tensor) -> torch.Tensor:
     if trits.numel() and not torch.compiler.is_compiling() and int(trits.max()) > 2:
         raise ValueError("pack_trits only accepts indices in {0, 1, 2}")
     m, n = trits.shape
-    nbytes = (n + _TRITS_PER_BYTE - 1) // _TRITS_PER_BYTE
-    padded = F.pad(trits.to(torch.int32), (0, nbytes * _TRITS_PER_BYTE - n))
-    chunks = padded.view(m, nbytes, _TRITS_PER_BYTE)
+    nbytes = (n + TRITS_PER_BYTE - 1) // TRITS_PER_BYTE
+    padded = F.pad(trits.to(torch.int32), (0, nbytes * TRITS_PER_BYTE - n))
+    chunks = padded.view(m, nbytes, TRITS_PER_BYTE)
     powers = _TRIT_POWERS.to(trits.device)
     return (chunks * powers).sum(dim=-1).to(torch.uint8)
 
@@ -116,15 +148,15 @@ def unpack_trits(packed: torch.Tensor, n: int) -> torch.Tensor:
             f"unpack_trits expects a 2-D tensor, got shape {tuple(packed.shape)}"
         )
     m, nbytes = packed.shape
-    if nbytes * _TRITS_PER_BYTE < n:
+    if nbytes * TRITS_PER_BYTE < n:
         raise ValueError(
-            f"packed buffer too small: {nbytes} bytes hold {nbytes * _TRITS_PER_BYTE} trits, need {n}"
+            f"packed buffer too small: {nbytes} bytes hold {nbytes * TRITS_PER_BYTE} trits, need {n}"
         )
     base = packed.to(torch.int32)
     digits = torch.empty(
-        m, nbytes, _TRITS_PER_BYTE, dtype=torch.int32, device=packed.device
+        m, nbytes, TRITS_PER_BYTE, dtype=torch.int32, device=packed.device
     )
-    for t in range(_TRITS_PER_BYTE):
+    for t in range(TRITS_PER_BYTE):
         digits[:, :, t] = (base // (3**t)) % 3
     return digits.view(m, -1)[:, :n].to(torch.uint8)
 

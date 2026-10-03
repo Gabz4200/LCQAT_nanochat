@@ -20,7 +20,12 @@ from nanochat.models.quant.activation import ACT_BODIES, ACT_BODY_PWL
 from nanochat.models.quant.codebook import split_from_k
 from nanochat.models.quant.codebook import validate_split as _validate_split
 from nanochat.models.quant.learnable_lut import RELAXATION_LOGITS, RELAXATIONS
-from nanochat.models.quant.linear import GRAD_SCALE_INV_SQRT_N, GRAD_SCALES, LCQATLinear
+from nanochat.models.quant.linear import (
+    GRAD_SCALE_INV_SQRT_N,
+    GRAD_SCALES,
+    LCQATLinear,
+    is_lcqat_layer,
+)
 
 #: The exact set of `LayerKConfig` fields whose value is a `CodebookSpec`.
 #:
@@ -503,6 +508,20 @@ def get_layer_config(module_name: str, config: LayerKConfig) -> LayerQuantSpec |
     )
 
 
+def _is_fp8_linear(module: nn.Module) -> bool:
+    """Whether `module` is an fp8 Linear installed by `--fp8`.
+
+    The precise check first: a real `Float8Linear` is what `--fp8` installs.
+    The name test is the fallback, because that is the codebase-wide idiom for
+    identifying fp8 layers (`scripts/_train/build.py`'s `num_fp8` count and
+    `disable_fp8` both use it), and it catches an fp8 layer whose class came
+    from a build that does not expose `Float8Linear` for import.
+    """
+    from nanochat.models.fp8 import Float8Linear
+
+    return isinstance(module, Float8Linear) or "Float8" in type(module).__name__
+
+
 def retrofit_model(model: nn.Module, config: LayerKConfig) -> nn.Module:
     """Recursively replace eligible nn.Linear modules with LCQATLinear, in place.
 
@@ -515,16 +534,17 @@ def retrofit_model(model: nn.Module, config: LayerKConfig) -> nn.Module:
     matched_rules: set[str] = set()
 
     for full_name, child in model.named_modules():
-        if not isinstance(child, nn.Linear) or isinstance(child, LCQATLinear):
+        # `is_lcqat_layer` for the already-retrofitted skip: a
+        # SparsePropLinearLCQAT is an nn.Linear (through backbone
+        # Linear) and would otherwise be quantized a second time. The
+        # pipeline retrofits before it wraps, so this changes nothing
+        # there -- it removes the trap for any other call order.
+        if not isinstance(child, nn.Linear) or is_lcqat_layer(child):
             continue
         spec = get_layer_config(full_name, config)
         if spec is None:
             continue
-        # Name-based, not isinstance: the guard is a contract about any
-        # Linear that claims to be an fp8 layer (a Float8Linear subclass from
-        # another build included), and `tests/test_lcqat_retrofit.py` pins it
-        # with a stand-in class that only borrows the name.
-        if "Float8" in type(child).__name__:
+        if _is_fp8_linear(child):
             raise ValueError(
                 f"--fp8 and --lcqat are mutually exclusive (both convert Linear): {full_name}"
             )
@@ -581,7 +601,9 @@ def retrofit_summary(model: nn.Module) -> dict[str, int]:
     """
     summary: dict[str, int] = {}
     for module in model.modules():
-        if isinstance(module, LCQATLinear):
+        # `is_lcqat_layer`, not isinstance: a SparseProp-wrapped LC-QAT layer is
+        # one without being a subclass, and it carries both quantizers.
+        if is_lcqat_layer(module):
             w, a = module.weight_quantizer, module.act_quantizer
             key = f"Kw={w.K}(m{w.m_neg},p{w.m_pos}),Ka={a.K}(m{a.m_neg},p{a.m_pos})"
             summary[key] = summary.get(key, 0) + 1
@@ -626,7 +648,7 @@ def _prepare_exported_buffers(model: nn.Module, model_data: dict) -> None:
     not match the artifact - fail fast with that hint.
     """
     for name, module in model.named_modules():
-        if not isinstance(module, LCQATLinear):
+        if not is_lcqat_layer(module):
             continue
         idx_key = f"{name}.packed_weight_indices"
         if idx_key not in model_data:

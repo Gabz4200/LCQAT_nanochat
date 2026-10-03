@@ -108,6 +108,37 @@ def quantize_with_ste(
     )
 
 
+def lcqat_layer_types() -> tuple[type, ...]:
+    """Every module class that *behaves* as an LC-QAT layer, subclass or not.
+
+    `SparsePropLinearLCQAT` re-parents an `LCQATLinear`'s weight, bias and all
+    three quantizers into its own attributes instead of inheriting from it --
+    nesting the inner layer as a submodule would register every codebook
+    parameter twice. The consequence is that it is functionally an LC-QAT layer
+    and is not a subclass of one.
+
+    So `isinstance(m, LCQATLinear)` is a question about the *class*, and every
+    "is this layer quantized?" call site wants the answer about the layer.
+    Measured: with 4 of 12 layers sparse-wrapped, `retrofit_summary` reported 8
+    and `strip_lcqat` left 4 quantized layers in a supposedly-float twin.
+
+    Use `is_lcqat_layer`, not this tuple, at call sites.
+    """
+    from nanochat.models.quant.sparseprop import SparsePropLinearLCQAT
+
+    return (LCQATLinear, SparsePropLinearLCQAT)
+
+
+def is_lcqat_layer(module: nn.Module) -> bool:
+    """Whether `module` is an LC-QAT layer. See `lcqat_layer_types` for why.
+
+    Used by `retrofit_summary`, `prepare_lcqat_before_load`, `strip_lcqat` and
+    the export walk, all of which previously asked `isinstance` and so skipped
+    every sparse LC-QAT layer.
+    """
+    return isinstance(module, lcqat_layer_types())
+
+
 def apply_trained_activation(lut, out_quantizer, y: torch.Tensor) -> torch.Tensor:
     """Map `y` through a *trained* activation table, indexed by the out-codebook.
 
@@ -563,7 +594,7 @@ class LCQATLinear(Linear):
         K_bias: int | None = None,
         K_bias_split: tuple[int, int] | None = None,
     ) -> "LCQATLinear":
-        if isinstance(mod, LCQATLinear):
+        if is_lcqat_layer(mod):
             raise ValueError(
                 "from_float expects a plain float Linear, got an LCQATLinear"
             )

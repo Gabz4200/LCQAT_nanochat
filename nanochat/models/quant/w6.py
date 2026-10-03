@@ -287,19 +287,16 @@ def strip_lcqat(root: nn.Module) -> int:
     would otherwise stay in `parameters()`, invisible to `verify_partition`,
     which only walks the student.
 
-    KNOWN GAP: this matches `LCQATLinear` only. `SparsePropLinearLCQAT`
-    subclasses `SparsePropLinear`, not `LCQATLinear`, so a sparse LC-QAT
-    layer is NOT stripped and survives into the twin. Widening the isinstance
-    would change what this function returns, so it is recorded here rather
-    than changed inside a behaviour-preserving pass -- the resume path is
-    where the twin is built after the retrofit, and that is where it bites.
+    Matches both LC-QAT layer shapes via `is_lcqat_layer`.
+    `isinstance(..., LCQATLinear)` used to skip `SparsePropLinearLCQAT`, so a
+    sparse LC-QAT layer survived into a twin that is supposed to be plain float.
     """
-    from nanochat.models.quant.linear import LCQATLinear
+    from nanochat.models.quant.linear import is_lcqat_layer
 
     replaced = 0
     for parent in list(root.modules()):
         for child_name, child in list(parent.named_children()):
-            if not isinstance(child, LCQATLinear):
+            if not is_lcqat_layer(child):
                 continue
             plain = nn.Linear(
                 child.in_features,

@@ -290,10 +290,12 @@ class SparsePropLinearLCQAT(SparsePropLinear):
     """
 
     def __init__(self, lcqat_linear, sparsity: float = 0.75):
-        from nanochat.models.quant.linear import LCQATLinear
+        from nanochat.models.quant.linear import is_lcqat_layer
 
-        assert isinstance(lcqat_linear, LCQATLinear), (
-            f"Expected LCQATLinear, got {type(lcqat_linear)}"
+        # Both shapes: a plain LCQATLinear on the first wrap, and an
+        # already-sparse SparsePropLinearLCQAT on a ramp re-wrap.
+        assert is_lcqat_layer(lcqat_linear), (
+            f"Expected an LC-QAT layer, got {type(lcqat_linear)}"
         )
         # Initialize SparsePropLinear first (sets up mask, ptr/col buffers, etc.)
         super().__init__(

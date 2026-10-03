@@ -49,8 +49,16 @@ def print_run_summary(
     total_training_time: float,
     val_bpb: float,
     min_val_bpb: float,
+    bpb_places: int = 6,
 ) -> None:
-    """Print the end-of-run report to stdout."""
+    """Print the end-of-run report to stdout.
+
+    `bpb_places` because the two callers disagree and each states its own: the
+    pretraining loop has always printed 6, chat SFT has always printed 4. The
+    helper owns the *shape* of the report; the precision is a per-stage
+    presentation choice, so it is a parameter rather than a second copy of the
+    three `print0` lines.
+    """
     print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
     print0(f"Total training time: {total_training_time / 60:.2f}m")
     # Gated on `val_bpb` and prints `min_val_bpb`. Preserved verbatim from the
@@ -58,4 +66,4 @@ def print_run_summary(
     # but changing it would alter when the line appears, which is a behavior
     # change, not a refactor.
     if val_bpb is not None:
-        print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
+        print0(f"Minimum validation bpb: {min_val_bpb:.{bpb_places}f}")

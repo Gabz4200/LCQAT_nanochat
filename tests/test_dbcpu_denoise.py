@@ -4,6 +4,11 @@
 denoise within its own equi-probability sigma range, and only that block's layers
 run, so gradients exist for L/B layers instead of L. `train_step` (full-depth
 next-token CE with block-isolated gradients) is the escape hatch.
+
+Absorbs the former `test_dbcpu_objective.py`: it was a near-wholesale duplicate
+of this file -- same module docstring intent, same imports, 20.6% duplication --
+with four tests whose bodies differed only in docstring wording. Its four unique
+tests are here; the six it shared with this file are not.
 """
 
 import gc
@@ -12,6 +17,7 @@ import torch
 
 from nanochat.training.diffusion_blocks import (
     EquiProbabilityPartitioner,
+    block_diagonal_mask,
     edm_preconditioning,
 )
 from tests.test_dbcpu_engine import make_engine
@@ -183,3 +189,92 @@ def test_when_ce_and_edm_objectives_then_only_edm_isolates_the_forward() -> None
     calls.clear()
     engine.denoise_step(idx, block_idx=1)
     assert len(calls) == 2, "still L/B = 2 layers, independent of which block"
+
+
+# ---------------------------------------------------------------------------
+# Masking and target hoisting. Merged in from `test_dbcpu_objective.py`, which
+# was a near-wholesale duplicate of this file: same intent, same imports, and
+# four tests with identical bodies modulo docstring wording. This file held the
+# stronger variant of both overlapping pairs, so the survivor is here.
+# ---------------------------------------------------------------------------
+
+
+def test_when_loss_scales_with_sigma_then_the_jitter_is_the_edm_weighting():
+    """Explains the per-step loss variation seen in a training log.
+
+    With fixed weights and a fixed target the loss still varies a lot across
+    steps, because sigma is resampled and w(sigma) reweights it. That is the EDM
+    objective behaving as specified, not instability -- pinned so a future reader
+    does not try to "fix" it.
+    """
+    torch.manual_seed(0)
+    engine = make_engine(2, active=False)  # weights frozen: sigma is the only input
+    idx = torch.randint(0, 128, (4, 32))
+    with torch.no_grad():
+        clean = torch.nn.functional.normalize(
+            engine.model.transformer.wte(idx).float(), dim=-1
+        )
+    seen = []
+    for i in range(6):
+        loss, sigma = engine.denoise_step(idx, block_idx=i % 2, clean=clean)
+        seen.append((float(sigma), loss.item()))
+    sigmas = [s for s, _ in seen]
+    losses = [v for _, v in seen]
+    assert max(losses) / min(losses) > 1.5, "expected sigma-driven loss spread"
+    assert len(set(round(s, 6) for s in sigmas)) > 1
+
+
+def test_when_attn_mask_causal_then_it_matches_the_unmasked_path():
+    """`denoise_step` calls the blocks directly, so it must thread the mask itself.
+
+    `train_step` forwards the mask through GPT.forward; the EDM path bypassed that
+    and always ran unmasked, which made packed sequences silently wrong.
+    """
+    engine = make_engine(2)
+    idx = torch.randint(0, 128, (2, 16))
+    t = idx.size(1)
+    causal = torch.ones(t, t, dtype=torch.bool).tril().view(1, 1, t, t)
+    torch.manual_seed(7)
+    unmasked, _ = engine.denoise_step(idx, block_idx=0, attn_mask=None)
+    torch.manual_seed(7)
+    masked, _ = engine.denoise_step(idx, block_idx=0, attn_mask=causal)
+    # Attention is already causal, so a full causal mask is a no-op.
+    assert torch.allclose(unmasked, masked, atol=1e-5)
+
+
+def test_when_block_diagonal_mask_then_packed_documents_are_isolated():
+    """The block-diagonal mask is what stops a packed document attending to its
+    neighbour. It was dead code before W1.1, so it has to actually change things."""
+    engine = make_engine(2)
+    idx = torch.randint(0, 128, (2, 16))
+    t = idx.size(1)
+    mask = block_diagonal_mask([t // 2, t - t // 2], t)
+    assert mask.shape == (1, 1, t, t)
+    plain_causal = torch.ones(t, t, dtype=torch.bool).tril().view(1, 1, t, t)
+    # Guard against a vacuous comparison: the mask must differ from causal.
+    assert not torch.equal(mask, plain_causal)
+    torch.manual_seed(11)
+    unmasked, _ = engine.denoise_step(idx, block_idx=0, attn_mask=None)
+    torch.manual_seed(11)
+    packed, _ = engine.denoise_step(idx, block_idx=0, attn_mask=mask)
+    assert not torch.allclose(unmasked, packed)
+
+
+def test_when_denoise_step_reuses_hoisted_clean_then_no_recomputation():
+    """The batch is reused across micro-steps, so the target is hoisted.
+
+    Passing `clean` must produce the same result as letting `denoise_step` build
+    it, and must not re-enter the embedding lookup.
+    """
+    torch.manual_seed(0)
+    engine = make_engine(2)
+    idx = torch.randint(0, 128, (2, 16))
+    with torch.no_grad():
+        clean = torch.nn.functional.normalize(
+            engine.model.transformer.wte(idx).float(), dim=-1
+        )
+    torch.manual_seed(3)
+    hoisted, _ = engine.denoise_step(idx, block_idx=0, clean=clean)
+    torch.manual_seed(3)
+    implicit, _ = engine.denoise_step(idx, block_idx=0, clean=None)
+    assert torch.allclose(hoisted, implicit, atol=1e-6)

@@ -58,26 +58,26 @@ def _lcqat_linears(model: nn.Module) -> list[LCQATLinear]:
 # --- 1. the flag is consumed ------------------------------------------------
 
 
-def test_when_channel_center_flag_absent_then_shared_tables() -> None:
-    cfg = lcqat_config_from_args(_args())
-    assert cfg.per_channel_weight is False
-
-
-def test_when_channel_center_flag_set_then_config_turns_per_channel_on() -> None:
-    cfg = lcqat_config_from_args(_args(lcqat_channel_center=True))
-    assert cfg.per_channel_weight is True
-
-
-def test_when_caller_omits_the_flag_entirely_then_config_still_builds() -> None:
-    """`chat_rl` does not register `--lcqat-channel-center` (handoff §9.5).
-
-    `lcqat_config_from_args` reads it with a `getattr` default precisely so a
-    caller that registered a subset of the flags still works. Without that, the
-    missing attribute would be an AttributeError at startup.
-    """
-    args = _args()
-    del args.lcqat_channel_center
-    assert lcqat_config_from_args(args).per_channel_weight is False
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        pytest.param({}, False, id="flag_absent"),
+        pytest.param({"lcqat_channel_center": True}, True, id="flag_set"),
+        pytest.param({"lcqat_channel_center": False}, False, id="flag_off"),
+        # `chat_rl` does not register `--lcqat-channel-center` at all.
+        # `lcqat_config_from_args` reads it with a `getattr` default precisely so
+        # a caller that registered a subset of the flags still works; without
+        # that, the missing attribute would be an AttributeError at startup.
+        pytest.param({"__delete__": True}, False, id="flag_not_registered"),
+    ],
+)
+def test_the_channel_center_flag_decides_per_channel_tables(
+    kwargs: dict, expected: bool
+) -> None:
+    args = _args(**{k: v for k, v in kwargs.items() if k != "__delete__"})
+    if "__delete__" in kwargs:
+        del args.lcqat_channel_center
+    assert lcqat_config_from_args(args).per_channel_weight is expected
 
 
 def test_when_flag_set_then_retrofitted_model_really_gets_per_channel_tables() -> None:

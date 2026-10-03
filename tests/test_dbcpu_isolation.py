@@ -79,7 +79,12 @@ def test_when_shared_parameters_then_wte_trains_on_every_block():
         engine.zero_grad(set_to_none=True)
         loss, _ = engine.denoise_step(idx, block_idx=b)
         loss.backward()
-        assert engine.model.transformer.wte.weight.grad is not None
+        grad = engine.model.transformer.wte.weight.grad
+        # Non-zero, not merely present: this file's whole premise is that a
+        # zero tensor transmits no gradient, so `grad is not None` alone is
+        # satisfied by the exact vacuity it exists to rule out.
+        assert grad is not None
+        assert grad.abs().sum() > 0, f"wte received an all-zero gradient on block {b}"
 
 
 def test_when_edm_objective_then_lm_head_is_not_in_the_graph():
@@ -136,8 +141,10 @@ def test_when_freezer_freezes_then_the_veto_survives_later_steps():
     engine = make_engine(2, n_layer=4)
     freezer = SelectiveFreezer(engine.model, warmup_steps=0, freeze_middle_frac=1.0)
     # 4 layers: the band is clamped to layers 1..2 (never the first or last).
-    _n_layer, start, end = freezer.layer_bounds()
-    assert start >= 1 and end <= 3
+    n_layer, start, end = freezer.layer_bounds()
+    # n_layer is pinned as well: `start`/`end` are only bounds if the band
+    # was computed against the depth we actually built.
+    assert n_layer == 4 and start >= 1 and end <= 3
     assert freezer.freeze() > 0
     engine.set_freezer(freezer)
 

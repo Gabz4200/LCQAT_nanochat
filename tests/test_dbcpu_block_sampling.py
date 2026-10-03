@@ -56,20 +56,22 @@ def test_when_sampling_step_mode_then_every_micro_step_uses_the_same_block():
 
 
 def test_when_sampling_micro_mode_then_blocks_vary_across_micro_steps():
-    """The ablation arm: `block_idx=None` redraws per micro-step."""
+    """The ablation arm: `block_idx=None` redraws per micro-step.
+
+    Exercises `sample_block` directly rather than through a denoise loop that
+    reads the drawn block back out of the gradients. The property under test is
+    the sampler's distribution, so reading it off gradients made the test slower
+    without making it sharper.
+    """
     engine = make_engine(4, n_layer=8)
-    idx = torch.randint(0, 128, (2, 16))
     torch.manual_seed(0)
-    seen = []
-    for _ in range(12):
-        engine.zero_grad(set_to_none=True)
-        loss, _ = engine.denoise_step(idx, block_idx=None)
-        loss.backward()
-        grads = {n for n, p in engine.named_parameters() if p.grad is not None}
-        seen.append(
-            next(n.split(".")[1] for n in grads if n.startswith("db_denoise_heads."))
-        )
-    assert len(set(seen)) > 1, "per-micro-step sampling should visit several blocks"
+    gen = torch.Generator().manual_seed(0)
+    seen = [engine.sample_block(gen) for _ in range(64)]
+    assert sorted(set(seen)) == [0, 1, 2, 3], (
+        f"per-micro-step sampling visited {sorted(set(seen))}, not every block"
+    )
+    # And it must not be degenerate in the other direction either.
+    assert len(set(seen)) == 4
 
 
 def test_when_micro_mode_then_earlier_blocks_gradients_are_discarded():

@@ -83,8 +83,22 @@ def test_when_quantize_out_then_output_values_come_from_the_output_codebook() ->
     assert (distance == 0).all()
 
 
-def test_when_no_quantize_out_then_output_quantizer_is_absent() -> None:
-    assert from_float(quantize_out=False).out_quantizer is None
+@pytest.mark.parametrize(
+    ("quantize_out", "expected"),
+    [(False, False), (True, True)],
+    ids=["quantize_out_off", "quantize_out_on"],
+)
+def test_the_quantize_out_flag_decides_the_output_quantizer(
+    quantize_out: bool, expected: bool
+) -> None:
+    """Both directions, because the negative alone is satisfied by a change that
+    simply stopped creating out-quantizers."""
+    linear = from_float(quantize_out=quantize_out)
+    assert (linear.out_quantizer is not None) is expected
+    if quantize_out:
+        # An out-quantizer that exists but holds the wrong K would still pass an
+        # existence check.
+        assert linear.out_quantizer.K == 15
 
 
 def test_when_backward_then_gradients_reach_weights_inputs_and_all_codebooks() -> None:

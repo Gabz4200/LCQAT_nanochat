@@ -11,11 +11,13 @@ import pytest
 import torch
 
 from nanochat.models.quant import (
+    PRESETS,
     LCQATLinear,
     export_lcqat_checkpoint,
     is_exported_lcqat_state,
     is_lcqat_state,
     prepare_lcqat_before_load,
+    retrofit_model,
 )
 from nanochat.models.quant.packing import (
     FORMAT_NIBBLES,
@@ -24,6 +26,97 @@ from nanochat.models.quant.packing import (
     index_format_for_k,
     unpack_weight_indices,
 )
+from nanochat.models.quant.retrofit import DEFAULT_PRESET
+from nanochat.modules.experiments.tiny_models import build_active_tiny_gpt
+from nanochat.training.diffusion_blocks import (
+    DiffusionBlockEngine,
+    EquiProbabilityPartitioner,
+)
+
+
+def _lcqat_engine(num_blocks: int = 2) -> DiffusionBlockEngine:
+    """A DiffusionBlocks engine with LC-QAT on the model *and* its own layers.
+
+    This is the shape `scripts/base_train.py` builds by default: `--lcqat` plus
+    `--db-blocks=4` calls `retrofit_model` on the GPT and then
+    `engine.apply_lcqat` on the adapters and denoise heads, so all three owned
+    subtrees carry quantized Linears. `load_model` returns the engine for any
+    checkpoint declaring `meta["db"]`, which is every default run.
+    """
+
+    torch.manual_seed(0)
+    cfg = PRESETS[DEFAULT_PRESET]
+    model = retrofit_model(build_active_tiny_gpt(), cfg)
+    engine = DiffusionBlockEngine(
+        model, EquiProbabilityPartitioner(num_blocks=num_blocks), dtype=torch.float32
+    )
+    engine.apply_lcqat(cfg)
+    return engine
+
+
+def test_when_exporting_a_diffusion_blocks_engine_then_every_owned_subtree_is_stripped(
+    tmp_path,
+) -> None:
+    """Regression: export died on the default configuration.
+
+    `export_lcqat_checkpoint` walked `model.named_modules()`, which a
+    `DiffusionBlockEngine` does not have, so every default run -- the ones
+    declaring `meta["db"]` -- raised `AttributeError` at export. The engine also
+    has to expose `get_submodule` for the activation-LUT sibling walk, which
+    resolves `transformer.h.<n>.mlp.c_proj` by dotted path.
+
+    Asserting on the artifact, not on the absence of an exception: an engine
+    that merely walked `self.model` would pass a "does not raise" test and then
+    ship FP32 adapters with no index buffers.
+    """
+    engine = _lcqat_engine()
+
+    state = export_lcqat_checkpoint(engine, str(tmp_path / "db_export.pt"))
+
+    assert is_exported_lcqat_state(state)
+    assert not is_lcqat_state(state)
+    # Every quantized layer in every owned subtree loses its FP32 shadow weight
+    # and gains packed indices -- base GPT, adapters, and denoise heads alike.
+    quantized = [
+        name
+        for name, module in engine.named_modules()
+        if getattr(module, "weight_quantizer", None) is not None
+        and hasattr(module, "K_weight")
+    ]
+    assert quantized, "fixture did not retrofit anything"
+    prefixes = {"transformer": 0, "db_adapters": 0, "db_denoise_heads": 0}
+    for name in quantized:
+        subtree = name.split(".")[0]
+        assert subtree in prefixes, f"unexpected subtree in {name}"
+        prefixes[subtree] += 1
+        assert not any(k == f"{name}.weight" for k in state), (
+            f"shadow weight kept: {name}"
+        )
+        assert f"{name}.packed_weight_indices" in state, f"no indices for {name}"
+    # A pass that only covered the bare GPT would leave these at zero.
+    assert prefixes["db_adapters"] > 0, "adapters were not exported"
+    assert prefixes["db_denoise_heads"] > 0, "denoise heads were not exported"
+    assert prefixes["transformer"] > 0, "base transformer was not exported"
+
+
+def test_when_exporting_a_diffusion_blocks_engine_then_activation_luts_are_wired(
+    tmp_path,
+) -> None:
+    """The `get_submodule` half of the contract.
+
+    `_activation_pairs` resolves a dotted path to find the quantized sibling that
+    consumes an out-quantized layer's output. On an engine that resolution runs
+    through `get_submodule`, so a stub returning None would skip every table
+    silently and emit an artifact with no activation LUTs at all.
+    """
+    engine = _lcqat_engine()
+
+    state = export_lcqat_checkpoint(engine, str(tmp_path / "db_lut_export.pt"))
+
+    activation_lut_keys = [
+        k for k, v in state.items() if k.endswith("activation_lut") and v.numel() > 1
+    ]
+    assert activation_lut_keys, "no fused activation tables were wired"
 
 
 def test_when_exporting_then_artifact_has_indices_luts_and_no_shadow_weights(
@@ -68,8 +161,6 @@ def test_when_loading_exported_artifact_then_loads_and_runs(
 ) -> None:
     from dataclasses import asdict
 
-    from nanochat.models.quant import PRESETS, retrofit_model
-
     torch.manual_seed(1)
     source = retrofit_model(tiny_gpt_factory(), PRESETS["prd"])
     float_baseline = copy.deepcopy(source)
@@ -98,7 +189,6 @@ def test_when_build_model_with_exported_artifact_then_eval_runs_and_train_reject
 ) -> None:
     from dataclasses import asdict
 
-    from nanochat.models.quant import PRESETS, retrofit_model
     from nanochat.modules import checkpoint_manager as cm
 
     torch.manual_seed(2)
@@ -165,7 +255,6 @@ def test_when_exporting_then_indices_are_packed_by_k_format(
 def test_when_exporting_preset_prd_then_uint8_and_trit_formats_coexist(
     tiny_gpt_factory, tmp_path
 ) -> None:
-    from nanochat.models.quant import PRESETS, retrofit_model
 
     model = retrofit_model(tiny_gpt_factory(), PRESETS["prd"])
     state = export_lcqat_checkpoint(model, str(tmp_path / "prd_export.pt"))
@@ -177,7 +266,7 @@ def test_when_exporting_preset_prd_then_uint8_and_trit_formats_coexist(
 def test_when_exporting_k_above_255_then_int32_indices_not_rejected(
     tiny_gpt_factory, tmp_path
 ) -> None:
-    from nanochat.models.quant import LayerKConfig, retrofit_model
+    from nanochat.models.quant import LayerKConfig
 
     cfg = LayerKConfig(down_weight=257, down_act=15)
     model = retrofit_model(tiny_gpt_factory(), cfg)

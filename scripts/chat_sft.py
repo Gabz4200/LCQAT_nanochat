@@ -20,7 +20,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
 
-from nanochat.callbacks.training import log_step_metrics, manage_gc
+from nanochat.callbacks.training import (
+    log_step_metrics,
+    manage_gc,
+    print_run_summary,
+)
 from nanochat.data.tokenizer import get_token_bytes
 from nanochat.models.flash_attention import HAS_FA3
 from nanochat.models.quant import lcqat_config_from_args, retrofit_summary
@@ -39,6 +43,7 @@ from nanochat.tasks.smoltalk import SmolTalk
 from nanochat.training.diffusion_blocks import (
     DiffusionBlockEngine,
     EquiProbabilityPartitioner,
+    add_db_args,
 )
 from nanochat.utils.common import (
     COMPUTE_DTYPE,
@@ -52,6 +57,7 @@ from nanochat.utils.common import (
     is_ddp_initialized,
     print0,
 )
+from scripts._cli import add_common_cli_args
 from scripts._train.build import (
     build_grad_scaler,
     make_adamw,
@@ -62,24 +68,10 @@ from scripts.chat_eval import run_chat_eval
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) the model")
+add_common_cli_args(parser, model_step=True)
 # Logging
-parser.add_argument(
-    "--run",
-    type=str,
-    default="dummy",
-    help="wandb run name ('dummy' disables wandb logging)",
-)
 # Runtime
-parser.add_argument(
-    "--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)"
-)
 # Model loading
-parser.add_argument(
-    "--model-tag", type=str, default=None, help="model tag to load from"
-)
-parser.add_argument(
-    "--model-step", type=int, default=None, help="model step to load from"
-)
 parser.add_argument(
     "--load-optimizer",
     type=int,
@@ -144,57 +136,13 @@ parser.add_argument(
     default=0.5,
     help="ratio of iterations for LR warmdown",
 )
-parser.add_argument(
-    "--db-objective",
-    type=str,
-    default="edm",
-    choices=["edm", "ce"],
-    help=(
-        "block-wise training objective. 'edm' (default) is the DiffusionBlocks "
-        "method: only the active block's layers run, so activations are "
-        "O(L/B). 'ce' is the escape hatch (full-depth next-token cross-entropy "
-        "with block-isolated gradients). Should match the pretraining "
-        "objective -- switching mid-pipeline changes what is being optimized."
-    ),
-)
-parser.add_argument(
-    "--db-overlap",
-    type=float,
-    default=0.1,
-    help="log-sigma overlap between adjacent blocks (DiffusionBlocks App. C)",
-)
-parser.add_argument(
-    "--db-block-sampling",
-    type=str,
-    default="step",
-    choices=["step", "micro"],
-    help="draw the active block once per optimizer step (default) or per micro-step",
-)
-parser.add_argument(
-    "--db-blocks",
-    type=int,
-    default=4,
-    help="number of diffusion blocks for block-wise training (default: 4)",
-)
-parser.add_argument(
-    "--no-sparseprop",
-    action="store_false",
-    dest="sparseprop",
-    default=True,
-    help="disable SparseProp sparse backprop (default: SparseProp is always on)",
-)
-parser.add_argument(
-    "--sparseprop-sparsity",
-    type=float,
-    default=0.75,
-    help="sparsity level for SparseProp (fraction of weights pruned, 0.0-1.0)",
-)
 from nanochat.models.quant.pruning import (  # noqa: E402
     add_sparseprop_pruning_args,
     schedule_from_args,
 )
 
 add_sparseprop_pruning_args(parser)
+add_db_args(parser)
 # W6 DiffusionBlocks features (sigma codebooks / EfQAT per-block latching /
 # denoiser KD) plus --lcqat-channel-center, registered through the same shared
 # helper base_train uses so the three entry points cannot drift apart.
@@ -332,7 +280,12 @@ for name, fallback, source in [
     else:
         print0(f"Using {name}={arg_val}")
 
-orig_model = model
+# The ChatCORE samplers below need the *bare* GPT. `load_model` returns the
+# engine itself whenever the checkpoint declares `meta["db"]` -- the default for
+# anything this repo's `base_train` writes -- and `DiffusionBlockEngine` has no
+# `forward`, so aliasing `orig_model` before this unwrap hands the samplers an
+# object they cannot run. Unwrap first, then the GPT is `base_model`.
+# `scripts/base_eval.py` works around the same trap with `getattr`.
 if isinstance(model, DiffusionBlockEngine):
     engine = model
     base_model = engine.model
@@ -750,7 +703,7 @@ while True:
         model.eval()
         # ar_engine is the autoregressive sampler; it must not shadow the
         # DiffusionBlockEngine bound to `engine`, which train_step runs on.
-        ar_engine = Engine(orig_model, tokenizer)
+        ar_engine = Engine(base_model, tokenizer)
         all_tasks = ["ARC-Easy", "ARC-Challenge", "MMLU", "GSM8K", "HumanEval"]
         categorical_tasks = {"ARC-Easy", "ARC-Challenge", "MMLU"}
         baseline_accuracies = {
@@ -770,7 +723,7 @@ while True:
             max_problems = None if limit < 0 else limit  # -1 means no limit
             acc = run_chat_eval(
                 task_name,
-                orig_model,
+                base_model,
                 tokenizer,
                 ar_engine,
                 batch_size=args.device_batch_size,
@@ -813,7 +766,7 @@ while True:
         save_checkpoint(
             checkpoint_dir,
             step,
-            # engine.state_dict(), not orig_model.state_dict(): the engine owns
+            # engine.state_dict(), not base_model.state_dict(): the engine owns
             # db_adapters.* / db_denoise_heads.*, and this checkpoint declares
             # meta["db"] below. Saving the bare model would write a checkpoint
             # that claims a diffusion engine but carries none of its parameters.
@@ -833,22 +786,17 @@ while True:
                 },
                 "user_config": user_config,  # inputs to the training script
                 "lcqat": lcqat_meta,
-                "db": {
-                    "num_blocks": num_db_blocks,
-                    "sigma_min": 0.002,
-                    "sigma_max": 80.0,
-                    "sigma_data": 0.5,
-                    "sigma_codebook": describe_sigma_codebooks(args),
-                },
-                "sparseprop": {
-                    "enabled": args.sparseprop,
-                    "sparsity": args.sparseprop_sparsity,
-                    "scope": sparse_schedule.scope,
-                    "start_frac": sparse_schedule.start_frac,
-                    "every": sparse_schedule.every,
-                    "ramp_steps": sparse_schedule.ramp_steps,
-                    "dense_threshold": sparse_schedule.dense_threshold,
-                },
+                # Written by the objects that own them: `build_model`
+                # rebuilds the partitioner and reads these keys back, so
+                # restating the partitioner's defaults as literals here
+                # (as this used to) is three chances to disagree with the
+                # model actually being saved.
+                "db": engine.partitioner.to_meta(
+                    sigma_codebook=describe_sigma_codebooks(args)
+                ),
+                "sparseprop": sparse_schedule.to_meta(
+                    args.sparseprop, args.sparseprop_sparsity
+                ),
             },
             rank=ddp_rank,
         )
@@ -980,11 +928,12 @@ while True:
     )
     manage_gc(step, first_step_of_run=(step == 1))
 
-# Not `print_run_summary`: that helper formats bpb to 6 places and this script
-# has always printed 4, so reusing it would change the log line.
-print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
-print0(f"Total training time: {total_training_time / 60:.2f}m")
-print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
+# `bpb_places=4`: chat SFT has always printed bits-per-byte to 4 places,
+# while the pretraining loop prints 6. The helper owns the report's shape, so
+# the precision is the only thing that has to differ.
+print_run_summary(
+    get_max_memory, total_training_time, val_bpb, min_val_bpb, bpb_places=4
+)
 
 # cleanup
 wandb_run.finish()  # wandb run finish

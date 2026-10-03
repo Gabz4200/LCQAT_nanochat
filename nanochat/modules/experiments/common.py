@@ -13,8 +13,10 @@ import torch
 
 from nanochat.models.quant.ablation_metrics import select_quantizer
 from nanochat.models.quant.retrofit import PRESETS, retrofit_model
-from tests.conftest import build_active_tiny_gpt
-from tests.test_dbcpu_engine import make_engine
+from nanochat.modules.experiments.tiny_models import (
+    build_active_tiny_gpt,
+    make_engine,
+)
 
 #: Preset the `asym` experiment treats as the improvement, and the one it beats.
 BASELINE_PRESET = "small"
@@ -57,7 +59,7 @@ def expected_1_over_sqrt_n(n_elements: int) -> float:
     return 1.0 / (n_elements**0.5)
 
 
-def build_probe_engine(args: argparse.Namespace, seed: int = 0):
+def build_probe_engine(args: argparse.Namespace):
     """A tiny DiffusionBlocks engine, depth-configurable and with live zero-inits.
 
     `make_engine(active=True)` is what makes the gradient-reachability
@@ -72,12 +74,10 @@ def build_probe_engine(args: argparse.Namespace, seed: int = 0):
     *second* model at the default depth and silently discard the first -- the
     knob would appear to work while measuring the wrong depth.
 
-    `seed` does the same job: `make_engine` re-seeds internally, so a seed set
-    here would be overwritten. It is used to seed the *probes*, which are built
-    separately, and the engine itself is deterministic across arms -- which is
-    what pairing requires. Both arms at a given seed therefore see a
-    byte-identical engine, and a per-seed difference in the result is a
-    difference in the probe, not in the model.
+    The engine is deterministic across arms, which is what pairing requires:
+    two arms at a given seed see a byte-identical model, so a per-seed
+    difference in the result is a difference in the probe. Probes are seeded
+    separately by `block_probe_tensors`.
     """
     return make_engine(
         num_blocks=args.ablation_blocks, n_layer=args.ablation_n_layer, active=True
@@ -149,7 +149,10 @@ def count_codebook_cost(module) -> tuple[int, int]:
     twice would overstate the artifact.
     """
     params = sum(p.numel() for p in module.parameters())
-    persistent = {name for name, _ in module.named_buffers()}
+    # Persistence has to be read off `state_dict`, not off `named_buffers`:
+    # the latter yields non-persistent buffers too, so filtering by it is a
+    # tautology and every derived buffer gets priced as if it shipped.
+    persistent = set(module.state_dict())
     buffers = sum(
         b.numel() * b.element_size()
         for name, b in module.named_buffers()

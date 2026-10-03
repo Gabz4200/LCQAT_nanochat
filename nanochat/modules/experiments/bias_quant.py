@@ -193,8 +193,12 @@ def run_bias_quant(args: argparse.Namespace) -> list[AblationRow]:
         # parameters (never the derived `get_codebook()` tensor, which carries no
         # optimizer state) for `steps` SGD steps. Fixed target, so the loss is a
         # genuine signal in the same way `observe_grad_scale` makes it one.
+        # Built once and reused across the SGD steps: `non_negative_probe`
+        # seeds its own generator, so every call returned a bit-identical
+        # tensor and the loop was allocating one per step to throw away.
+        probe = non_negative_probe(layer.in_features, args.n, seed)
         layer.zero_grad(set_to_none=True)
-        out = layer(non_negative_probe(layer.in_features, args.n, seed))
+        out = layer(probe)
         out.square().mean().backward()
         target = list(quantizer.parameters())
         if not target:
@@ -212,9 +216,7 @@ def run_bias_quant(args: argparse.Namespace) -> list[AblationRow]:
         optimizer = torch.optim.SGD(target, lr=args.bias_quant_lr)
         for _ in range(args.bias_quant_steps):
             optimizer.zero_grad(set_to_none=True)
-            layer(
-                non_negative_probe(layer.in_features, args.n, seed)
-            ).square().mean().backward()
+            layer(probe).square().mean().backward()
             optimizer.step()
         moved += math.sqrt(
             sum(
@@ -316,7 +318,7 @@ def run_bias_quant(args: argparse.Namespace) -> list[AblationRow]:
             experiment="bias_quant_liveness",
             metric="codebook_param_delta",
             baseline="zero gradient",
-            variant="codebook gradient live: " + ("True" if live else "False"),
+            variant=f"codebook gradient live: {live_flag}",
             value_baseline=0.0,
             value_variant=avg_moved,
             delta=avg_moved,

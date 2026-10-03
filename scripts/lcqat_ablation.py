@@ -263,11 +263,12 @@ from nanochat.training.diffusion_blocks import (  # noqa: E402
     EquiProbabilityPartitioner,
     edm_preconditioning,
 )
-from tests.conftest import build_active_tiny_gpt  # noqa: E402
-from tests.test_dbcpu_engine import make_engine  # noqa: E402
 
+#: This module is consumed as a namespace: `tests/test_lcqat_ablation_driver.py`
+#: loads it by path and reaches the measurements through it. Module objects
+#: (`argparse`, `json`, `math`, `torch`, ...) are not part of that surface,
+#: and the five driver entry points were each listed twice.
 __all__ = [
-    # CLI surface.
     "PUBLISHED_LEADERBOARD",
     "REPO_ROOT",
     "check_claims",
@@ -275,9 +276,6 @@ __all__ = [
     "register_args",
     "validate_args",
     "write_leaderboard",
-    # Every name this module binds. The measurements moved to
-    # nanochat.modules.experiments but are re-exported here, so this list
-    # documents the module's whole surface rather than only the CLI.
     "ACT_BODIES",
     "ACT_BODY_PWL",
     "ACT_BODY_SMOOTHPWL",
@@ -322,14 +320,10 @@ __all__ = [
     "_spread",
     "_weight_kwargs",
     "add_sparseprop_pruning_args",
-    "annotations",
-    "argparse",
     "bias_probe",
     "block_probe_tensors",
     "build_activation_lut",
-    "build_active_tiny_gpt",
     "build_probe_engine",
-    "check_claims",
     "codebook_of",
     "count_codebook_cost",
     "edm_preconditioning",
@@ -338,11 +332,7 @@ __all__ = [
     "get_activation",
     "grad_retained_fraction",
     "inject_sparseprop_layers",
-    "json",
-    "main",
-    "make_engine",
     "matched_budget_codebooks",
-    "math",
     "measure_overlap_out_of_band",
     "measure_reconstruction",
     "measure_sparsity_nmse",
@@ -353,7 +343,6 @@ __all__ = [
     "pruned_lcqat_layers",
     "quantization_error",
     "reconstruct_layer",
-    "register_args",
     "render_leaderboard",
     "retrofit_model",
     "row_to_dict",
@@ -371,11 +360,6 @@ __all__ = [
     "select_quantizer",
     "sorted_overlap_sweep",
     "sparsity_sweep",
-    "sys",
-    "time",
-    "torch",
-    "validate_args",
-    "write_leaderboard",
 ]
 
 

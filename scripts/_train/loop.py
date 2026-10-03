@@ -170,14 +170,7 @@ def save_step_checkpoint(
             # an LM-mode checkpoint loads as a bare GPT with a strict
             # load and no engine adapters to be silently zero.
             "db": (
-                {
-                    "num_blocks": ctx.num_db_blocks,
-                    "sigma_min": 0.002,
-                    "sigma_max": 80.0,
-                    "sigma_data": 0.5,
-                }
-                if ctx.use_diffusion_blocks
-                else None
+                ctx.engine.partitioner.to_meta() if ctx.use_diffusion_blocks else None
             ),
             # EfQAT per-block latch: which blocks have been permanently
             # retired. Metadata only -- the tensors themselves are already
@@ -188,15 +181,9 @@ def save_step_checkpoint(
                 ctx.engine.freezer_metadata() if ctx.use_diffusion_blocks else None
             ),
             "sigma_codebook": describe_sigma_codebooks(args),
-            "sparseprop": {
-                "enabled": args.sparseprop,
-                "sparsity": args.sparseprop_sparsity,
-                "scope": ctx.sparse_schedule.scope,
-                "start_frac": ctx.sparse_schedule.start_frac,
-                "every": ctx.sparse_schedule.every,
-                "ramp_steps": ctx.sparse_schedule.ramp_steps,
-                "dense_threshold": ctx.sparse_schedule.dense_threshold,
-            },
+            "sparseprop": ctx.sparse_schedule.to_meta(
+                args.sparseprop, args.sparseprop_sparsity
+            ),
             "device_batch_size": args.device_batch_size,
             "max_seq_len": args.max_seq_len,
             "total_batch_size": ctx.total_batch_size,
@@ -436,7 +423,14 @@ def train_loop(ctx):
             ctx.scaler.update()
         else:
             ctx.optimizer.step()
-        ctx.model.zero_grad(set_to_none=True)
+        # `trainable_root`, not `model`: in DiffusionBlocks mode the optimizer
+        # owns the engine, and its `db_adapters.*` / `db_denoise_heads.*` are
+        # separate subtrees that `ctx.model` cannot reach. Zeroing the bare GPT
+        # left those gradients alive, and `_apply_requires_grad` only clears
+        # `p.grad` for parameters the *active* block does not own -- so when a
+        # block is drawn twice inside one optimizer step, the second draw's
+        # adapter and denoise-head gradients accumulate onto the first.
+        ctx.trainable_root.zero_grad(set_to_none=True)
         train_loss_f = train_loss.item()  # .item() is a CPU-GPU sync point
         ctx.synchronize()
         t1 = time.time()

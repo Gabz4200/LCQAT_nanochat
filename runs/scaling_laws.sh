@@ -16,6 +16,7 @@ EVAL_TOKENS=$((100 * 524288))  # ~100M tokens for final eval (default is ~10M)
 
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
+source "$(dirname "${BASH_SOURCE[0]}")/lib_depth.sh"
 source .venv/bin/activate
 
 RESULTS_DIR="$NANOCHAT_BASE_DIR/scaling_laws_results_${LABEL}"
@@ -60,22 +61,8 @@ for flops in "${FLOPS_BUDGETS[@]}"; do
         # Unique tag for this run
         TAG="scaling_${flops}_d${d}"
 
-        # Reduce --device-batch-size to avoid OOM at larger depths
-        if [ $d -ge 28 ]; then
-            DEVICE_BATCH_SIZE_ARG="--device-batch-size=8"
-        elif [ $d -ge 20 ]; then
-            DEVICE_BATCH_SIZE_ARG="--device-batch-size=16"
-        else
-            DEVICE_BATCH_SIZE_ARG="--device-batch-size=32"
-        fi
-        # DiffusionBlocks engine is on by default; scale the block count with depth.
-        if [ $d -ge 26 ]; then
-            DB_BLOCKS_ARG="--db-blocks=8"
-        elif [ $d -ge 16 ]; then
-            DB_BLOCKS_ARG="--db-blocks=6"
-        else
-            DB_BLOCKS_ARG="--db-blocks=4"
-        fi
+        DEVICE_BATCH_SIZE_ARG=$(device_batch_arg "$d")
+        DB_BLOCKS_ARG=$(db_blocks_arg "$d")
 
         # Record start time
         START_TIME=$(date +%s)

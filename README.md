@@ -225,11 +225,13 @@ It is easy to hit on CPU, where the natural instinct is to keep both numbers sma
 **Exporting.** Freeze a checkpoint into the quantized artifact with:
 
 ```bash
-python -m scripts.export_lcqat --source base --model-tag d4lm --step 40
-# Exported LC-QAT artifact to exports/lcqat_base_40.pt (24 quantized modules, 141.9 MiB)
+python -m scripts.export_lcqat --source base --model-tag d4exp --step 40
+# Exported LC-QAT artifact to exports/lcqat_base_40.pt (30 quantized modules, 143.8 MiB)
 ```
 
-Read that 141.9 MiB against the 149.2 MiB fp32 checkpoint it came from and the compression looks unimpressive. It is not, and the parameter table above says why: at d4 the quantized `transformer_matrices` are 3.1M of 36.7M parameters, and the other 91% is the embedding tables, which this format does not touch. The win scales with depth, not with parameter count. At GPT-2 scale the transformer is the overwhelming majority of the model and the same code path compresses it hard; nobody has measured that here yet.
+That checkpoint is from a 40-step run of the same command above with `--save-every=40`, so every default stage is engaged. The 30 modules are the 24 transformer Linears plus the 6 the DiffusionBlocks engine owns (4 adapter Linears, 2 denoise heads) — the adapters and heads are quantized too, and the artifact reloads as a `DiffusionBlockEngine` with all three subtrees still quantized. See [docs/kernels.md](docs/kernels.md#export) for what that took.
+
+Read that 143.8 MiB against the 151.9 MiB fp32 checkpoint it came from and the compression looks unimpressive. It is not, and the parameter table above says why: at d4 the quantized `transformer_matrices` are 3.1M of 36.7M parameters, and the other 91% is the embedding tables, which this format does not touch. The win scales with depth, not with parameter count. At GPT-2 scale the transformer is the overwhelming majority of the model and the same code path compresses it hard; nobody has measured that here yet.
 
 ---
 

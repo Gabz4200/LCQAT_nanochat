@@ -38,7 +38,7 @@ def _run_objective_arm(
     no gradient under it; that is a property of the objective (handoff §5.1a),
     not a wiring defect, and asserting it either way would assert an accident.
     """
-    engine = build_probe_engine(args, seed=seed)
+    engine = build_probe_engine(args)
     probe, idx, targets = block_probe_tensors(args, seed)
     params = [p for _, p in engine_named_parameters(engine) if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=args.objective_lr)

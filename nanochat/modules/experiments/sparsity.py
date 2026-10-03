@@ -162,8 +162,8 @@ def run_sparsity(args: argparse.Namespace) -> list[AblationRow]:
     SparseProp Fig. 6 compares Uniform-GMP against Global-GMP at equal average
     sparsity and finds Global better, so the two scopes are not interchangeable
     and neither is the default by construction. Both are swept here, at the
-    floors and at the target, on a retrofitted `attn.c_proj` -- the first
-    non-negative activated layer in the model. No training runs: this measures
+    floors and at the target, pooled over a retrofitted `attn.c_proj` and
+    `mlp.c_fc` -- the model's two non-negative activated layers. No training runs: this measures
     the mask, not what a trained model would do with it.
     """
     levels = sparsity_sweep(args)
@@ -199,7 +199,7 @@ def run_sparsity(args: argparse.Namespace) -> list[AblationRow]:
                 seeds=list(range(args.seeds)),
                 n_seeds=args.seeds,
                 notes=(
-                    f"dequantized NMSE of a retrofitted attn.c_proj, {scope} scope, "
+                    f"dequantized NMSE pooled over attn.c_proj and mlp.c_fc, {scope} scope, "
                     f"sparsity {low:g} -> {target:g}, reached by the gradual schedule "
                     "at its last ramp event. Masks are KEEP-masks (True = retained) "
                     "and structural zeros dequantize to exactly 0.0 "

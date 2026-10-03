@@ -16,7 +16,11 @@ from nanochat.models.quant.ablation_metrics import (
     observe_grad_scale,
 )
 from nanochat.models.quant.linear import GRAD_SCALE_INV_SQRT_N, GRAD_SCALE_NONE
-from nanochat.modules.experiments.common import VARIANT_PRESET, probe_layer
+from nanochat.modules.experiments.common import (
+    VARIANT_PRESET,
+    expected_1_over_sqrt_n,
+    probe_layer,
+)
 
 
 def run_grad_scale(
@@ -72,7 +76,7 @@ def run_grad_scale(
             n_seeds=args.seeds,
             notes=(
                 f"observed ratio {ratio:.6g} vs predicted 1/sqrt(N) = "
-                f"{1.0 / (n_elements**0.5):.6g} for N={n_elements}"
+                f"{expected_1_over_sqrt_n(n_elements):.6g} for N={n_elements}"
             ),
         )
     )

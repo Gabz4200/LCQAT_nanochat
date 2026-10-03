@@ -165,7 +165,7 @@ def _per_block_reference(
     zeroed or restored gradients -- would compare the two modes against a
     reference that had already been through the process being measured.
     """
-    engine = build_probe_engine(args, seed=seed)
+    engine = build_probe_engine(args)
     _probe, idx, _targets = block_probe_tensors(args, seed)
     clean = torch.nn.functional.normalize(
         engine.model.transformer.wte(idx).float(), dim=-1
@@ -208,7 +208,7 @@ def run_block_sampling(args: argparse.Namespace) -> list[AblationRow]:
         # Built from its own engine, before any accumulation runs.
         ref_grads, names = _per_block_reference(args, seed)
         for mode in (SAMPLING_STEP, SAMPLING_MICRO):
-            engine = build_probe_engine(args, seed=seed)
+            engine = build_probe_engine(args)
             _probe, idx, _targets = block_probe_tensors(args, seed)
             clean = torch.nn.functional.normalize(
                 engine.model.transformer.wte(idx).float(), dim=-1

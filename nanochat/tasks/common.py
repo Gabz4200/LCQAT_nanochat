@@ -9,6 +9,7 @@ import json
 import os
 import random
 import urllib.request
+from typing import Literal
 
 import numpy as np
 import pyarrow as pa
@@ -87,6 +88,38 @@ def load_hub_dataset(repo_id, subset="default", split="train"):
     return HubDataset(table)
 
 
+#: The two evaluation shapes a task can have. `generative` tasks score free
+#: text; `categorical` tasks constrain the answer to a fixed letter set. They
+#: are constants rather than bare strings because `scripts/chat_eval.py`
+#: dispatches on this value: a typo in a subclass otherwise surfaces only at
+#: eval time, as an "Unsupported task evaluation type".
+EVAL_TYPE_GENERATIVE = "generative"
+EVAL_TYPE_CATEGORICAL = "categorical"
+EvalType = Literal[EVAL_TYPE_GENERATIVE, EVAL_TYPE_CATEGORICAL]
+
+
+def categorical_match(
+    conversation: dict,
+    assistant_response: str,
+    letters,
+    task_name: str,
+) -> bool:
+    """Score a multiple-choice response against the gold letter.
+
+    The assert is not strictly speaking needed, but the way these tasks are
+    evaluated expects it to be true; it stays here to prevent footguns.
+
+    `letters` is passed in rather than read off the conversation because the
+    tasks disagree on where they keep it: ARC carries it per example, MMLU
+    keeps it on the task.
+    """
+    assert assistant_response in letters, (
+        f"{task_name} answer {assistant_response} is expected to be one of {letters}"
+    )
+    gold = conversation["messages"][-1]["content"]  # e.g. "A"
+    return assistant_response == gold
+
+
 class Task:
     """
     Base class of a Task. Allows for lightweight slicing of the underlying dataset.
@@ -104,8 +137,7 @@ class Task:
         self.step = step
 
     @property
-    def eval_type(self):
-        # one of 'generative' | 'categorical'
+    def eval_type(self) -> EvalType:
         raise NotImplementedError
 
     def num_examples(self):

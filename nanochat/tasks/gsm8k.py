@@ -16,7 +16,11 @@ Notice that GSM8K uses tool calls inside << >> tags.
 
 import re
 
-from nanochat.tasks.common import Task, load_hub_dataset
+from nanochat.tasks.common import (
+    EVAL_TYPE_GENERATIVE,
+    Task,
+    load_hub_dataset,
+)
 
 GSM_RE = re.compile(r"#### (\-?[0-9\.\,]+)")
 
@@ -44,7 +48,7 @@ class GSM8K(Task):
 
     @property
     def eval_type(self):
-        return "generative"
+        return EVAL_TYPE_GENERATIVE
 
     def num_examples(self):
         return len(self.ds)

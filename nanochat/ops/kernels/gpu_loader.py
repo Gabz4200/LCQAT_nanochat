@@ -18,6 +18,20 @@ import numpy as np
 import taichi as ti
 import torch
 
+from nanochat.models.quant.packing import (
+    FORMAT_NIBBLES,
+    FORMAT_TRITS,
+    TRITS_PER_BYTE,
+)
+
+#: Largest head dim the attention kernel's per-row accumulator is sized for.
+#: Taichi resolves a module-level Python int as a compile-time constant inside a
+#: kernel body, so the Python-side guard in `quant_attn_gpu` and the `ti.Vector`
+#: width below are the same number by construction rather than by convention --
+#: raising the guard alone would otherwise turn a clear ValueError into an
+#: out-of-range write.
+GPU_MAX_HEAD_DIM = 256
+
 _lock = Lock()
 _initialized = False
 _init_error: BaseException | None = None
@@ -135,7 +149,7 @@ def _quant_attn_kernel(
                 dot += q[q_base + dd] * k_lut[lut_base + idx]
             mx = ti.max(mx, dot * scale)
 
-        acc = ti.Vector([0.0] * 256)
+        acc = ti.Vector([0.0] * GPU_MAX_HEAD_DIM)
         total = 0.0
         for j in range(lo, g + 1):
             k_base = ((bi * seq_len + j) * h_kv + kv) * n_bytes
@@ -179,9 +193,9 @@ def _index_linear_kernel(
         for j in range(n):
             x = act_lut[act[act_base + j]]
             idx = 0
-            if format == 0:
-                byte = w[w_base + j // 5]
-                rem = j % 5
+            if format == FORMAT_TRITS:
+                byte = w[w_base + j // TRITS_PER_BYTE]
+                rem = j % TRITS_PER_BYTE
                 pow3 = 1
                 if rem == 1:
                     pow3 = 3
@@ -192,7 +206,7 @@ def _index_linear_kernel(
                 elif rem == 4:
                     pow3 = 81
                 idx = (byte // pow3) % 3
-            elif format == 1:
+            elif format == FORMAT_NIBBLES:
                 byte = w[w_base + j // 2]
                 idx = ((byte >> 4) & 15) if ((j & 1) != 0) else (byte & 15)
             else:

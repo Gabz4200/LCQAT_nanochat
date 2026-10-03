@@ -15,6 +15,7 @@ from nanochat.models.quant.packing import (
     FORMAT_NIBBLES,
     FORMAT_TRITS,
     FORMAT_UINT8,
+    TRITS_PER_BYTE,
     index_format_for_k,
     unpack_weight_indices,
 )
@@ -63,9 +64,10 @@ def validate_index_linear_inputs(
             f"format {format} does not match K={weight_lut.numel()} "
             f"(expected format {expected})"
         )
-    if format == FORMAT_TRITS and weight_indices.shape[1] * 5 < n:
+    if format == FORMAT_TRITS and weight_indices.shape[1] * TRITS_PER_BYTE < n:
         raise ValueError(
-            f"trit-packed rows hold {weight_indices.shape[1] * 5} values, need n={n}"
+            f"trit-packed rows hold {weight_indices.shape[1] * TRITS_PER_BYTE} values, "
+            f"need n={n}"
         )
     if format == FORMAT_NIBBLES and weight_indices.shape[1] * 2 < n:
         raise ValueError(

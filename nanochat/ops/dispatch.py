@@ -8,9 +8,39 @@ back to the naive reference. The naive backend is only ever reached when it
 was explicitly requested (reference testing, debugging, CI parity).
 """
 
+from typing import Literal
+
 import torch
 
-from nanochat.ops.references.gemv_reference import reference_gemv_k3
+#: The three backends every dispatcher accepts. `naive` is the pure-PyTorch
+#: oracle and is reached only when explicitly requested; `cpu` and `gpu` are
+#: the compiled paths.
+Backend = Literal["naive", "cpu", "gpu"]
+
+VALID_BACKENDS: tuple[str, ...] = ("naive", "cpu", "gpu")
+
+
+def _select_backend(backend: str, *, naive, cpu, gpu):
+    """Run the thunk for `backend`, or raise. One implementation of the ladder.
+
+    The thunks are zero-argument callables so each backend's imports stay
+    *inside* the branch: a compiled backend's module must never be imported at
+    package-import time, which is what keeps `import nanochat` working on a
+    host with no compiler and no GPU.
+
+    Raising on an unknown backend is the whole no-silent-fallback guarantee:
+    there is deliberately no path from a failed `cpu`/`gpu` request back to
+    `naive`.
+    """
+    if backend == "naive":
+        return naive()
+    if backend == "cpu":
+        return cpu()
+    if backend == "gpu":
+        return gpu()
+    raise ValueError(
+        f"Unknown backend: {backend!r}. Valid backends: {list(VALID_BACKENDS)}"
+    )
 
 
 def dispatch_gemv(
@@ -19,7 +49,7 @@ def dispatch_gemv(
     weight_indices: torch.Tensor,
     scale_neg: float,
     scale_pos: float,
-    backend: str = "naive",
+    backend: Backend = "naive",
 ) -> torch.Tensor:
     """Dispatch the K_W=3 GEMV to the selected backend.
 
@@ -32,21 +62,25 @@ def dispatch_gemv(
         backend: "naive" (pure PyTorch oracle), "cpu" (AVX-512/AVX2 C++),
             "gpu" (Taichi/Vulkan kernel).
     """
-    if backend == "naive":
+
+    def _naive():
+        from nanochat.ops.references.gemv_reference import reference_gemv_k3
+
         return reference_gemv_k3(
             act_indices, act_lut, weight_indices, scale_neg, scale_pos
         )
-    if backend == "cpu":
+
+    def _cpu():
         from nanochat.ops.gemv import gemv_k3_cpu
 
         return gemv_k3_cpu(act_indices, act_lut, weight_indices, scale_neg, scale_pos)
-    if backend == "gpu":
+
+    def _gpu():
         from nanochat.ops.gemv import gemv_k3_gpu
 
         return gemv_k3_gpu(act_indices, act_lut, weight_indices, scale_neg, scale_pos)
-    raise ValueError(
-        f"Unknown backend: {backend!r}. Valid backends: ['naive', 'cpu', 'gpu']"
-    )
+
+    return _select_backend(backend, naive=_naive, cpu=_cpu, gpu=_gpu)
 
 
 def dispatch_quant_attn(
@@ -57,7 +91,7 @@ def dispatch_quant_attn(
     v_lut: torch.Tensor,
     cache_seqlens: torch.Tensor,
     window_left: int,
-    backend: str = "naive",
+    backend: Backend = "naive",
 ) -> torch.Tensor:
     """Dispatch the index-native quantized-KV attention to the selected backend.
 
@@ -70,23 +104,25 @@ def dispatch_quant_attn(
         backend: "naive" (dequantize+SDPA oracle), "cpu" (C++ LUT-gather),
             "gpu" (Taichi/Vulkan kernel).
     """
-    if backend == "naive":
+
+    def _naive():
         from nanochat.ops.references.attn_reference import reference_quant_attn
 
         return reference_quant_attn(
             q, k_idx, v_idx, k_lut, v_lut, cache_seqlens, window_left
         )
-    if backend == "cpu":
+
+    def _cpu():
         from nanochat.ops.quant_attn import quant_attn_cpu
 
         return quant_attn_cpu(q, k_idx, v_idx, k_lut, v_lut, cache_seqlens, window_left)
-    if backend == "gpu":
+
+    def _gpu():
         from nanochat.ops.quant_attn import quant_attn_gpu
 
         return quant_attn_gpu(q, k_idx, v_idx, k_lut, v_lut, cache_seqlens, window_left)
-    raise ValueError(
-        f"Unknown backend: {backend!r}. Valid backends: ['naive', 'cpu', 'gpu']"
-    )
+
+    return _select_backend(backend, naive=_naive, cpu=_cpu, gpu=_gpu)
 
 
 def dispatch_index_linear(
@@ -96,7 +132,7 @@ def dispatch_index_linear(
     weight_lut: torch.Tensor,
     n: int,
     format: int,
-    backend: str = "naive",
+    backend: Backend = "naive",
 ) -> torch.Tensor:
     """Dispatch the K-agnostic index-weight linear to the selected backend.
 
@@ -114,7 +150,8 @@ def dispatch_index_linear(
         backend: "naive" (dequantize+matmul oracle), "cpu" (C++ LUT-gather),
             "gpu" (Taichi/Vulkan kernel).
     """
-    if backend == "naive":
+
+    def _naive():
         from nanochat.ops.references.index_linear_reference import (
             reference_index_linear,
         )
@@ -122,18 +159,19 @@ def dispatch_index_linear(
         return reference_index_linear(
             act_indices, act_lut, weight_indices, weight_lut, n, format
         )
-    if backend == "cpu":
+
+    def _cpu():
         from nanochat.ops.index_linear import index_linear_cpu
 
         return index_linear_cpu(
             act_indices, act_lut, weight_indices, weight_lut, n, format
         )
-    if backend == "gpu":
+
+    def _gpu():
         from nanochat.ops.index_linear import index_linear_gpu
 
         return index_linear_gpu(
             act_indices, act_lut, weight_indices, weight_lut, n, format
         )
-    raise ValueError(
-        f"Unknown backend: {backend!r}. Valid backends: ['naive', 'cpu', 'gpu']"
-    )
+
+    return _select_backend(backend, naive=_naive, cpu=_cpu, gpu=_gpu)

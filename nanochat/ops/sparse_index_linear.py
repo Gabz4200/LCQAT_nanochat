@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import torch
 
+from nanochat.ops.kernels.registration import register_inference_only_op
+
 _fake_registered = False
 
 
@@ -41,7 +43,6 @@ def _ensure_cpu_sparse_index_linear_op() -> None:
     if _fake_registered:
         return
 
-    @torch.library.register_fake("nanochat::lcqat_sparse_index_linear")
     def _lcqat_sparse_index_linear_fake(
         act_indices, act_lut, col_indices, row_ptr, alphabet, m, n
     ):
@@ -49,15 +50,8 @@ def _ensure_cpu_sparse_index_linear_op() -> None:
             (act_indices.shape[0], m), dtype=torch.float32, device=act_lut.device
         )
 
-    def _lcqat_sparse_index_linear_backward(ctx, *grad_outputs):
-        raise RuntimeError(
-            "nanochat::lcqat_sparse_index_linear is inference-only and defines "
-            "no gradient; training runs the STE path in F.linear instead"
-        )
-
-    torch.library.register_autograd(
-        "nanochat::lcqat_sparse_index_linear",
-        _lcqat_sparse_index_linear_backward,
+    register_inference_only_op(
+        "nanochat::lcqat_sparse_index_linear", _lcqat_sparse_index_linear_fake
     )
     _fake_registered = True
 

@@ -142,11 +142,10 @@ def sparseprop_backward_cpu(
 def _build_csr_from_mask(mask: torch.Tensor):
     """Build CSR (row_ptr, col_idx) from boolean mask [M, K].
 
-    Vectorized: `nonzero` + `bincount` + `cumsum`. The previous version looped
-    over rows calling `.tolist()` on each, which is O(M) host syncs -- unusable
-    at 4096 rows, and a large share of why SparseProp had never been exercised at
-    real depth. `nonzero` returns row-major order, so columns within a row stay
-    ascending exactly as the loop produced them.
+    Fully vectorized: `nonzero` + `bincount` + `cumsum`, so the cost is O(M)
+    device work and a single host sync rather than one per row. `nonzero`
+    returns row-major order, which is what keeps the columns within a row
+    ascending.
     """
     M = mask.shape[0]
     rows, cols = torch.nonzero(mask, as_tuple=True)
@@ -184,61 +183,52 @@ def _build_csc_from_mask(mask: torch.Tensor):
     return col_ptr.to(torch.int32), rows.to(torch.int32)
 
 
-def _naive_sparseprop_forward(
+def _masked_weight(weight_dense: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """`weight_dense` with pruned slots forced to exactly zero.
+
+    One place, because the forward and the backward must agree on whether the
+    mask is applied to the weights (it is) and never to the gradient on its own.
+    """
+    return weight_dense * mask.to(weight_dense.dtype)
+
+
+def reference_sparseprop_forward(
     x: torch.Tensor,  # [K, B]
     weight_dense: torch.Tensor,  # [M, K]
     mask: torch.Tensor,  # [M, K] bool
-    bias: torch.Tensor | None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dense masked matmul reference: y = (W * mask) @ x + bias.
 
     Layout: x [K, B], W [M, K], y [M, B].
     """
-    W_eff = weight_dense * mask.to(weight_dense.dtype)
-    y = W_eff @ x  # [M, B]
+    y = _masked_weight(weight_dense, mask) @ x  # [M, B]
     if bias is not None:
         y = y + bias.unsqueeze(1)
     return y
 
 
-def _naive_sparseprop_backward(
+def reference_sparseprop_backward(
     gY: torch.Tensor,  # [M, B]
     x: torch.Tensor,  # [K, B]
     weight_dense: torch.Tensor,  # [M, K]
     mask: torch.Tensor,  # [M, K] bool
-    bias: torch.Tensor | None,
+    bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Dense masked backward reference."""
-    W_eff = weight_dense * mask.to(weight_dense.dtype)
+    """Dense masked backward reference.
+
+    Returns dense gX, the dense masked gW, and gBias -- the "only keep nnz"
+    part of the sparse walk is expressed as the mask multiply, so the dense
+    reference and the kernel agree on which slots carry a gradient.
+    """
     # gX = W_eff.T @ gY  [K, B]
-    gX = W_eff.t() @ gY
+    gX = _masked_weight(weight_dense, mask).t() @ gY
     # gW = gY @ x.T  [M, K], but only keep nnz
     gW_dense = gY @ x.t()
     gW_masked = gW_dense * mask.to(gW_dense.dtype)
     # Bias grad
     gBias = gY.sum(dim=1) if bias is not None else None
     return gX, gW_masked, gBias
-
-
-def reference_sparseprop_forward(
-    x: torch.Tensor,
-    weight_dense: torch.Tensor,
-    mask: torch.Tensor,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Naive reference for SpMM forward (uses dense matmul with mask)."""
-    return _naive_sparseprop_forward(x, weight_dense, mask, bias)
-
-
-def reference_sparseprop_backward(
-    gY: torch.Tensor,
-    x: torch.Tensor,
-    weight_dense: torch.Tensor,
-    mask: torch.Tensor,
-    bias: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Naive reference for backward (returns dense gX, dense masked gW, gBias)."""
-    return _naive_sparseprop_backward(gY, x, weight_dense, mask, bias)
 
 
 def build_csr_csc_from_mask(mask: torch.Tensor):
@@ -248,23 +238,27 @@ def build_csr_csc_from_mask(mask: torch.Tensor):
     return w_ptr, w_col, w_cptr, w_row
 
 
-def _nnz_row_indices(w_row_ptr: torch.Tensor, M: int) -> torch.Tensor:
-    """Expand CSR row_ptr into per-nnz row indices [nnz].
+def _expand_ptr(ptr: torch.Tensor, n: int) -> torch.Tensor:
+    """Expand a CSR/CSC `ptr` into the per-nnz index it addresses, `[nnz]`.
 
-    Vectorized via `repeat_interleave`: the previous version did an `.item()`
-    per row (M host syncs). `w_row_ptr` is already on device, so only the final
-    length needs a sync.
+    `ptr` is the `n+1` prefix-sum pointer of the structure and `n` its row (or
+    column) count. One body serves both orientations -- CSR expands rows, CSC
+    expands columns -- so the two cannot disagree about the walk order. The
+    pointer is already on device, so only the final length needs a sync.
     """
-    counts = w_row_ptr[1:] - w_row_ptr[:-1]
-    rows = torch.arange(M, device=w_row_ptr.device)
-    return torch.repeat_interleave(rows, counts.to(torch.int64)).to(torch.int32)
+    counts = ptr[1:] - ptr[:-1]
+    axis = torch.arange(n, device=ptr.device)
+    return torch.repeat_interleave(axis, counts.to(torch.int64)).to(torch.int32)
 
 
-def _csc_col_indices(w_cptr: torch.Tensor, K: int, nnz: int, device) -> torch.Tensor:
-    """Expand CSC col_ptr into per-nnz column indices [nnz]. Vectorized."""
-    counts = w_cptr[1:] - w_cptr[:-1]
-    cols = torch.arange(K, device=w_cptr.device)
-    return torch.repeat_interleave(cols, counts.to(torch.int64)).to(torch.int32)
+def _nnz_row_indices(w_row_ptr: torch.Tensor, M: int) -> torch.Tensor:
+    """Expand CSR row_ptr into per-nnz row indices [nnz]."""
+    return _expand_ptr(w_row_ptr, M)
+
+
+def _csc_col_indices(w_cptr: torch.Tensor, K: int) -> torch.Tensor:
+    """Expand CSC col_ptr into per-nnz column indices [nnz]."""
+    return _expand_ptr(w_cptr, K)
 
 
 def gather_values_from_dense(

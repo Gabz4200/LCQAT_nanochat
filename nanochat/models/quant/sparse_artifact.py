@@ -43,11 +43,6 @@ from nanochat.models.quant.packing import (
     unpack_weight_indices,
 )
 
-#: Marks an artifact whose weight buffers are sparse (CSR over index slots).
-#: Consumers key off this to decide between the dense and sparse decode path.
-SPARSE_FORMAT_TAG = 1
-
-
 #: Smallest compacted alphabet an exported artifact may declare. `packing`
 #: picks a storage format from K and the densest one (trits) starts at 3, so a
 #: K=1 or K=2 artifact has no valid format and `pack_weight_indices` raises.
@@ -210,7 +205,11 @@ def csr_structure_bytes(plan: SparseExportPlan, index_bytes: int = 4) -> int:
 
 
 def dense_bytes_for(indices: torch.Tensor, k: int) -> int:
-    """Bytes the dense packed buffer for `indices` at codebook size `k` occupies."""
+    """Bytes the dense packed buffer for `indices` at codebook size `k` occupies.
+
+    Kept as a name in its own right: it is the counterfactual every sparse
+    footprint is quoted against, and `packed_value_bytes` is the primitive.
+    """
     return packed_value_bytes(indices, k)
 
 
@@ -262,7 +261,6 @@ def sparsity_break_even(indices: torch.Tensor, k: int, index_bytes: int = 4) -> 
 
 __all__ = [
     "MIN_EXPORT_ALPHABET",
-    "SPARSE_FORMAT_TAG",
     "SparseExportPlan",
     "csr_structure_bytes",
     "dense_bytes_for",

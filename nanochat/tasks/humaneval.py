@@ -7,7 +7,11 @@ It is a coding benchmark.
 import re
 
 from nanochat.modules.execution import execute_code
-from nanochat.tasks.common import Task, load_hub_dataset
+from nanochat.tasks.common import (
+    EVAL_TYPE_GENERATIVE,
+    Task,
+    load_hub_dataset,
+)
 
 
 def extract_imports(prompt):
@@ -55,7 +59,7 @@ class HumanEval(Task):
 
     @property
     def eval_type(self):
-        return "generative"
+        return EVAL_TYPE_GENERATIVE
 
     def num_examples(self):
         return len(self.ds)

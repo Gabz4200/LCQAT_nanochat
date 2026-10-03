@@ -21,10 +21,28 @@ from nanochat.training.diffusion_blocks import (
     DiffusionBlockEngine,
     EquiProbabilityPartitioner,
 )
-from nanochat.utils.common import COMPUTE_DTYPE, get_base_dir, setup_default_logging
+from nanochat.utils.common import COMPUTE_DTYPE, get_base_dir
 
-setup_default_logging()
+# `nanochat.utils.common` calls `setup_default_logging()` at its own import, so
+# calling it again here would be a no-op -- `logging.basicConfig` returns once
+# root has a handler.
 logger = logging.getLogger(__name__)
+
+
+#: State-dict key families the DiffusionBlocks engine owns, on top of the bare
+#: GPT. `diffusion_blocks.py` is the writer and this module is the reader, so the
+#: prefixes are declared once here rather than restated per check: a new family
+#: added to the writer but not to this tuple would load as an unexpected key.
+DB_ADAPTER_PREFIX = "db_adapters."
+DB_HEAD_PREFIX = "db_denoise_heads."
+#: The single shared head that preceded per-block heads.
+DB_LEGACY_HEAD_PREFIX = "db_denoise_head."
+DB_PREFIXES = (DB_ADAPTER_PREFIX, DB_HEAD_PREFIX, DB_LEGACY_HEAD_PREFIX)
+
+
+def strip_db_prefixes(model_data):
+    """The base-model view of an engine state dict: everything the GPT owns."""
+    return {k: v for k, v in model_data.items() if not k.startswith(DB_PREFIXES)}
 
 
 def log0(message):
@@ -136,6 +154,7 @@ def build_model(checkpoint_dir, step, device, phase, lcqat=None):
     # Do this BEFORE the strict load so malformed db checkpoints fail with
     # the intended message instead of an incidental LUT key error.
     db_meta = meta_data.get("db")
+    num_blocks = db_meta.get("num_blocks", 4) if db_meta is not None else 0
     if db_meta is not None:
         # The engine's own parameters (adapters, denoise heads) are zero-initialized
         # at construction (diffusion_blocks.py NoiseConditionedBlockAdapter /
@@ -146,8 +165,8 @@ def build_model(checkpoint_dir, step, device, phase, lcqat=None):
         # legacy key prefix: `db_denoise_heads.{b}.*` (per-block, W1.3) or
         # `db_denoise_head.*` (the single shared head that preceded it).
         families = {
-            "db_adapters.": ("db_adapters.",),
-            "db_denoise_head": ("db_denoise_heads.", "db_denoise_head."),
+            "db_adapters.": (DB_ADAPTER_PREFIX,),
+            "db_denoise_head": (DB_HEAD_PREFIX, DB_LEGACY_HEAD_PREFIX),
         }
         missing = [
             family
@@ -168,9 +187,8 @@ def build_model(checkpoint_dir, step, device, phase, lcqat=None):
     # prefix (db_denoise_heads.), fail with the intended message before
     # the strict base load (which would complain about LUT keys instead).
     if db_meta is not None:
-        num_blocks = db_meta.get("num_blocks", 4)
-        has_legacy_head = any(k.startswith("db_denoise_head.") for k in model_data)
-        has_per_block_heads = any(k.startswith("db_denoise_heads.") for k in model_data)
+        has_legacy_head = any(k.startswith(DB_LEGACY_HEAD_PREFIX) for k in model_data)
+        has_per_block_heads = any(k.startswith(DB_HEAD_PREFIX) for k in model_data)
         if num_blocks > 1 and has_legacy_head and not has_per_block_heads:
             raise RuntimeError(
                 f"checkpoint declares meta['db'] with num_blocks={num_blocks} "
@@ -206,20 +224,13 @@ def build_model(checkpoint_dir, step, device, phase, lcqat=None):
             with_lcqat=lcqat_active is not None,
         )
     # Strip db_ keys for base model load
-    base_model_data = {
-        k: v
-        for k, v in model_data.items()
-        if not k.startswith("db_adapters.")
-        and not k.startswith("db_denoise_heads.")
-        and not k.startswith("db_denoise_head.")
-    }
+    base_model_data = strip_db_prefixes(model_data)
     model.load_state_dict(base_model_data, strict=True, assign=True)
     if lcqat_active is None:
         finish_lcqat_after_load(model, lcqat)
 
     # DiffusionBlocks engine construction (top level, only when db_meta exists)
     if db_meta is not None:
-        num_blocks = db_meta.get("num_blocks", 4)
         sigma_min = db_meta.get("sigma_min", 0.002)
         sigma_max = db_meta.get("sigma_max", 80.0)
         sigma_data = db_meta.get("sigma_data", 0.5)

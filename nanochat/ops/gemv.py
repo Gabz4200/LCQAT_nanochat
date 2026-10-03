@@ -9,6 +9,7 @@ Compiled backends load lazily on first use - never at package import.
 import torch
 
 from nanochat.models.quant.packing import pack_nibbles, pack_trits
+from nanochat.ops.kernels.registration import register_inference_only_op
 from nanochat.ops.references.gemv_reference import validate_gemv_inputs
 
 _fake_registered = False
@@ -35,7 +36,6 @@ def _ensure_cpu_op() -> None:
     load_cpu_extension()
     if not _fake_registered:
 
-        @torch.library.register_fake("nanochat::lcqat_gemv_k3")
         def _lcqat_gemv_k3_fake(
             act_nibbles, act_lut, weight_trits, n, scale_neg, scale_pos
         ):
@@ -43,15 +43,7 @@ def _ensure_cpu_op() -> None:
                 weight_trits.shape[0], dtype=torch.float32, device=act_lut.device
             )
 
-        def _lcqat_gemv_k3_backward(ctx, *grad_outputs):
-            raise RuntimeError(
-                "nanochat::lcqat_gemv_k3 is inference-only and defines no gradient; "
-                "training runs the STE path in F.linear instead"
-            )
-
-        torch.library.register_autograd(
-            "nanochat::lcqat_gemv_k3", _lcqat_gemv_k3_backward
-        )
+        register_inference_only_op("nanochat::lcqat_gemv_k3", _lcqat_gemv_k3_fake)
         _fake_registered = True
 
 

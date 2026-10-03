@@ -10,6 +10,7 @@ raises and points at the STE F.linear training path).
 
 import torch
 
+from nanochat.ops.kernels.registration import register_inference_only_op
 from nanochat.ops.references.index_linear_reference import (
     validate_index_linear_inputs,
 )
@@ -25,7 +26,6 @@ def _ensure_cpu_index_linear_op() -> None:
     load_cpu_index_linear_extension()
     if not _fake_registered:
 
-        @torch.library.register_fake("nanochat::lcqat_index_linear")
         def _lcqat_index_linear_fake(
             act_indices, act_lut, weight_indices, weight_lut, n, format
         ):
@@ -35,14 +35,8 @@ def _ensure_cpu_index_linear_op() -> None:
                 device=act_lut.device,
             )
 
-        def _lcqat_index_linear_backward(ctx, *grad_outputs):
-            raise RuntimeError(
-                "nanochat::lcqat_index_linear is inference-only and defines no "
-                "gradient; training runs the STE path in F.linear instead"
-            )
-
-        torch.library.register_autograd(
-            "nanochat::lcqat_index_linear", _lcqat_index_linear_backward
+        register_inference_only_op(
+            "nanochat::lcqat_index_linear", _lcqat_index_linear_fake
         )
         _fake_registered = True
 

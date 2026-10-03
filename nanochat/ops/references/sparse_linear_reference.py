@@ -37,11 +37,11 @@ def validate_sparse_index_linear_inputs(
 ) -> None:
     """Fail-fast boundary validation for the CSR sparse path.
 
-    Checks the CSR structure invariants that a wrong kernel would violate
-    rather than produce: pointers are non-decreasing and start at 0, indices
-    are in range, and `nnz` agrees between all three buffers. Shape and dtype
-    errors raise here; value-range scans on the *indices* stay out of the hot
-    path because they are data-dependent (see the note in
+    Checks the *structural* invariants a wrong kernel would violate rather than
+    produce: rank, dtype, `row_ptr` has one more entry than the matrix has
+    rows, and the column listing and index buffer are the same length. Value
+    scans -- pointer monotonicity, `row_ptr[0] == 0`, column indices in range --
+    stay out of the hot path because they are data-dependent (see the note in
     `validate_index_linear_inputs`).
 
     `indices` is the compacted codebook index of each stored slot. A caller that

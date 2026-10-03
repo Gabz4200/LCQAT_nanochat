@@ -60,8 +60,11 @@ def load_cpu_attn_extension():
 def load_cpu_index_linear_extension():
     """Build (once per process) the K-agnostic index-weight linear extension.
 
-    Registers `nanochat::lcqat_index_linear` (separate extension so the GEMV
-    and attention kernels compile and cache independently).
+    Registers `nanochat::lcqat_index_linear`. Its own extension so it compiles
+    and caches independently of the GEMV and attention kernels: a change to one
+    kernel then costs one rebuild, not three. (Every one of these must use
+    TORCH_LIBRARY_FRAGMENT, never a second TORCH_LIBRARY on the same namespace
+    -- the latter SIGABRTs during dlopen.)
     """
     return _load("nanochat_lcqt_cpu_index_linear", "index_linear.cpp")
 

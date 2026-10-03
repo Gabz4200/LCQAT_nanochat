@@ -19,8 +19,7 @@ def _gather_csc_values(
     weight: torch.Tensor, w_row: torch.Tensor, w_cptr: torch.Tensor
 ) -> torch.Tensor:
     """Gather weight values at nnz positions (CSC order) from dense [M, K]."""
-    nnz = w_row.numel()
-    col_idx = _csc_col_indices(w_cptr, weight.size(1), nnz, weight.device)
+    col_idx = _csc_col_indices(w_cptr, weight.size(1))
     lin_idx = w_row.to(weight.device) * weight.size(1) + col_idx.to(weight.device)
     return weight.view(-1)[lin_idx]
 
@@ -276,7 +275,7 @@ class TestSparseLayoutContracts:
         # Every (row, col) in the CSR listing must be a mask entry, and the
         # CSC listing must be the same set.
         rows_csr = _nnz_row_indices(row_ptr, mask.shape[0]).long()
-        cols_csc = _csc_col_indices(col_ptr, mask.shape[1], nnz, mask.device).long()
+        cols_csc = _csc_col_indices(col_ptr, mask.shape[1]).long()
         csr_set = {(int(r), int(c)) for r, c in zip(rows_csr, col_idx.long())}
         csc_set = {(int(r), int(c)) for r, c in zip(row_idx.long(), cols_csc)}
         assert csr_set == csc_set

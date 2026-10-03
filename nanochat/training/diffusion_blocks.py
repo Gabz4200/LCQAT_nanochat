@@ -1,5 +1,6 @@
 """DiffusionBlocks-CPU: block-wise AR training + diffusion inference for constrained CPUs."""
 
+import argparse
 import math
 
 import torch
@@ -91,6 +92,75 @@ def _standard_normal_icdf(q: torch.Tensor) -> torch.Tensor:
     return 2.0**0.5 * torch.erfinv(2.0 * q - 1.0)
 
 
+def add_db_args(parser: argparse.ArgumentParser) -> None:
+    """Register the DiffusionBlocks (`--db-*`) flags on `parser`.
+
+    The three training entry points each spelled this block out. The defaults
+    and accepted values were already identical -- only the help prose differed,
+    with `base_train`'s being the fullest, so that is the text kept here. A flag
+    added in one script and not another would make the entry points disagree
+    about what a run means, which is the same reason
+    `add_sparseprop_pruning_args` and `add_w6_args` exist.
+
+    `--db-blocks 0` (or any negative value) disables DiffusionBlocks entirely
+    and trains a plain autoregressive LM; `--db-objective ce` is *not* that
+    baseline, because it still routes through the engine.
+    """
+    parser.add_argument(
+        "--db-blocks",
+        type=int,
+        default=4,
+        help=(
+            "number of diffusion blocks for block-wise training (default: 4). "
+            "0 (or any negative value) disables DiffusionBlocks entirely and trains "
+            "a plain autoregressive LM by next-token cross-entropy: no partitioner, "
+            "no denoise heads, no block isolation, every layer trains every step. "
+            "Use it for a conventional baseline -- --db-objective ce is NOT that "
+            "baseline, because it still routes through the engine and still "
+            "gradients only one block at a time."
+        ),
+    )
+    parser.add_argument(
+        "--db-objective",
+        type=str,
+        default="edm",
+        choices=["edm", "ce"],
+        help=(
+            "block-wise training objective. 'edm' (default) is the DiffusionBlocks "
+            "method: only the active block's layers run, so activations are "
+            "O(L/B) instead of O(L), and the block is trained by score matching "
+            "against its own equi-probability noise range. 'ce' is the escape "
+            "hatch: a full-depth next-token cross-entropy with block-isolated "
+            "gradients, which saves backward memory but no forward FLOPs and gives "
+            "no noise-range specialization. Should match the pretraining "
+            "objective -- switching mid-pipeline changes what is being optimized."
+        ),
+    )
+    parser.add_argument(
+        "--db-overlap",
+        type=float,
+        default=0.1,
+        help=(
+            "log-sigma overlap extension gamma between adjacent blocks "
+            "(DiffusionBlocks App. C). 0.0 = disjoint intervals, larger = smoother "
+            "transitions. Paper uses 0.05 for vision/diffusion, 0.1 for text."
+        ),
+    )
+    parser.add_argument(
+        "--db-block-sampling",
+        type=str,
+        default="step",
+        choices=["step", "micro"],
+        help=(
+            "when to draw the active block. 'step' (default) draws once per "
+            "optimizer step, so every micro-step in a step trains the same block. "
+            "'micro' redraws per micro-step, which degrades block-wise training "
+            "into ordinary gradient accumulation (memory saving kept, noise-range "
+            "specialization lost)."
+        ),
+    )
+
+
 class EquiProbabilityPartitioner:
     """Maps [sigma_min, sigma_max] into B equi-probability-mass intervals."""
 
@@ -113,6 +183,26 @@ class EquiProbabilityPartitioner:
         self.sigma_data = sigma_data
         self.p_mean = p_mean
         self.p_std = p_std
+
+    def to_meta(self, sigma_codebook=None) -> dict:
+        """The `meta["db"]` payload for a checkpoint this partitioner drove.
+
+        Written by the partitioner rather than by each caller, because
+        `checkpoint_manager.build_model` *rebuilds the partitioner from these
+        keys*: a literal restated at three call sites is three chances to
+        disagree with the defaults used to build the model being saved.
+        `sigma_codebook` is optional because it describes the codebooks, not the
+        partition, and only the chat stages know about it.
+        """
+        meta = {
+            "num_blocks": self.num_blocks,
+            "sigma_min": self.sigma_min,
+            "sigma_max": self.sigma_max,
+            "sigma_data": self.sigma_data,
+        }
+        if sigma_codebook is not None:
+            meta["sigma_codebook"] = sigma_codebook
+        return meta
 
     def _cdf(self, sigma: float) -> torch.Tensor:
         return _standard_normal_cdf(
@@ -220,13 +310,20 @@ def _wrap_sparseprop(
     rejects, and which silently doubled the codebook count before the partition
     check existed. Re-parenting in place keeps one registration per parameter.
     """
-    from nanochat.models.quant.linear import LCQATLinear
+    from nanochat.models.quant.linear import is_lcqat_layer
     from nanochat.models.quant.sparseprop import (
         SparsePropLinear,
         SparsePropLinearLCQAT,
     )
 
-    if isinstance(linear, LCQATLinear):
+    # `is_lcqat_layer`, not isinstance: on a ramp event the layer is
+    # ALREADY a SparsePropLinearLCQAT, which is functionally LC-QAT but
+    # not a subclass. Asking isinstance here built a plain
+    # SparsePropLinear on the second wrap, silently dropping the
+    # quantized forward while leaving the codebook modules attached --
+    # so `verify_partition` saw no missing role and the loss went
+    # unnoticed.
+    if is_lcqat_layer(linear):
         if not with_lcqat:
             # LC-QAT without SparseProp: leave the module alone. Forcing a
             # wrapper would drop the quantized inference path (see
@@ -255,7 +352,7 @@ def _reparent_sparseprop_in_place(linear, sparsity: float) -> None:
     which silently doubled the codebook parameter count before
     `verify_partition` caught it.
     """
-    from nanochat.models.quant.linear import LCQATLinear
+    from nanochat.models.quant.linear import is_lcqat_layer
     from nanochat.models.quant.sparseprop import (
         SparsePropLinear,
         SparsePropLinearLCQAT,
@@ -265,7 +362,9 @@ def _reparent_sparseprop_in_place(linear, sparsity: float) -> None:
     # on a throwaway module and then adopt. Nothing is allocated twice: the
     # weight and quantizers are the *same objects*, shared with the scratch
     # module, which is discarded immediately.
-    if isinstance(linear, LCQATLinear):
+    # `is_lcqat_layer` so a re-wrap of an already-sparse LC-QAT layer
+    # keeps the SparsePropLinearLCQAT class. See `_wrap_sparseprop`.
+    if is_lcqat_layer(linear):
         scratch = SparsePropLinearLCQAT(linear, sparsity=sparsity)
         new_cls = SparsePropLinearLCQAT
     else:

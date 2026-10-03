@@ -16,7 +16,7 @@ from nanochat.models.quant.learnable_lut import (
     RELAXATION_LOGITS,
     LearnableIndexLut,
 )
-from nanochat.models.quant.linear import LCQATLinear
+from nanochat.models.quant.linear import LCQATLinear, is_lcqat_layer
 from nanochat.models.quant.lut import ACTIVATION_LUTS, compile_activation
 from nanochat.models.quant.packing import index_dtype_for_k, pack_weight_indices
 from nanochat.models.quant.sparse_artifact import pack_sparse_plan, plan_sparse_export
@@ -32,7 +32,13 @@ def _activation_pairs(model: nn.Module, table: tuple):
     from disagreeing about which layers get a table.
     """
     for name, module in model.named_modules():
-        if not isinstance(module, LCQATLinear) or module.out_quantizer is None:
+        # `getattr`, not attribute access: `SparsePropLinearLCQAT` re-parents only
+        # the quantizers that are not None, so a sparse-wrapped layer whose
+        # out_quantizer was None has no `out_quantizer` attribute at all rather
+        # than one set to None. Reading it directly raised AttributeError as soon
+        # as any such layer existed, which is every export of a model with
+        # --sparseprop applied to a projection that does not feed the KV cache.
+        if not is_lcqat_layer(module) or getattr(module, "out_quantizer", None) is None:
             continue
         for substr, act_name, kwargs in table:
             if not name.endswith(substr):
@@ -160,11 +166,7 @@ def _next_quantized_sibling(
         if attr == leaf:
             found_self = True
             continue
-        if (
-            found_self
-            and isinstance(child, LCQATLinear)
-            and child.act_quantizer is not None
-        ):
+        if found_self and is_lcqat_layer(child) and child.act_quantizer is not None:
             return child
     return None
 

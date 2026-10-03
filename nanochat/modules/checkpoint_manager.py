@@ -17,6 +17,9 @@ from nanochat.models.quant.retrofit import (
     is_exported_lcqat_state,
     prepare_lcqat_before_load,
 )
+from nanochat.models.quant.retrofit import (
+    prepare_exported_subtree_buffers as _prepare_exported_buffers,
+)
 from nanochat.training.diffusion_blocks import (
     DiffusionBlockEngine,
     EquiProbabilityPartitioner,
@@ -120,6 +123,34 @@ def _db_keys_need(model_data: dict, suffix: str) -> bool:
     it was never trained in.
     """
     return any(k.startswith("db_") and k.endswith(suffix) for k in model_data)
+
+
+def _prepare_exported_db_buffers(engine, model_data: dict) -> None:
+    """Put the engine-owned LCQAT layers into the exported runtime shape.
+
+    The exported counterpart of `prepare_lcqat_before_load`: strip each shadow
+    weight, freeze its quantizers, and register `packed_weight_indices` plus the
+    optional sparse-CSR and activation-LUT buffers. Delegates per subtree to the
+    single implementation `retrofit.py` already uses for the bare GPT, with the
+    `db_adapters` / `db_denoise_heads` prefix re-attached so the state keys line
+    up -- which is also what proves export and load agree on the layout.
+    """
+    for attr, prefixes in (
+        ("adapters", (DB_ADAPTER_PREFIX,)),
+        ("denoise_heads", (DB_HEAD_PREFIX, DB_LEGACY_HEAD_PREFIX)),
+    ):
+        subtree_state: dict[str, torch.Tensor] = {}
+        for prefix in prefixes:
+            subtree_state.update(
+                {
+                    k[len(prefix) :]: v
+                    for k, v in model_data.items()
+                    if k.startswith(prefix)
+                }
+            )
+        if not subtree_state:
+            continue
+        _prepare_exported_buffers(getattr(engine, attr), subtree_state)
 
 
 def build_model(checkpoint_dir, step, device, phase, lcqat=None):
@@ -226,7 +257,18 @@ def build_model(checkpoint_dir, step, device, phase, lcqat=None):
     # evaluation at all. Rebuild it here from meta["sparseprop"], which records
     # the settings the checkpoint was written with.
     sparseprop_meta = meta_data.get("sparseprop")
-    if sparseprop_meta and sparseprop_meta.get("enabled"):
+    if (
+        sparseprop_meta
+        and sparseprop_meta.get("enabled")
+        # An exported artifact is already in its final shape:
+        # `prepare_lcqat_before_load` ran `_prepare_exported_buffers` above,
+        # which registered the CSR structure the artifact carries. Injecting
+        # again asks `SparsePropLinearLCQAT.from_lcqat` for `lcqat_linear.weight`
+        # -- which export deleted, so it raised AttributeError on a stripped
+        # layer. Since SparseProp is on by default, that made every exported
+        # artifact unloadable.
+        and not is_exported_lcqat_state(model_data)
+    ):
         from nanochat.models.quant.sparseprop import inject_sparseprop_layers
 
         # No pruning: the mask built here is a placeholder that the strict load
@@ -236,6 +278,19 @@ def build_model(checkpoint_dir, step, device, phase, lcqat=None):
             sparsity=float(sparseprop_meta.get("sparsity", 0.75)),
             with_lcqat=lcqat_active is not None,
         )
+    if is_exported_lcqat_state(model_data):
+        # An exported artifact keeps the D9 `LearnableIndexLut` parameters
+        # (`logits` / `initial_table`) that `--lcqat-lut-relaxation` attached
+        # during training, but `_prepare_exported_buffers` registers the baked
+        # `activation_lut` table instead and never builds the learnable module,
+        # so the strict load rejected them as unexpected. They are redundant
+        # here, not lost: the function they parameterize is the baked table
+        # beside them, and an exported artifact is inference-only by contract
+        # (the `phase == "train"` guard above rejects it outright).
+        model_data = {
+            k: v for k, v in model_data.items() if "learnable_activation_lut" not in k
+        }
+
     # Strip db_ keys for base model load
     base_model_data = strip_db_prefixes(model_data)
     model.load_state_dict(base_model_data, strict=True, assign=True)
@@ -272,16 +327,36 @@ def build_model(checkpoint_dir, step, device, phase, lcqat=None):
         # subtree the checkpoint has no codebooks for would fabricate fresh
         # codebooks that the strict-ish load then ignores, and an export would
         # freeze those random levels into the artifact.
-        if _db_keys_need(model_data, "weight_quantizer.raw_pos_deltas"):
+        exported = is_exported_lcqat_state(model_data)
+        # A training checkpoint carries `raw_*_deltas` (the un-frozen step
+        # parameters); an exported one carries `packed_weight_indices` and
+        # `compiled_codebook` instead. Both mean the db_* layers were quantized,
+        # and both need `apply_lcqat` to build the modules that can receive them.
+        db_is_lcqat = _db_keys_need(model_data, "weight_quantizer.raw_pos_deltas") or (
+            exported and _db_keys_need(model_data, "packed_weight_indices")
+        )
+        if db_is_lcqat:
             if lcqat_active is None:
                 raise RuntimeError(
-                    "checkpoint carries db_* LC-QAT codebook parameters, but its "
-                    "meta has no `lcqat` config to rebuild them from. This "
+                    "checkpoint carries db_* LC-QAT state, but its meta has no "
+                    "`lcqat` config to rebuild the codebooks from. This "
                     "checkpoint cannot be loaded losslessly; retrain it, or pass "
                     "lcqat=<LayerKConfig>."
                 )
             engine.apply_lcqat(lcqat_active)
-        if _db_keys_need(model_data, "sparsity_mask"):
+            if exported:
+                # The exported counterpart of the reshape `prepare_lcqat_before_load`
+                # applied to the bare GPT, which it could not do for these: it was
+                # handed `model`, and the engine is constructed here, after it ran.
+                # Without it the engine's adapters and heads keep their shadow
+                # weights, every db_* index buffer misses its module and is dropped
+                # by the `strict=False` load, and inference serves float adapters
+                # out of an artifact that looks fully quantized on disk.
+                _prepare_exported_db_buffers(engine, model_data)
+        # Same rule as the base GPT above: an exported artifact is already in its
+        # final shape, and `apply_sparseprop` reads the shadow weight that export
+        # deleted.
+        if _db_keys_need(model_data, "sparsity_mask") and not exported:
             engine.apply_sparseprop(
                 sparsity=float((sparseprop_meta or {}).get("sparsity", 0.75)),
                 with_lcqat=lcqat_active is not None,

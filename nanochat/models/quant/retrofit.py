@@ -637,7 +637,7 @@ def resolve_lcqat_config(
     return PRESETS[DEFAULT_PRESET]
 
 
-def _prepare_exported_buffers(model: nn.Module, model_data: dict) -> None:
+def prepare_exported_subtree_buffers(model: nn.Module, model_data: dict) -> None:
     """Strip shadow weights and register the exported runtime buffers.
 
     Turns a retrofitted float-structure model into the shape the exported
@@ -646,7 +646,14 @@ def _prepare_exported_buffers(model: nn.Module, model_data: dict) -> None:
     when present), taken from the state itself so shapes and formats can
     never disagree. A missing index key means the active LayerKConfig does
     not match the artifact - fail fast with that hint.
+
+    Public and subtree-parameterised: `checkpoint_manager` calls this for the
+    DiffusionBlocks engine's `adapters` and `denoise_heads` as well as for the
+    bare GPT, since an exported engine artifact has to be reshaped on both.
     """
+    # `named_modules()` here must reach every retrofitted layer in whatever tree
+    # it is handed. An `nn.Module` (the GPT, a ModuleList of adapters) walks
+    # itself; the `DiffusionBlockEngine` forwards to its three owned subtrees.
     for name, module in model.named_modules():
         if not is_lcqat_layer(module):
             continue
@@ -679,6 +686,17 @@ def _prepare_exported_buffers(model: nn.Module, model_data: dict) -> None:
             "sparse_index_format",
             "sparse_alphabet",
             "sparse_k_used",
+            # The training-time SparseProp bookkeeping travels in the artifact
+            # too (export does not strip it), so it has to land on the reshaped
+            # layer or the caller's strict load rejects it as unexpected. Not
+            # read by the quantized forward -- which uses the dense
+            # `packed_weight_indices` -- but keeping the trained mask means the
+            # artifact round-trips losslessly.
+            "sparsity_mask",
+            "w_ptr",
+            "w_ptr_csc",
+            "w_col",
+            "w_row",
         ):
             key = f"{name}.{suffix}"
             if key in model_data:
@@ -721,7 +739,7 @@ def prepare_lcqat_before_load(
             )
         config = resolve_lcqat_config(meta_lcqat, None)
         retrofit_model(model, config)
-        _prepare_exported_buffers(model, model_data)
+        prepare_exported_subtree_buffers(model, model_data)
         return config
     if is_lcqat_state(model_data):
         config = resolve_lcqat_config(meta_lcqat, requested)

@@ -8,6 +8,8 @@ instead of O(M*K)).
 
 from __future__ import annotations
 
+import time
+
 import torch
 import torch.nn as nn
 
@@ -16,8 +18,17 @@ from nanochat.models.quant.linear import (
     apply_trained_activation,
     quantize_with_ste,
 )
+from nanochat.ops.dispatch import (
+    dispatch_sparseprop_backward,
+    dispatch_sparseprop_forward,
+)
 from nanochat.ops.sparseprop import (
+    _nnz_row_indices,
     build_csr_csc_from_mask,
+    gather_values_from_dense,
+    gather_values_from_dense_csc,
+    sparseprop_backward_cpu,
+    sparseprop_forward_cpu,
 )
 
 #: How a pruning target is distributed across layers.
@@ -33,18 +44,56 @@ DEFAULT_DENSE_THRESHOLD = 0.8
 
 
 class SparsePropLinearFunction(torch.autograd.Function):
-    """Autograd function routing linear backward through the AVX2 kernel.
+    """Autograd function routing the linear through the selected kernel.
 
-    Forward: y = SpMM(W * mask, x) + bias
-    Backward: gX and gW (at nnz only) via C++ kernel.
+    Forward: y = SpMM(W * mask, x) + bias. Backward: gX and gW, with
+    gW an exact zero at every pruned position (what keeps pruned
+    weights frozen). `kernel` selects the implementation:
+
+    * ``"dense"`` -- the masked dense GEMM. Below the paper's 80%
+      sparsity crossover this is the faster implementation by a wide
+      margin (measured at the shapes this trains at, out=256,
+      in=1024, batch=2048, sparsity=0.75: the C++ nnz-walking SpMM
+      took 80.9 ms against the dense masked mm's 7.4 ms, and the
+      nnz-walking backward 73.9 ms against 15.6 ms). The SpMM does
+      4x fewer multiply-accumulates than the GEMM and still loses by
+      an order of magnitude, because a per-nnz gather of a B-float
+      row cannot be vectorized the way a packed GEMM micro-kernel is.
+      Arithmetic count is the wrong optimization target here; achieved
+      FLOPs is.
+    * ``"cpu"`` / ``"gpu"`` -- the SparseProp kernels (CSR SpMM
+      forward, SDDMM dW + SpGEMM dX backward), reached through
+      `dispatch_sparseprop_*`. The module measures the crossover
+      (SparsePropLinear._measure_kernel) and only leaves the dense
+      path once the sparse kernels actually win.
+
+    Equivalence is exact in structure, not approximate: pruned
+    weights hold the *exact* zero anchor (see the note in
+    SparsePropLinearLCQAT.forward), so the dense product over the
+    masked matrix sums the same surviving terms the sparse walk does,
+    and the sparse backward's scatter leaves pruned gradient slots at
+    exactly 0.0.
     """
 
     @staticmethod
-    def forward(ctx, x, weight, bias, mask):
+    def forward(
+        ctx,
+        x,
+        weight,
+        bias,
+        mask,
+        w_ptr,
+        w_col,
+        w_row,
+        w_cptr,
+        kernel,
+    ):
         """Forward: y = SpMM(W * mask, x) + bias.
 
         Layout: x [*, in], weight [out, in], y [*, out].
-        Kernel uses transposed [in, B] / [out, B] for contiguous batch axis.
+        The compiled kernels use the transposed [in, B] / [out, B]
+        layout (contiguous batch axis), so the module's [B, *] view
+        is transposed for the call and the result transposed back.
         """
         # Flatten batch dims to 2D [B, in] for the kernel
         in_f = x.size(-1)
@@ -57,38 +106,41 @@ class SparsePropLinearFunction(torch.autograd.Function):
         ctx.B = B
         ctx.has_bias = bias is not None
         ctx.x_shape = x.shape  # save original batch shape for backward reshape
-        # Only x and weight are needed by the dense backward below, so the
-        # signature carries no CSR/CSC structure: a dense matmul reads none of
-        # it. The structure buffers live on the module for the sparse export.
+        # Only x and weight are needed by the backward: the CSR/CSC
+        # structures and both gathered value listings are rebuilt from
+        # the saved weight, so they can never go stale relative to the
+        # weight the gradients are computed against.
         ctx.save_for_backward(x_flat, weight)
         ctx.mask = mask
+        ctx.w_ptr = w_ptr
+        ctx.w_col = w_col
+        ctx.w_row = w_row
+        ctx.w_cptr = w_cptr
+        ctx.kernel = kernel
 
-        # Dense masked GEMM.
-        #
-        # This replaced the AVX2 SpMM that walked the CSR nnz list. Same
-        # measurement that motivated the dense backward, on the forward at
-        # these shapes (out=256, in=1024, batch=2048, sparsity=0.75):
-        #
-        #     C++ nnz-walking SpMM   80.9 ms
-        #     dense masked mm        7.4 ms   (10.9x faster)
-        #
-        # The SpMM does 4x fewer multiply-accumulates than the GEMM and loses
-        # by an order of magnitude, because a per-nnz gather of a B-float row
-        # cannot be vectorized the way a packed GEMM micro-kernel is. Counting
-        # arithmetic is the wrong optimization target here; achieved FLOPs is.
-        #
-        # This is a drop-in equivalent, not an approximation: pruned weights
-        # hold the *exact* zero anchor (see the note in
-        # SparsePropLinearLCQAT.forward), so the dense product over the masked
-        # matrix sums the same surviving terms. Measured agreement is ~1e-6
-        # relative, i.e. fp32 summation-order noise. Pruned slots stay exactly
-        # 0.0 in the weight, which is the contract the sparse export and the
-        # mul-less kernels read.
-        out = x_flat @ weight.t()  # [B, out_f]
-
+        if kernel == "dense":
+            out = x_flat @ weight.t()  # [B, out_f]
+        else:
+            w_val = gather_values_from_dense(weight, w_col, w_ptr, out_f)
+            # No bias here: the op adds it inside its kernel, and
+            # the dense GEMM cannot take one, so the sparse path
+            # must not either -- bias is applied once, below, on
+            # both paths.
+            y = dispatch_sparseprop_forward(
+                x_flat.t(),
+                weight,
+                mask,
+                w_val,
+                w_col,
+                w_ptr,
+                None,
+                out_f,
+                backend=kernel,
+            )
+            out = y.t()  # [B, out_f]
         if bias is not None:
             out = out + bias
-        # Restore original batch shape
+        # Restore original batch shape.
         if ctx.x_shape[:-1] != out.shape[:-1]:
             out = out.reshape(*ctx.x_shape[:-1], out_f)
         return out
@@ -99,54 +151,72 @@ class SparsePropLinearFunction(torch.autograd.Function):
         x_flat, weight = ctx.saved_tensors
         B = ctx.B
         out_f = ctx.out_features
+        in_f = ctx.in_features
 
         grad_y_flat = grad_y.reshape(B, out_f)
 
-        # Dense GEMMs, masked rather than iterated over nnz.
-        #
-        # This replaced a hand-written AVX2 sparse backward that walked the
-        # CSR/CSC nnz lists. Measured at the shapes this trains at
-        # (out=256, in=1024, batch=2048, sparsity=0.75):
-        #
-        #     C++ nnz-walking backward   73.9 ms
-        #     masked dense GEMM backward  15.6 ms   (4.7x faster)
-        #
-        # The sparse version does 4x fewer multiply-accumulates (nnz*B vs
-        # M*K*B) and still loses by that much, because a per-nnz gather of a
-        # B-float row cannot be vectorized the way a blocked GEMM is: each nnz
-        # re-walks a B-element row with a stride that defeats the cache, while
-        # the GEMM streams both operands once through a packed micro-kernel.
-        # Arithmetic count is the wrong thing to optimize on this hardware --
-        # achieved FLOPs is. The forward took the same view (see the measurement
-        # there): the SpMM does 4x fewer multiply-accumulates and still loses,
-        # because a per-nnz gather of a B-float row cannot be vectorized the way
-        # a packed GEMM micro-kernel is.
-        #
-        # Equivalence is exact in structure, not approximate. In the [B, *]
-        # layout the tensors are already saved in:
-        #
-        #   dX_flat[B,in] = gY[B,out] @ W[out,in]
-        #   dW[out,in]    = gY[B,out].T @ x[B,in]
-        #
-        # The sparse walk computed dW only at surviving (m,k) and left the rest
-        # at zero; the mask multiply below zeroes precisely those positions, so
-        # the two agree to fp32 summation-order noise (~1e-7 relative). dX sums
-        # over the already-masked weight, whose pruned entries hold the exact
-        # zero anchor, so that product is bit-identical.
-        grad_x_flat = grad_y_flat @ weight  # [B, in_f]
-        grad_w = grad_y_flat.t() @ x_flat  # [out_f, in_f]
-
-        # Zero grad at masked positions (frozen pruned weights). The multiply
-        # is what keeps pruned weights frozen: the GEMM above computes a
-        # gradient at every position, including ones the sparse walk skipped.
-        grad_w = grad_w * ctx.mask.to(grad_w.dtype)
+        if ctx.kernel == "dense":
+            # Dense masked GEMMs. The mask multiply zeroes precisely
+            # the positions the sparse walk skips, so the two agree
+            # to fp32 summation-order noise (~1e-7 relative). dX sums
+            # over the already-masked weight, whose pruned entries
+            # hold the exact zero anchor, so that product is
+            # bit-identical.
+            grad_x_flat = grad_y_flat @ weight  # [B, in_f]
+            grad_w = grad_y_flat.t() @ x_flat  # [out_f, in_f]
+            # Zero grad at masked positions (frozen pruned weights).
+            # The multiply is what keeps pruned weights frozen: the
+            # GEMM above computes a gradient at every position,
+            # including ones the sparse walk skipped.
+            grad_w = grad_w * ctx.mask.to(grad_w.dtype)
+        else:
+            # Sparse kernels: gather the weight in both listings from
+            # the saved weight (the dW pass walks CSR, the dX pass
+            # walks CSC), then route through the dispatcher so the
+            # backend choice made at forward time is honoured here.
+            w_val = gather_values_from_dense(weight, ctx.w_col, ctx.w_ptr, out_f)
+            w_val_csc = gather_values_from_dense_csc(weight, ctx.w_row, ctx.w_cptr)
+            gX, gW_val = dispatch_sparseprop_backward(
+                grad_y_flat.t(),
+                x_flat.t(),
+                weight,
+                ctx.mask,
+                w_val,
+                ctx.w_col,
+                ctx.w_ptr,
+                w_val_csc,
+                ctx.w_row,
+                ctx.w_cptr,
+                out_f,
+                in_f,
+                backend=ctx.kernel,
+            )
+            grad_x_flat = gX.t()
+            # Scatter the nnz gradients into the dense [M, K] gradient.
+            # The scatter (not a mask multiply) is what makes pruned
+            # slots *exactly* zero: the sparse backward never computes
+            # a gradient for them, so nothing can accumulate there.
+            grad_w = torch.zeros(out_f, in_f, dtype=weight.dtype, device=weight.device)
+            row_idx = _nnz_row_indices(ctx.w_ptr, out_f)
+            lin_idx = row_idx.long() * in_f + ctx.w_col.long()
+            grad_w.reshape(-1)[lin_idx] = gW_val
 
         # Restore the caller's batch shape.
         grad_x = grad_x_flat.reshape(*ctx.x_shape)
 
         grad_bias = grad_y.sum(dim=0) if ctx.has_bias else None
 
-        return grad_x, grad_w, grad_bias, None
+        return (
+            grad_x,
+            grad_w,
+            grad_bias,
+            None,  # mask
+            None,  # w_ptr
+            None,  # w_col
+            None,  # w_row
+            None,  # w_cptr
+            None,  # kernel
+        )
 
 
 class SparsePropLinear(Linear):
@@ -162,6 +232,15 @@ class SparsePropLinear(Linear):
         sparsity: fraction of weights to prune (0.0-1.0)
         bias: whether to include a bias term
     """
+
+    # Class-level default for the kernel choice. The engine's
+    # in-place wrap (DiffusionBlockEngine._reparent_sparseprop_in_place)
+    # swaps the class and adopts the scratch module's buffers, but a
+    # plain attribute like `_kernel_choice` is not a buffer, so a
+    # swapped module would raise AttributeError on its first forward
+    # without this default: it reads the class's None until its own
+    # first forward resolves (and caches) the choice.
+    _kernel_choice: str | None = None
 
     def __init__(
         self,
@@ -198,6 +277,13 @@ class SparsePropLinear(Linear):
         self.register_buffer(
             "w_row", torch.zeros(0, dtype=torch.int32, device=device), persistent=True
         )
+        # The kernel this layer trains through: None = unresolved (the
+        # first forward after a mask change resolves it, measuring the
+        # paper's Sec. 4.2 crossover), "dense" below the crossover,
+        # the measured winner ("dense" / "cpu" / "gpu") above it.
+        # Plain attribute, not a buffer: it is per-run state, not
+        # checkpointed state -- a resumed run re-measures once.
+        self._kernel_choice: str | None = None
         self._init_sparsity()
 
     def _init_sparsity(self) -> None:
@@ -225,6 +311,12 @@ class SparsePropLinear(Linear):
         with torch.no_grad():
             self.weight.data[~self.sparsity_mask] = 0.0
         self._build_sparse_structure()
+        # The mask change may have crossed the dense/sparse crossover in
+        # either direction (a gradual-prune ramp only crosses upward, but
+        # a fresh `_set_mask` can land anywhere), so the kernel choice is
+        # invalidated and re-resolved -- measured again if above the
+        # threshold -- on the next forward.
+        self._kernel_choice = None
 
     def _set_mask(self, mask: torch.Tensor) -> None:
         """Update sparsity mask and re-zero inactive weight entries."""
@@ -236,10 +328,134 @@ class SparsePropLinear(Linear):
         self.sparsity_mask.copy_(mask)
         self._apply_mask()
 
+    def _resolve_kernel(self, effective_weight: torch.Tensor, x: torch.Tensor) -> str:
+        """The kernel this layer's next forward runs through.
+
+        SparseProp Sec. 4.2: a module executes dense until it is at
+        least 80% sparse, then measures one batch through each
+        implementation and keeps the fastest. Below the threshold the
+        dense masked GEMM wins by an order of magnitude, so no
+        measurement runs there (the choice is made for free); at or
+        above it the choice is measured once per mask change -- the
+        sparsity pattern is static between prune events, so the
+        probe's cost is amortized over the whole run, which is the
+        paper's argument for the policy.
+        """
+        if self._kernel_choice is None:
+            numel = effective_weight.numel()
+            sparsity = 1.0 - int(self.sparsity_mask.sum()) / numel if numel else 0.0
+            if sparsity < DEFAULT_DENSE_THRESHOLD:
+                self._kernel_choice = "dense"
+            else:
+                self._kernel_choice = self._measure_kernel(effective_weight, x)
+        return self._kernel_choice
+
+    @torch.no_grad()
+    def _measure_kernel(self, effective_weight: torch.Tensor, x: torch.Tensor) -> str:
+        """Time one batch through each implementation; return the fastest.
+
+        The probe runs the real forward and the real backward (against a
+        random output gradient, as an actual loss's gradient would be) on
+        the current batch, under `no_grad` so the probe itself leaves no
+        autograd trace. Every implementation it times is one this layer
+        can actually run: the dense masked GEMM, the AVX2 CPU kernels,
+        and -- when a Vulkan device exists -- the Taichi GPU kernel. The
+        GPU path stages every operand through host memory, so it usually
+        loses at training shapes; measuring it anyway is the policy's
+        point (choose by measurement, not by assumption), and the probe
+        runs once per mask change.
+        """
+        from nanochat.ops.kernels.gpu_loader import vulkan_available
+
+        x_flat = x.reshape(-1, x.size(-1)) if x.dim() > 2 else x
+        B, in_f = x_flat.shape
+        out_f = effective_weight.shape[0]
+        gY = torch.randn(out_f, B, dtype=torch.float32, device=x_flat.device)
+        mask_f = self.sparsity_mask.to(effective_weight.dtype)
+
+        # Dense masked GEMM: the path below-threshold layers train on.
+        # gY is in the kernel layout [M, B], so the gradient probes
+        # transpose it to [B, M] first: gX = gY.T @ W, gW = gY @ x.
+        # Probe results are discarded -- the arithmetic is what
+        # is timed, so the expressions stand alone.
+        start = time.perf_counter()
+        out = x_flat @ (effective_weight * mask_f).t()
+        if self.bias is not None:
+            out = out + self.bias
+        gY.t() @ (effective_weight * mask_f)
+        (gY @ x_flat) * mask_f
+        dense_s = time.perf_counter() - start
+
+        # Sparse CPU kernels: CSR SpMM forward, SDDMM + SpGEMM backward.
+        w_val = gather_values_from_dense(
+            effective_weight, self.w_col, self.w_ptr, out_f
+        )
+        w_val_csc = gather_values_from_dense_csc(
+            effective_weight, self.w_row, self.w_ptr_csc
+        )
+        start = time.perf_counter()
+        # Forward probe: the output is discarded, the kernel
+        # walk is what is timed.
+        sparseprop_forward_cpu(
+            x_flat.t(), w_val, self.w_col, self.w_ptr, self.bias, out_f
+        )
+        sparseprop_backward_cpu(
+            gY,
+            x_flat.t(),
+            w_val,
+            self.w_col,
+            self.w_ptr,
+            w_val_csc,
+            self.w_row,
+            self.w_ptr_csc,
+            out_f,
+            in_f,
+        )
+        cpu_s = time.perf_counter() - start
+
+        timings = {"dense": dense_s, "cpu": cpu_s}
+
+        # GPU kernel, only when a Vulkan device actually exists.
+        if vulkan_available():
+            from nanochat.ops.sparseprop import (
+                sparseprop_backward_gpu,
+                sparseprop_forward_gpu,
+            )
+
+            start = time.perf_counter()
+            sparseprop_forward_gpu(
+                x_flat.t(), w_val, self.w_col, self.w_ptr, self.bias, out_f
+            )
+            sparseprop_backward_gpu(
+                gY,
+                x_flat.t(),
+                w_val,
+                self.w_col,
+                self.w_ptr,
+                w_val_csc,
+                self.w_row,
+                self.w_ptr_csc,
+                out_f,
+                in_f,
+            )
+            timings["gpu"] = time.perf_counter() - start
+
+        best = min(timings, key=timings.get)
+        return best
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward: y = SpMM(W * mask, x) + bias."""
+        """Forward: y = SpMM(W * mask, x) + bias, through the selected kernel."""
+        kernel = self._resolve_kernel(self.weight, x)
         return SparsePropLinearFunction.apply(
-            x, self.weight, self.bias, self.sparsity_mask
+            x,
+            self.weight,
+            self.bias,
+            self.sparsity_mask,
+            self.w_ptr,
+            self.w_col,
+            self.w_row,
+            self.w_ptr_csc,
+            kernel,
         )
 
     @classmethod
@@ -429,11 +645,21 @@ class SparsePropLinearLCQAT(SparsePropLinear):
         w_q = self._quantize(self.weight_quantizer, self.weight, self.weight.numel())
 
         bias = self.bias if self.bias is not None else None
+        # The quantized weight value is what actually flows through the
+        # layer, so it is the weight the kernel choice is measured
+        # against (the structures are built from the mask, which matches
+        # the pruned positions of the quantized value).
+        kernel = self._resolve_kernel(w_q.value, x)
         out = SparsePropLinearFunction.apply(
             x_q.value,
             w_q.value,
             bias,
             self.sparsity_mask,
+            self.w_ptr,
+            self.w_col,
+            self.w_row,
+            self.w_ptr_csc,
+            kernel,
         )
 
         if orig_shape[:-1] != out.shape[:-1] or out.shape[-1] != self.out_features:

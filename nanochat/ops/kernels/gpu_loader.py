@@ -215,6 +215,106 @@ def _index_linear_kernel(
         out[linear] = acc
 
 
+# SparseProp kernels (arXiv 2302.04852, Algorithms 1-2). Each mirrors
+# the CPU kernel's decomposition so the backends agree by construction:
+# forward and dX are element-parallel over (row, batch) and
+# (column, batch) respectively -- every output element is written by
+# exactly one thread, so no atomics or barriers are needed -- and dW is
+# row-parallel over the CSR listing, where rows own disjoint nnz ranges.
+# All loop bounds are kernel arguments: Taichi resolves Python-level
+# globals at first compile, so a shape change must not require editing
+# the kernel.
+
+
+@ti.kernel
+def _sparseprop_forward_kernel(
+    w_val: _F32_ARR,
+    w_col: _I32_ARR,
+    w_ptr: _I32_ARR,
+    x: _F32_ARR,
+    bias: _F32_ARR,
+    out: _F32_ARR,
+    M: ti.i32,
+    B: ti.i32,
+    has_bias: ti.i32,
+):
+    """SparseProp SpMM: y[m, b] = sum over row m's nnz of w * x.
+
+    One thread per (output row, batch element); each walks its row's
+    CSR nnz list and accumulates into a scalar. `bias` may be a dummy
+    one-element buffer when `has_bias` is 0 -- the guard keeps it
+    unindexed.
+    """
+    for linear in range(M * B):
+        m = linear // B
+        b = linear % B
+        acc = 0.0
+        p_start = w_ptr[m]
+        p_end = w_ptr[m + 1]
+        for p in range(p_start, p_end):
+            acc += w_val[p] * x[w_col[p] * B + b]
+        if has_bias != 0:
+            acc += bias[m]
+        out[linear] = acc
+
+
+@ti.kernel
+def _sparseprop_backward_dw_kernel(
+    gY: _F32_ARR,
+    x: _F32_ARR,
+    w_col: _I32_ARR,
+    w_ptr: _I32_ARR,
+    gW_val: _F32_ARR,
+    M: ti.i32,
+    B: ti.i32,
+):
+    """SparseProp SDDMM (dW): gW_val[p] = dot(gY[m], x[col[p]]).
+
+    One thread per output row; the row computes a dot product over B
+    for each of its nnz. The SDDMM reads the CSR structure but not
+    the weight values (the gradient of an entry is the outer product
+    of the two activations, independent of the entry itself), which
+    is why this kernel takes no value buffer.
+    """
+    for m in range(M):
+        p_start = w_ptr[m]
+        p_end = w_ptr[m + 1]
+        for p in range(p_start, p_end):
+            c = w_col[p]
+            acc = 0.0
+            for b in range(B):
+                acc += gY[m * B + b] * x[c * B + b]
+            gW_val[p] = acc
+
+
+@ti.kernel
+def _sparseprop_backward_dx_kernel(
+    gY: _F32_ARR,
+    w_val_csc: _F32_ARR,
+    w_row: _I32_ARR,
+    w_cptr: _I32_ARR,
+    gX: _F32_ARR,
+    K: ti.i32,
+    B: ti.i32,
+):
+    """SparseProp SpGEMM (dX): gX[k, b] = sum over column k's nnz.
+
+    One thread per (input column, batch element); each walks the
+    column's CSC nnz list. The transpose of a CSR matrix is the same
+    matrix in CSC format, so the dX pass consumes the CSC listing the
+    structure builders emit -- no sparse transpose at runtime.
+    """
+    for linear in range(K * B):
+        k = linear // B
+        b = linear % B
+        acc = 0.0
+        p_start = w_cptr[k]
+        p_end = w_cptr[k + 1]
+        for p in range(p_start, p_end):
+            acc += w_val_csc[p] * gY[w_row[p] * B + b]
+        gX[linear] = acc
+
+
 # Staging wrappers: torch -> numpy -> Taichi ndarray -> kernel -> torch.
 
 
@@ -318,3 +418,87 @@ def run_index_linear(
     )
     ti.sync()
     return torch.from_numpy(out.to_numpy().copy()).reshape(t, m)
+
+
+def run_sparseprop_forward(
+    w_val: torch.Tensor,
+    w_col: torch.Tensor,
+    w_ptr: torch.Tensor,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+    M: int,
+) -> torch.Tensor:
+    """SparseProp SpMM; returns [M, B] FP32 on the host."""
+    _ensure_init()
+    B = int(x.shape[1])
+    out = ti.ndarray(ti.f32, shape=(M * B,))
+    has_bias = 1 if bias is not None and bias.numel() > 0 else 0
+    # A one-element dummy keeps the kernel's bias argument a valid
+    # ndarray when the layer has no bias; the has_bias guard means it
+    # is never indexed.
+    bias_arr = _to_ti(bias if has_bias else torch.zeros(1, dtype=torch.float32), ti.f32)
+    _sparseprop_forward_kernel(
+        _to_ti(w_val, ti.f32),
+        _to_ti(w_col, ti.i32),
+        _to_ti(w_ptr, ti.i32),
+        _to_ti(x, ti.f32),
+        bias_arr,
+        out,
+        int(M),
+        B,
+        has_bias,
+    )
+    ti.sync()
+    return torch.from_numpy(out.to_numpy().copy()).reshape(M, B)
+
+
+def run_sparseprop_backward(
+    gY: torch.Tensor,
+    x: torch.Tensor,
+    w_val: torch.Tensor,
+    w_col: torch.Tensor,
+    w_ptr: torch.Tensor,
+    w_val_csc: torch.Tensor,
+    w_row: torch.Tensor,
+    w_cptr: torch.Tensor,
+    M: int,
+    K: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SparseProp backward; returns (gX [K, B], gW_val [nnz]).
+
+    `w_val` is not read by either kernel -- dW is the outer product
+    of the activations and dX walks the CSC values -- but it sizes the
+    gW_val output, and taking it keeps the signature identical to the
+    CPU op so a backend swap changes one word.
+    """
+    _ensure_init()
+    B = int(gY.shape[1])
+    nnz = int(w_val.shape[0])
+    # Stage the operands both kernels share once; a second _to_ti of
+    # the same tensor would copy it twice.
+    gY_arr = _to_ti(gY, ti.f32)
+    x_arr = _to_ti(x, ti.f32)
+    gX = ti.ndarray(ti.f32, shape=(K * B,))
+    gW_val = ti.ndarray(ti.f32, shape=(nnz,))
+    _sparseprop_backward_dw_kernel(
+        gY_arr,
+        x_arr,
+        _to_ti(w_col, ti.i32),
+        _to_ti(w_ptr, ti.i32),
+        gW_val,
+        int(M),
+        B,
+    )
+    _sparseprop_backward_dx_kernel(
+        gY_arr,
+        _to_ti(w_val_csc, ti.f32),
+        _to_ti(w_row, ti.i32),
+        _to_ti(w_cptr, ti.i32),
+        gX,
+        int(K),
+        B,
+    )
+    ti.sync()
+    gx = torch.from_numpy(gX.to_numpy().copy()).reshape(K, B)
+    gw = torch.from_numpy(gW_val.to_numpy().copy())
+    return gx, gw

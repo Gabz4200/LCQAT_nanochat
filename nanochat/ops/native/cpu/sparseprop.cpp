@@ -35,13 +35,11 @@ float hsum8_avx2(__m256 v) {
 
 // --- Forward per-row SpMM: y[row,:] += sum_p w_val[p]*x[col[p],:] ---
 __attribute__((target("avx2,fma")))
-void spmm_row_avx2(const float* __restrict gy_unused, // kept for signature uniformity, unused
-                   const float* __restrict x_base,
+void spmm_row_avx2(const float* __restrict x_base,
                    const int32_t* __restrict cols,     // [nnz_in_row] column indices
                    const float* __restrict vals,       // [nnz_in_row] weight values
                    int nnz_in_row, int B,
                    float* __restrict y_row) {
-  (void)gy_unused;
   // Register-blocked over the batch axis. The naive form accumulated straight
   // into y_row, so every nnz entry paid a load/add/store round trip on the
   // output row: at the default 0.75 sparsity that is ~4/3 * K read-modify-writes
@@ -166,6 +164,27 @@ Path select_path() {
   return Path::kScalar;
 }
 
+// Validates a CSR/CSC listing before the kernels walk it: the row (or
+// column) pointers must be monotone from 0 to nnz, and every stored
+// index must lie inside the matrix. The Python facade only ever
+// produces canonical listings, but the ops are reachable directly
+// through torch.ops, and a malformed listing would otherwise read
+// out of bounds inside the kernels with no error. The pass is O(nnz),
+// the same order as the walk it guards.
+void validate_listing(const int32_t* __restrict ptr, int64_t rows,
+                      const int32_t* __restrict idx, int64_t nnz,
+                      int64_t max_index, const char* kind) {
+  TORCH_CHECK(ptr[0] == 0, kind, " listing must start at 0");
+  TORCH_CHECK(ptr[rows] == nnz, kind, " listing must end at nnz");
+  for (int64_t r = 0; r < rows; ++r) {
+    TORCH_CHECK(ptr[r] <= ptr[r + 1], kind, " pointers must be monotone");
+  }
+  for (int64_t p = 0; p < nnz; ++p) {
+    TORCH_CHECK(idx[p] >= 0 && idx[p] < max_index,
+                kind, " index out of range [0, ", max_index, ")");
+  }
+}
+
 // ---------- Torch C++ API ----------
 
 at::Tensor lcqat_sparseprop_forward(
@@ -188,6 +207,7 @@ at::Tensor lcqat_sparseprop_forward(
 
   int64_t K = x.size(0);
   int64_t B = x.size(1);
+  int64_t nnz = w_val.size(0);
 
   auto y = at::zeros({M, B}, x.options());
   if (bias.defined() && bias.numel() > 0) {
@@ -208,6 +228,10 @@ at::Tensor lcqat_sparseprop_forward(
   const float* wv_ptr = w_val.data_ptr<float>();
   const int32_t* wc_ptr = w_col.data_ptr<int32_t>();
   const int32_t* wp_ptr = w_ptr.data_ptr<int32_t>();
+  // The kernels walk the listing with raw pointer arithmetic, so a
+  // malformed one would read out of bounds with no error: validate it
+  // here, once, before the walk.
+  validate_listing(wp_ptr, M, wc_ptr, nnz, K, "CSR");
   float* y_ptr = y.data_ptr<float>();
   const Path path = select_path();
 
@@ -218,7 +242,7 @@ at::Tensor lcqat_sparseprop_forward(
       int nnz_in_row = p_end - p_start;
       float* y_row = y_ptr + m * B;
       if (path == Path::kAVX2) {
-        spmm_row_avx2(nullptr, x_ptr, wc_ptr + p_start, wv_ptr + p_start,
+        spmm_row_avx2(x_ptr, wc_ptr + p_start, wv_ptr + p_start,
                        nnz_in_row, B, y_row);
       } else {
         spmm_row_scalar(x_ptr, wc_ptr + p_start, wv_ptr + p_start,
@@ -252,6 +276,7 @@ std::tuple<at::Tensor, at::Tensor> lcqat_sparseprop_backward(
 
   int64_t B = gY.size(1);
   int64_t nnz = w_val.size(0);
+  TORCH_CHECK(w_val_csc.size(0) == nnz, "w_val and w_val_csc must have the same length");
 
   auto gW_val = at::empty({nnz}, w_val.options());
   auto gX = at::zeros({K, B}, x.options());
@@ -264,6 +289,13 @@ std::tuple<at::Tensor, at::Tensor> lcqat_sparseprop_backward(
   const float* wvc_ptr = w_val_csc.data_ptr<float>();
   const int32_t* wr_ptr = w_row.data_ptr<int32_t>();
   const int32_t* wcptr_ptr = w_cptr.data_ptr<int32_t>();
+  // The kernels walk both listings with raw pointer arithmetic,
+  // so a malformed one would read out of bounds with no error:
+  // validate them here, once, before the walk. CSR walks
+  // columns of W (max index K); CSC walks rows of W (max
+  // index M).
+  validate_listing(wp_ptr, M, wc_ptr, nnz, K, "CSR");
+  validate_listing(wcptr_ptr, K, wr_ptr, nnz, M, "CSC");
   float* gw_ptr = gW_val.data_ptr<float>();
   float* gx_ptr = gX.data_ptr<float>();
   const Path path = select_path();

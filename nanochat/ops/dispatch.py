@@ -175,3 +175,120 @@ def dispatch_index_linear(
         )
 
     return _select_backend(backend, naive=_naive, cpu=_cpu, gpu=_gpu)
+
+
+def dispatch_sparseprop_forward(
+    x: torch.Tensor,
+    weight_dense: torch.Tensor,
+    mask: torch.Tensor,
+    w_val: torch.Tensor,
+    w_col: torch.Tensor,
+    w_ptr: torch.Tensor,
+    bias: torch.Tensor | None,
+    M: int,
+    backend: Backend = "naive",
+) -> torch.Tensor:
+    """Dispatch the SparseProp SpMM to the selected backend.
+
+    Both representations are carried deliberately: the mask is
+    the *specification* ("this slot is zero"), the CSR listing is
+    the *implementation*. The naive oracle computes the dense
+    masked matmul from the mask; the compiled backends walk the
+    listing. A kernel that skipped or double-counted an nnz, or
+    read the wrong column, agrees with neither -- which is the
+    question the dispatch exists to answer.
+
+    Args:
+        x: [K, B] float32 input (transposed layout, batch-major
+            storage is the caller's view of the same batch).
+        weight_dense: [M, K] float32 weight (naive oracle only).
+        mask: [M, K] bool keep-mask (naive oracle only).
+        w_val, w_col, w_ptr: the CSR listing (compiled backends).
+        bias: [M] float32 or None.
+        M: out_features.
+        backend: "naive" (dense masked matmul oracle), "cpu"
+            (AVX2 C++ kernels), "gpu" (Taichi/Vulkan kernel).
+    """
+
+    def _naive():
+        from nanochat.ops.sparseprop import reference_sparseprop_forward
+
+        return reference_sparseprop_forward(x, weight_dense, mask, bias)
+
+    def _cpu():
+        from nanochat.ops.sparseprop import sparseprop_forward_cpu
+
+        return sparseprop_forward_cpu(x, w_val, w_col, w_ptr, bias, M)
+
+    def _gpu():
+        from nanochat.ops.sparseprop import sparseprop_forward_gpu
+
+        return sparseprop_forward_gpu(x, w_val, w_col, w_ptr, bias, M)
+
+    return _select_backend(backend, naive=_naive, cpu=_cpu, gpu=_gpu)
+
+
+def dispatch_sparseprop_backward(
+    gY: torch.Tensor,
+    x: torch.Tensor,
+    weight_dense: torch.Tensor,
+    mask: torch.Tensor,
+    w_val: torch.Tensor,
+    w_col: torch.Tensor,
+    w_ptr: torch.Tensor,
+    w_val_csc: torch.Tensor,
+    w_row: torch.Tensor,
+    w_cptr: torch.Tensor,
+    M: int,
+    K: int,
+    backend: Backend = "naive",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch the SparseProp backward to the selected backend.
+
+    Every backend returns the kernel layout: gX [K, B] and
+    gW_val [nnz] in CSR order. The naive oracle computes the
+    dense masked gradients and extracts the nnz listing through
+    the same CSR structure, so the three backends agree on
+    shape and semantics by construction.
+
+    Args:
+        gY: [M, B] float32 output gradient (kernel layout).
+        x: [K, B] float32 input.
+        weight_dense: [M, K] float32 weight (naive oracle only).
+        mask: [M, K] bool keep-mask (naive oracle only).
+        w_val, w_col, w_ptr: CSR listing (dW pass).
+        w_val_csc, w_row, w_cptr: CSC listing (dX pass).
+        M: out_features, K: in_features.
+        backend: "naive" (dense masked reference), "cpu" (AVX2
+            C++ kernels), "gpu" (Taichi/Vulkan kernel).
+    """
+
+    def _naive():
+        from nanochat.ops.sparseprop import (
+            _nnz_row_indices,
+            reference_sparseprop_backward,
+        )
+
+        gX, gW_masked, _ = reference_sparseprop_backward(
+            gY, x, weight_dense, mask, None
+        )
+        row_idx = _nnz_row_indices(w_ptr, M)
+        lin_idx = row_idx.long() * K + w_col.long()
+        gW_val = gW_masked.reshape(-1)[lin_idx.to(gW_masked.device)]
+        return gX, gW_val
+
+    def _cpu():
+        from nanochat.ops.sparseprop import sparseprop_backward_cpu
+
+        return sparseprop_backward_cpu(
+            gY, x, w_val, w_col, w_ptr, w_val_csc, w_row, w_cptr, M, K
+        )
+
+    def _gpu():
+        from nanochat.ops.sparseprop import sparseprop_backward_gpu
+
+        return sparseprop_backward_gpu(
+            gY, x, w_val, w_col, w_ptr, w_val_csc, w_row, w_cptr, M, K
+        )
+
+    return _select_backend(backend, naive=_naive, cpu=_cpu, gpu=_gpu)

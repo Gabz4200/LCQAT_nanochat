@@ -596,15 +596,12 @@ def register_args(parser: argparse.ArgumentParser) -> None:
         default=2048,
         help="Sigma draws per diffusion block in the `overlap` experiment.",
     )
-    group.add_argument(
-        "--sparseprop-sparsity",
-        type=float,
-        default=0.75,
-        help="Target sparsity for the `sparsity` experiment.",
-    )
-    # Scope, gradual schedule, dense threshold. Registered through the shared
-    # helper, so this driver cannot drift from `base_train` on a flag that
-    # changes what a pruning mask means.
+    # The whole SparseProp surface -- scope, sparsity, gradual schedule, dense
+    # threshold -- comes from the shared helper, so this driver cannot drift
+    # from `base_train` on a flag that changes what a pruning mask means. It
+    # includes `--sparseprop-sparsity`, which used to be registered here as well
+    # with driver-specific help text; two registrations of one flag is an
+    # argparse conflict, so the shared help wins.
     add_sparseprop_pruning_args(group)
 
 

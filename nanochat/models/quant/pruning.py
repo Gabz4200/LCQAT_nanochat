@@ -75,6 +75,24 @@ class GradualPruningSchedule:
         if self.scope not in PRUNE_SCOPES:
             raise ValueError(f"scope must be layer or global, got {self.scope!r}")
 
+    def to_meta(self, enabled: bool, sparsity: float) -> dict:
+        """The `meta["sparseprop"]` payload for a checkpoint this schedule drove.
+
+        `enabled` and `sparsity` are the *requested* values rather than derived
+        ones: `self.enabled` is False whenever `every == 0`, and a checkpoint
+        written that way would make a resume drop the ramp configuration it was
+        trained with. The reader wants what was asked for.
+        """
+        return {
+            "enabled": enabled,
+            "sparsity": sparsity,
+            "scope": self.scope,
+            "start_frac": self.start_frac,
+            "every": self.every,
+            "ramp_steps": self.ramp_steps,
+            "dense_threshold": self.dense_threshold,
+        }
+
     @property
     def enabled(self) -> bool:
         """True when the schedule re-prunes at all."""
@@ -185,7 +203,24 @@ def add_sparseprop_pruning_args(parser) -> None:
     Shared by base_train / chat_sft / chat_rl so the three entry points cannot
     drift apart on the same hardware knob (AGENTS.md: "Hardware knobs exist for
     a reason ... Don't hide them behind config files").
+
+    The always-on pair lives here too, rather than being written out in each
+    entry point: a helper named for this surface that left two of its own flags
+    in the caller is a helper that will drift.
     """
+    parser.add_argument(
+        "--no-sparseprop",
+        action="store_false",
+        dest="sparseprop",
+        default=True,
+        help="disable SparseProp sparse backprop (default: SparseProp is always on)",
+    )
+    parser.add_argument(
+        "--sparseprop-sparsity",
+        type=float,
+        default=0.75,
+        help="sparsity level for SparseProp (fraction of weights pruned, 0.0-1.0)",
+    )
     parser.add_argument(
         "--sparseprop-scope",
         choices=(SCOPE_LAYER, SCOPE_GLOBAL),

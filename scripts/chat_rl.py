@@ -34,6 +34,7 @@ from nanochat.tasks.gsm8k import GSM8K
 from nanochat.training.diffusion_blocks import (
     DiffusionBlockEngine,
     EquiProbabilityPartitioner,
+    add_db_args,
 )
 from nanochat.utils.common import (
     DummyWandb,
@@ -43,28 +44,15 @@ from nanochat.utils.common import (
     get_base_dir,
     print0,
 )
+from scripts._cli import add_common_cli_args
 
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Reinforcement learning on GSM8K")
+add_common_cli_args(parser, model_step=True)
 # Logging
-parser.add_argument(
-    "--run",
-    type=str,
-    default="dummy",
-    help="wandb run name ('dummy' disables wandb logging)",
-)
 # Runtime
-parser.add_argument(
-    "--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)"
-)
 # Model loading
-parser.add_argument(
-    "--model-tag", type=str, default=None, help="model tag to load from"
-)
-parser.add_argument(
-    "--model-step", type=int, default=None, help="model step to load from"
-)
 add_lcqat_args(parser)
 # Training horizon
 parser.add_argument(
@@ -121,57 +109,13 @@ parser.add_argument(
 parser.add_argument(
     "--init-lr-frac", type=float, default=0.05, help="initial LR as fraction of base LR"
 )
-parser.add_argument(
-    "--db-objective",
-    type=str,
-    default="edm",
-    choices=["edm", "ce"],
-    help=(
-        "block-wise training objective. 'edm' (default) is the DiffusionBlocks "
-        "method: only the active block's layers run, so activations are "
-        "O(L/B). 'ce' is the escape hatch (full-depth next-token cross-entropy "
-        "with block-isolated gradients). Should match the pretraining "
-        "objective -- switching mid-pipeline changes what is being optimized."
-    ),
-)
-parser.add_argument(
-    "--db-overlap",
-    type=float,
-    default=0.1,
-    help="log-sigma overlap between adjacent blocks (DiffusionBlocks App. C)",
-)
-parser.add_argument(
-    "--db-block-sampling",
-    type=str,
-    default="step",
-    choices=["step", "micro"],
-    help="draw the active block once per optimizer step (default) or per micro-step",
-)
-parser.add_argument(
-    "--db-blocks",
-    type=int,
-    default=4,
-    help="number of diffusion blocks for block-wise training (default: 4)",
-)
-parser.add_argument(
-    "--no-sparseprop",
-    action="store_false",
-    dest="sparseprop",
-    default=True,
-    help="disable SparseProp sparse backprop (default: SparseProp is always on)",
-)
-parser.add_argument(
-    "--sparseprop-sparsity",
-    type=float,
-    default=0.75,
-    help="sparsity level for SparseProp (fraction of weights pruned, 0.0-1.0)",
-)
 from nanochat.models.quant.pruning import (  # noqa: E402
     add_sparseprop_pruning_args,
     schedule_from_args,
 )
 
 add_sparseprop_pruning_args(parser)
+add_db_args(parser)
 # W6 DiffusionBlocks features (sigma codebooks / EfQAT per-block latching /
 # denoiser KD) plus --lcqat-channel-center, registered through the same shared
 # helper base_train and chat_sft use so the three entry points cannot drift
@@ -648,27 +592,18 @@ for step in range(num_steps):
             {
                 "model_config": model_config_kwargs,
                 "lcqat": lcqat_meta,
-                "db": {
-                    "num_blocks": num_db_blocks,
-                    "sigma_min": 0.002,
-                    "sigma_max": 80.0,
-                    "sigma_data": 0.5,
-                    # Recorded so a resumed run reports the codebook structure
-                    # it is actually training. `--db-sigma-codebook` is rejected
-                    # above under RL, so this is always the disabled form here;
-                    # it is written anyway because omitting it would make a
-                    # resume read the key as missing rather than as "off".
-                    "sigma_codebook": describe_sigma_codebooks(args),
-                },
-                "sparseprop": {
-                    "enabled": args.sparseprop,
-                    "sparsity": args.sparseprop_sparsity,
-                    "scope": sparse_schedule.scope,
-                    "start_frac": sparse_schedule.start_frac,
-                    "every": sparse_schedule.every,
-                    "ramp_steps": sparse_schedule.ramp_steps,
-                    "dense_threshold": sparse_schedule.dense_threshold,
-                },
+                # `sigma_codebook` is recorded so a resumed run reports the
+                # codebook structure it is actually training.
+                # `--db-sigma-codebook` is rejected above under RL, so this
+                # is always the disabled form here; it is written anyway
+                # because omitting it would make a resume read the key as
+                # missing rather than as "off".
+                "db": db_engine.partitioner.to_meta(
+                    sigma_codebook=describe_sigma_codebooks(args)
+                ),
+                "sparseprop": sparse_schedule.to_meta(
+                    args.sparseprop, args.sparseprop_sparsity
+                ),
             },
         )
         print0(f"✅ Saved model checkpoint to {checkpoint_dir}")

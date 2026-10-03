@@ -10,7 +10,7 @@ import time
 import torch
 
 from nanochat.data.dataset import parquets_iter_batched
-from nanochat.data.tokenizer import RustBPETokenizer
+from nanochat.data.tokenizer import RustBPETokenizer, token_bytes_path
 from nanochat.utils.common import get_base_dir
 
 # -----------------------------------------------------------------------------
@@ -106,7 +106,8 @@ for token_id in range(vocab_size):
         num_bytes = len(tokenizer.decode_single_token_bytes(token_id))
         token_bytes.append(num_bytes)
 token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device="cpu")
-token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
-with open(token_bytes_path, "wb") as f:
+# Shared with `get_token_bytes`: producer and consumer must agree byte-for-byte.
+token_bytes_file = token_bytes_path()
+with open(token_bytes_file, "wb") as f:
     torch.save(token_bytes, f)
-print(f"Saved token_bytes to {token_bytes_path}")
+print(f"Saved token_bytes to {token_bytes_file}")

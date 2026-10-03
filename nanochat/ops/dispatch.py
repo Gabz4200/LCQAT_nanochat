@@ -292,3 +292,42 @@ def dispatch_sparseprop_backward(
         )
 
     return _select_backend(backend, naive=_naive, cpu=_cpu, gpu=_gpu)
+
+
+def dispatch_db_denoise(
+    pred: torch.Tensor,
+    clean: torch.Tensor,
+    weight: float,
+    backend: Backend = "naive",
+) -> torch.Tensor:
+    """Dispatch the DiffusionBlocks EDM denoising loss to the selected backend.
+
+    The exact training objective every `denoise_step` optimizes:
+    `weight * mean((pred - clean)^2)` over all elements, returned as a 0-d
+    FP32 scalar. `weight` is the scalar EDM weight `w(sigma)` for the step's
+    single sampled sigma.
+
+    Args:
+        pred: [...] float32 denoiser prediction (any shape, non-empty).
+        clean: [...] float32 detached target, same shape as pred.
+        weight: scalar EDM weight (non-negative Python float).
+        backend: "naive" (pure-PyTorch oracle), "cpu" (C++ kernel),
+            "gpu" (Taichi/Vulkan kernel).
+    """
+
+    def _naive():
+        from nanochat.ops.references.db_denoise_reference import reference_db_denoise
+
+        return reference_db_denoise(pred, clean, float(weight))
+
+    def _cpu():
+        from nanochat.ops.db_denoise import db_denoise_cpu
+
+        return db_denoise_cpu(pred, clean, float(weight))
+
+    def _gpu():
+        from nanochat.ops.db_denoise import db_denoise_gpu
+
+        return db_denoise_gpu(pred, clean, float(weight))
+
+    return _select_backend(backend, naive=_naive, cpu=_cpu, gpu=_gpu)

@@ -73,7 +73,10 @@ def test_when_db_meta_present_but_db_keys_missing_then_raises(tmp_path):
         1,
         model.state_dict(),
         {},
-        {"model_config": _config_kwargs(model), "db": {"num_blocks": 2}},
+        {
+            "model_config": _config_kwargs(model),
+            "db": {"num_blocks": 2, "noise_map_version": 2},
+        },
     )
     with pytest.raises(RuntimeError, match="db_adapters"):
         build_model(str(tmp_path), 1, torch.device("cpu"), phase="eval")
@@ -87,7 +90,7 @@ def test_when_db_meta_present_with_db_keys_then_builds(tmp_path):
         1,
         engine.state_dict(),
         {},
-        {"model_config": config, "db": {"num_blocks": 2}},
+        {"model_config": config, "db": {"num_blocks": 2, "noise_map_version": 2}},
     )
     built, _tokenizer, meta = build_model(
         str(tmp_path), 1, torch.device("cpu"), phase="eval"
@@ -139,7 +142,7 @@ def test_when_db_engine_layers_are_quantized_then_build_model_retrofits_them(
         1,
         engine.state_dict(),
         {},
-        {"model_config": config, "db": {"num_blocks": 2}},
+        {"model_config": config, "db": {"num_blocks": 2, "noise_map_version": 2}},
     )
     saved = engine.state_dict()
 
@@ -184,7 +187,7 @@ def test_when_db_engine_layers_are_quantized_then_no_db_key_is_silently_dropped(
         1,
         engine.state_dict(),
         {},
-        {"model_config": config, "db": {"num_blocks": 2}},
+        {"model_config": config, "db": {"num_blocks": 2, "noise_map_version": 2}},
     )
 
     built, _tokenizer, _meta = build_model(
@@ -212,7 +215,10 @@ def test_when_legacy_single_denoise_head_and_multiple_blocks_then_raises(tmp_pat
         1,
         state,
         {},
-        {"model_config": _config_kwargs(base), "db": {"num_blocks": 2}},
+        {
+            "model_config": _config_kwargs(base),
+            "db": {"num_blocks": 2, "noise_map_version": 2},
+        },
     )
     with pytest.raises(RuntimeError, match="legacy single"):
         build_model(str(tmp_path), 1, torch.device("cpu"), phase="eval")

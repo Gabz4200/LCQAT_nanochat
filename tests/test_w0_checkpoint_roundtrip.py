@@ -55,7 +55,11 @@ def test_when_save_and_load_then_engine_state_is_identical(tmp_path):
     state = {k: v.clone() for k, v in engine.state_dict().items()}
 
     save_checkpoint(
-        str(tmp_path), 1, state, {}, {"model_config": {}, "db": {"num_blocks": 2}}
+        str(tmp_path),
+        1,
+        state,
+        {},
+        {"model_config": {}, "db": {"num_blocks": 2, "noise_map_version": 2}},
     )
     loaded, _, meta = load_checkpoint(
         str(tmp_path), 1, torch.device("cpu"), load_optimizer=False

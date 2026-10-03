@@ -34,9 +34,8 @@ def test_when_denoise_step_then_loss_and_sigma_are_well_formed() -> None:
 def test_when_sigma_sampled_then_it_lies_in_the_blocks_own_range() -> None:
     """Equi-probability partitioning: each block owns a disjoint sigma interval."""
     engine = make_engine(3, n_layer=6)
-    bounds = engine.partitioner.boundaries()
     for b in range(3):
-        lo, hi = float(bounds[b]), float(bounds[b + 1])
+        lo, hi = (float(v) for v in engine.partitioner.range_for_block(b))
         for _ in range(20):
             sigma = float(engine.partitioner.sample_sigma(b, overlap=0.0))
             assert lo <= sigma <= hi, f"block {b} sampled {sigma} outside [{lo}, {hi}]"
@@ -50,9 +49,8 @@ def test_when_overlap_enabled_then_range_is_widened() -> None:
     is a property of the noise schedule rather than of the network.
     """
     part = EquiProbabilityPartitioner(num_blocks=3)
-    bounds = part.boundaries()
     for b in range(3):
-        lo, hi = float(bounds[b]), float(bounds[b + 1])
+        lo, hi = (float(v) for v in part.range_for_block(b))
         # gamma > 0 widens the support to [lo/alpha, hi*alpha] with
         # alpha = (hi/lo)^gamma > 1, so the widened distribution covers strictly
         # more of the log-sigma axis. Assert that on the CDF directly: the

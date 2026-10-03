@@ -502,3 +502,46 @@ def run_sparseprop_backward(
     gx = torch.from_numpy(gX.to_numpy().copy()).reshape(K, B)
     gw = torch.from_numpy(gW_val.to_numpy().copy())
     return gx, gw
+
+
+# DiffusionBlocks EDM denoising loss (arXiv 2506.14202, training objective).
+# loss = w * mean((pred - clean)^2) over all N elements. One thread walks the
+# flattened buffers and reduces into a scalar -- the reduction is serial by
+# construction (parallel writes to one accumulator would race), which is the
+# same shape as the GEMV kernel above: correctness first, in one fused pass.
+
+
+@ti.kernel
+def _db_denoise_kernel(
+    pred: _F32_ARR,
+    clean: _F32_ARR,
+    out: _F32_ARR,
+    n: ti.i32,
+    w: ti.f32,
+):
+    """EDM loss: frontend stages flattened [N] buffers; returns scalar out[0]."""
+    acc = 0.0
+    for i in range(n):
+        d = pred[i] - clean[i]
+        acc += d * d
+    out[0] = w * acc / ti.cast(n, ti.f32)
+
+
+def run_db_denoise(
+    pred: torch.Tensor,
+    clean: torch.Tensor,
+    weight: float,
+) -> torch.Tensor:
+    """EDM denoising loss; returns a 0-d FP32 tensor on the host."""
+    _ensure_init()
+    n = int(pred.numel())
+    out = ti.ndarray(ti.f32, shape=(1,))
+    _db_denoise_kernel(
+        _to_ti(pred, ti.f32),
+        _to_ti(clean, ti.f32),
+        out,
+        n,
+        float(weight),
+    )
+    ti.sync()
+    return torch.from_numpy(out.to_numpy().copy()).reshape(())

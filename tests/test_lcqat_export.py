@@ -125,7 +125,7 @@ def test_when_loading_exported_db_artifact_then_engine_owns_its_quantized_layers
         {
             "model_config": asdict(config),
             "lcqat": asdict(PRESETS[DEFAULT_PRESET]),
-            "db": {"num_blocks": 2},
+            "db": {"num_blocks": 2, "noise_map_version": 2},
         },
     )
 

@@ -299,7 +299,9 @@ else:
         sigma_max=80.0,
         sigma_data=0.5,
     )
-    engine = DiffusionBlockEngine(base_model, partitioner)
+    engine = DiffusionBlockEngine(
+        base_model, partitioner, denoise_backend=args.db_denoise_backend
+    )
 
 # LC-QAT: retrofit the engine-owned Linear layers (adapters + denoise heads)
 # so the whole training pipeline is LC-QAT. The base model was already
@@ -852,7 +854,11 @@ while True:
     for micro_step in range(grad_accum_steps):
         if args.db_objective == "edm":
             loss, _ = engine.denoise_step(
-                x, block_idx=block_idx, overlap=args.db_overlap, clean=clean
+                x,
+                block_idx=block_idx,
+                overlap=args.db_overlap,
+                clean=clean,
+                backend=args.db_denoise_backend,
             )
             if engine.distiller is not None:
                 step_kd_logged = step_kd_logged + float(engine.last_kd_loss)

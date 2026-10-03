@@ -92,6 +92,15 @@ def _standard_normal_icdf(q: torch.Tensor) -> torch.Tensor:
     return 2.0**0.5 * torch.erfinv(2.0 * q - 1.0)
 
 
+#: Checkpoint provenance for the block/noise map. v1 mapped block 0 onto the
+#: LOWEST sigma range (backwards relative to the paper Fig. 6 / App. C); v2
+#: corrects it so block 0 (earliest layers) owns the highest noise range. The
+#: loader rejects anything but the current version loudly, because a v1
+#: checkpoint resumed under v2 would silently retarget every block's noise
+#: range and train garbage that looks healthy.
+NOISE_MAP_VERSION = 2
+
+
 def add_db_args(parser: argparse.ArgumentParser) -> None:
     """Register the DiffusionBlocks (`--db-*`) flags on `parser`.
 
@@ -159,10 +168,32 @@ def add_db_args(parser: argparse.ArgumentParser) -> None:
             "specialization lost)."
         ),
     )
+    parser.add_argument(
+        "--db-denoise-backend",
+        type=str,
+        default="cpu",
+        choices=["naive", "cpu", "gpu"],
+        help=(
+            "which backend computes the EDM loss scalar in `denoise_step`. "
+            "'cpu' (default) runs the compiled C++ kernel, 'naive' the "
+            "pure-PyTorch oracle, 'gpu' the Taichi/Vulkan kernel. All three "
+            "agree by construction (see tests/test_db_denoise_kernel.py); a "
+            "requested compiled backend that cannot run raises instead of "
+            "silently falling back."
+        ),
+    )
 
 
 class EquiProbabilityPartitioner:
-    """Maps [sigma_min, sigma_max] into B equi-probability-mass intervals."""
+    """Maps [sigma_min, sigma_max] into B equi-probability-mass intervals.
+
+    Block/noise convention (paper Fig. 6, App. C): block 0 is the EARLIEST
+    layers and owns the HIGHEST noise range; block B-1 (latest layers) owns the
+    lowest. `boundaries()` stays ascending (sigma_min -> sigma_max);
+    `range_for_block` applies the reversal, so every consumer (training
+    sampler, Euler sampler) shares one mapping instead of re-deriving it.
+    `NOISE_MAP_VERSION` (module level) stamps the checkpoint provenance.
+    """
 
     def __init__(
         self,
@@ -199,6 +230,7 @@ class EquiProbabilityPartitioner:
             "sigma_min": self.sigma_min,
             "sigma_max": self.sigma_max,
             "sigma_data": self.sigma_data,
+            "noise_map_version": NOISE_MAP_VERSION,
         }
         if sigma_codebook is not None:
             meta["sigma_codebook"] = sigma_codebook
@@ -211,14 +243,25 @@ class EquiProbabilityPartitioner:
             )
         )
 
+    def range_for_block(self, block_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The (lo, hi) sigma interval block `block_idx` owns.
+
+        The single owner of the block/noise map: `boundaries()` is ascending,
+        and block 0 (earliest layers) takes the top interval. Both the
+        training sampler and the Euler sampler route through here, so the two
+        can never disagree about which block handles a noise level.
+        """
+        bounds = self.boundaries()
+        r = self.num_blocks - 1 - int(block_idx)
+        return bounds[r], bounds[r + 1]
+
     def sample_sigma(
         self,
         block_idx: int,
         generator: torch.Generator | None = None,
         overlap: float = 0.0,
     ) -> torch.Tensor:
-        bounds = self.boundaries()
-        lo, hi = bounds[block_idx].item(), bounds[block_idx + 1].item()
+        lo, hi = (v.item() for v in self.range_for_block(block_idx))
         alpha = (hi / lo) ** overlap
         q_lo = self._cdf(lo / alpha).clamp(1e-6, 1.0 - 1e-6)
         q_hi = self._cdf(hi * alpha).clamp(1e-6, 1.0 - 1e-6)
@@ -441,10 +484,22 @@ class DiffusionBlockEngine:
         dtype: torch.dtype = torch.float32,
         cond_dim: int = 32,
         device=None,
+        denoise_backend: str = "cpu",
     ) -> None:
         self.model = model
         self.partitioner = partitioner
         self.dtype = dtype
+        if denoise_backend not in ("naive", "cpu", "gpu"):
+            raise ValueError(
+                f"Unknown denoise backend: {denoise_backend!r}. "
+                "Valid backends: ['naive', 'cpu', 'gpu']"
+            )
+        #: Which backend computes the EDM loss scalar in `denoise_step`.
+        #: "cpu" (default) runs the compiled C++ kernel; "naive" is the
+        #: pure-PyTorch oracle (bit-identical intent, debugging); "gpu" the
+        #: Taichi/Vulkan kernel. Never silently falls back: an unavailable
+        #: compiled backend raises from the dispatcher.
+        self.denoise_backend = denoise_backend
         n_layer = len(model.transformer.h)
         assert partitioner.num_blocks <= n_layer
         n_embd = model.config.n_embd
@@ -999,6 +1054,25 @@ class DiffusionBlockEngine:
         # duck-typed helper keeps a plain `nn.Linear` head working unchanged.
         return maybe_sigma_call(self.denoise_heads[block_idx], h, sigma_b)
 
+    @staticmethod
+    def _concat_causal_mask(base_mask: torch.Tensor) -> torch.Tensor:
+        """Expand a (1, 1, T, T) mask to the [clean | noisy] 2T input.
+
+        Paper App. E.4: noisy future tokens condition on clean past tokens
+        while information must not leak the other way. Clean rows see only
+        the clean past (`base`, and nothing of the noisy half); noisy rows
+        see the corresponding clean past (`base`) plus their own noisy past
+        (`base`). With a packed block-diagonal base, a noisy token stays
+        inside its own document's past on both halves.
+        """
+        if base_mask.dtype == torch.bool:
+            blocked = torch.zeros_like(base_mask)
+        else:
+            blocked = torch.full_like(base_mask, float("-inf"))
+        top = torch.cat([base_mask, blocked], dim=-1)
+        bottom = torch.cat([base_mask, base_mask], dim=-1)
+        return torch.cat([top, bottom], dim=-2)
+
     def denoise_step(
         self,
         idx: torch.Tensor,
@@ -1007,11 +1081,23 @@ class DiffusionBlockEngine:
         generator: torch.Generator | None = None,
         attn_mask: torch.Tensor | None = None,
         clean: torch.Tensor | None = None,
+        backend: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """EDM score-matching step for one block (the real DiffusionBlocks path).
 
         Only block `b`'s layers execute, which is where the B-fold activation
         memory reduction comes from: gradients exist for L/B layers, not L.
+
+        The denoiser input is the App. E.4 concatenation `[clean | noisy]`:
+        noisy future tokens condition on clean past tokens, in a single
+        forward over the 2T sequence (sequence memory doubles for the active
+        block only). The loss covers the noisy suffix only. The 2T attention
+        mask is always built explicitly by `_concat_causal_mask`: a plain
+        causal mask over the 2T sequence would leak clean FUTURE into each
+        noisy token (row T+i would see clean columns up to T+i), letting the
+        denoiser copy instead of denoise. A packed block-diagonal mask is
+        expanded the same way, keeping each noisy token inside its own
+        document's past.
 
         Args:
             idx: token ids (B, T). Used to build the diffusion target when
@@ -1026,6 +1112,9 @@ class DiffusionBlockEngine:
                 would redo the `wte` lookup and normalization every micro-step.
             attn_mask: optional attention mask, threaded into the blocks (so
                 packed sequences can be block-diagonal).
+            backend: EDM-loss backend for this step (`None` = the engine's
+                `denoise_backend`, default `"cpu"`). `"naive"` is the
+                pure-PyTorch oracle; all three agree by construction.
         """
         b = self._activate_block(block_idx)
         # The embedding table is used twice, and the two uses need different
@@ -1051,26 +1140,49 @@ class DiffusionBlockEngine:
             clean_input = clean
         sigma = self.partitioner.sample_sigma(b, generator=generator, overlap=overlap)
         c_in, _, w = edm_preconditioning(sigma, self.partitioner.sigma_data)
-        noisy = c_in * (clean_input + sigma * torch.randn_like(clean))
         t = idx.size(1)
-        pred = self._run_block_denoiser(b, noisy, sigma, t, attn_mask=attn_mask)
-        loss = (w * (pred - clean).square()).mean()
+        # App. E.4 causal conditioning: the block sees [clean | noisy] and the
+        # loss covers the noisy suffix only. The clean prefix is the same
+        # `clean_input` tensor the noise was drawn from (graph intact, so the
+        # embedding table trains through it); the suffix target is the
+        # detached `clean`, so the model cannot shrink the loss by shrinking
+        # the embeddings.
+        noisy_suffix = c_in * (clean_input + sigma * torch.randn_like(clean))
+        full = torch.cat([clean_input, noisy_suffix], dim=1)
+        if attn_mask is None:
+            attn_mask = torch.ones(t, t, dtype=torch.bool, device=idx.device).tril()
+            attn_mask = attn_mask.view(1, 1, t, t)
+        mask_2t = self._concat_causal_mask(attn_mask)
+        pred_full = self._run_block_denoiser(b, full, sigma, 2 * t, attn_mask=mask_2t)
+        pred = pred_full[:, t:, :]
+        # Late import: the op layer is a runtime backend, not model math, and
+        # importing it at module scope would pull torch.library registration
+        # machinery into every importer of the training engine.
+        from nanochat.ops.db_denoise import db_denoise_loss
+
+        loss = db_denoise_loss(
+            pred,
+            clean,
+            float(w),
+            backend=self.denoise_backend if backend is None else backend,
+        )
         # Reset first: a stale value from a previous call must not survive into
         # a step that ran without a distiller.
         self.last_kd_loss = 0.0
         if self.distiller is not None:
             # Denoiser distillation (KD, PRD 3.1, EDM form). The float twin
-            # re-runs the *same* block on the *same* `noisy` and sigma -- no new
-            # noise is sampled for it -- so the only difference between the two
-            # predictions is quantization, which is what the anchor is supposed
-            # to measure. `alpha` mixes the anchor against the data term rather
-            # than adding a second, unnormalized objective.
+            # re-runs the *same* block on the *same* `[clean | noisy]` input
+            # and sigma -- no new noise is sampled for it -- so the only
+            # difference between the two suffix predictions is quantization,
+            # which is what the anchor is supposed to measure. `alpha` mixes
+            # the anchor against the data term rather than adding a second,
+            # unnormalized objective.
             alpha = self.distiller.alpha
             loss_kd = self.distiller(
                 pred,
                 lambda: self.distiller.teacher._run_block_denoiser(
-                    b, noisy, sigma, t, attn_mask=attn_mask
-                ),
+                    b, full, sigma, 2 * t, attn_mask=mask_2t
+                )[:, t:, :],
                 weight=w,
             )
             loss = (1.0 - alpha) * loss + alpha * loss_kd
@@ -1090,8 +1202,9 @@ class DiffusionBlockEngine:
         """Euler diffusion sampler for token generation.
 
         Sequential ODE steps from sigma_max to sigma_min (Eq. 4-5 in paper).
-        For each step, applies the corresponding block b where sigma in [sigma_b, sigma_{b-1}],
-        Euler updating the noisy embedding z, followed by classification projection.
+        For each step, applies the block owning the current noise interval
+        (block 0 at the highest noise, block B-1 at the lowest), Euler
+        updating the noisy embedding z, followed by classification projection.
         """
         torch.manual_seed(seed)
         device = self.model.transformer.wte.weight.device
@@ -1138,12 +1251,15 @@ class DiffusionBlockEngine:
                 sigma_next = step_sigmas[s + 1]
                 delta_sigma = sigma_curr - sigma_next
 
-                # Determine which block handles this noise level
-                # Intervals are [sigma_b, sigma_{b-1}] where b in [0, B-1]
+                # Determine which block handles this noise level. Block 0 is
+                # the earliest layers and owns the highest noise range (paper
+                # Fig. 6, App. C), so the ascending-interval index is flipped:
+                # high sigma -> block 0, low sigma -> block B-1. Intervals are
+                # [sigma_b, sigma_{b+1}] with b in [0, B-1] ascending.
                 b_idx = 0
                 for b in range(b_count):
                     if sigmas[b] <= sigma_curr <= sigmas[b + 1]:
-                        b_idx = b
+                        b_idx = (b_count - 1) - b
                         break
 
                 c_in, _, _ = edm_preconditioning(

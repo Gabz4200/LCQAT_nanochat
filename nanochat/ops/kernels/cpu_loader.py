@@ -78,3 +78,15 @@ def load_cpu_sparseprop_extension():
     torch.utils.cpp_extension across processes (~/.cache/torch_extensions).
     """
     return _load("nanochat_lcqat_cpu_sparseprop", "sparseprop.cpp")
+
+
+def load_cpu_db_denoise_extension():
+    """Build (once per process) the DiffusionBlocks EDM-loss CPU extension.
+
+    Registers `nanochat::lcqat_db_denoise`. Its own extension so it compiles
+    and caches independently of the other kernels: a change to one kernel
+    then costs one rebuild, not all of them. (Every one of these must use
+    TORCH_LIBRARY_FRAGMENT, never a second TORCH_LIBRARY on the same namespace
+    -- the latter SIGABRTs during dlopen.)
+    """
+    return _load("nanochat_lcqat_cpu_db_denoise", "db_denoise.cpp")

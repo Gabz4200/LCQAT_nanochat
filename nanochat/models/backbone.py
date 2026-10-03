@@ -690,13 +690,21 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        # Int-keyed view of `value_embeds`, built once per forward from the
+        # live ModuleDict. `str(i) in ...` followed by `...[str(i)]` built the
+        # key twice and hashed it twice per layer; this builds it once.
+        #
+        # Derived from the module rather than cached in `__init__` on purpose:
+        # `resize_to` replaces `value_embeds` wholesale when the depth changes
+        # (the has_ve predicate depends on n_layer), so anything cached at
+        # construction goes stale, and a list indexed by `range(n_layer)` raises
+        # IndexError when `transformer.h` is longer than the config's n_layer.
+        # `i in ve_by_layer` degrades to `ve=None`, which is what every other
+        # mismatch in this loop already does.
+        ve_by_layer = {int(k): v for k, v in self.value_embeds.items() if k.isdigit()}
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = (
-                self.value_embeds[str(i)](idx).to(x.dtype)
-                if str(i) in self.value_embeds
-                else None
-            )
+            ve = ve_by_layer[i](idx).to(x.dtype) if i in ve_by_layer else None
             x = block(
                 x, ve, cos_sin, self.window_sizes[i], kv_cache, attn_mask=attn_mask
             )

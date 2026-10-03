@@ -39,6 +39,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from nanochat.models.quant.codebook import codebook_midpoints
 from nanochat.models.quant.lut import compile_activation_lut, get_activation
 
 #: Relaxation temperature for the softmax over output-level logits. Small
@@ -173,10 +174,7 @@ class LearnableIndexLut(nn.Module):
                 # shape and dtype are unchanged -- this only picks which output
                 # level each input index starts on.
                 body_values = smooth_body(input_codebook.to(torch.float32)).reshape(-1)
-                midpoints = (
-                    output_codebook.to(torch.float32)[1:]
-                    + output_codebook.to(torch.float32)[:-1]
-                ) / 2.0
+                midpoints = codebook_midpoints(output_codebook.to(torch.float32))
                 initial = torch.bucketize(body_values, midpoints).to(torch.int64)
             # Seed the logits so softmax(logits / T) peaks on the baked index.
             # A uniform init would make the relaxed value the mean of the
@@ -412,7 +410,7 @@ class LearnableIndexLut(nn.Module):
         the baked one to the bit.
         """
         if self.relaxation == RELAXATION_PROXIMITY:
-            midpoints = (self.output_codebook[:-1] + self.output_codebook[1:]) * 0.5
+            midpoints = codebook_midpoints(self.output_codebook)
             return torch.bucketize(self.pinned_levels(), midpoints).to(torch.int64)
         return torch.argmax(self.logits, dim=-1)
 
@@ -443,10 +441,13 @@ class LearnableIndexLut(nn.Module):
         hard = codebook[table[indices.long()]]
         if not torch.is_grad_enabled():
             return hard
-        if self.relaxation == RELAXATION_PROXIMITY:
-            soft = self.relaxed().to(table.device)[indices.long()]
-            return soft + hard - soft.detach()
-        if not isinstance(self.logits, nn.Parameter):
+        # `_trained_parameters` is the source of truth for "does this
+        # relaxation have trainable parameters at all"; it reports non-None
+        # under proximity (knots + levels), so the guard below is exactly the
+        # frozen-logits case and the two branches share one relaxation.
+        if self.relaxation != RELAXATION_PROXIMITY and (
+            self._trained_parameters() is None
+        ):
             return hard
         soft = self.relaxed().to(table.device)[indices.long()]
         return soft + hard - soft.detach()

@@ -22,6 +22,7 @@ import torch
 
 from nanochat.models.quant.sparseprop import (
     DEFAULT_DENSE_THRESHOLD,
+    PRUNE_SCOPES,
     SCOPE_GLOBAL,
     SCOPE_LAYER,
     SparsePropLinear,
@@ -54,7 +55,10 @@ class GradualPruningSchedule:
     ramp_steps: int = 8
     every: int = 0
     scope: str = SCOPE_LAYER
-    dense_threshold: float = 0.8
+    # Bound to the constant, not a literal: this is the value argparse fills in
+    # when --sparseprop-dense-threshold is absent, and the two drifting apart
+    # would silently change which layers take the sparse path.
+    dense_threshold: float = DEFAULT_DENSE_THRESHOLD
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -68,7 +72,7 @@ class GradualPruningSchedule:
             raise ValueError(f"ramp_steps must be >= 1, got {self.ramp_steps}")
         if self.every < 0:
             raise ValueError(f"every must be >= 0, got {self.every}")
-        if self.scope not in (SCOPE_LAYER, SCOPE_GLOBAL):
+        if self.scope not in PRUNE_SCOPES:
             raise ValueError(f"scope must be layer or global, got {self.scope!r}")
 
     @property

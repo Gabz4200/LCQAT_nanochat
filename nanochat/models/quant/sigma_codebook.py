@@ -33,6 +33,7 @@ from nanochat.models.quant.codebook import (
     QuantizedOutput,
     validate_split,
 )
+from nanochat.models.quant.packing import index_dtype_for_k
 
 # Log-sigma buckets are laid out symmetrically about log(SIGMA_PIVOT), which is
 # the sigma at which the EDM preconditioner makes the data and noise terms
@@ -363,7 +364,7 @@ class SigmaModulatedCodebook(nn.Module):
         # input activation is untouched.
         scaled = dequant * scale + (dequant * (1.0 - scale)).detach()
         x_q = scaled + (x_fp32 - x_fp32.detach())
-        idx_dtype = torch.uint8 if self.K <= 255 else torch.int32
+        idx_dtype = index_dtype_for_k(self.K)
         return QuantizedOutput(
             value=x_q.to(x.dtype), indices=idx.to(idx_dtype), codebook=codebook
         )

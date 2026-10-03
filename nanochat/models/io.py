@@ -53,18 +53,11 @@ class LayerQuantSpec:
 
     @property
     def effective_output(self) -> CodebookSpec:
-        """The output spec to build with, valid whether or not it is used."""
-        return self.output if self.output is not None else self.activation
+        """`output`, narrowed: `__post_init__` has already resolved the `None`.
 
-    def as_tuple(self) -> tuple[CodebookSpec, CodebookSpec, bool, CodebookSpec]:
-        """Backwards-compatible positional form, for callers not yet migrated.
-
-        Kept so the migration is mechanical rather than a flag day. Prefer
-        attribute access at new call sites; delete this once no caller uses it.
+        The property earns its keep purely by narrowing the declared type for
+        callers, which would otherwise have to re-check a condition
+        post-init guarantees.
         """
-        return (
-            self.weight,
-            self.activation,
-            self.quantize_output,
-            self.effective_output,
-        )
+        assert self.output is not None  # guaranteed by __post_init__
+        return self.output

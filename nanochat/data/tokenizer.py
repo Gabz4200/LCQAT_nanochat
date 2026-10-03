@@ -4,7 +4,6 @@ BPE Tokenizer in the style of GPT-4: train with rustbpe, inference with tiktoken
 
 import copy
 import os
-from functools import lru_cache
 
 SPECIAL_TOKENS = [
     # every document begins with the Beginning of Sequence (BOS) token that delimits documents
@@ -92,11 +91,11 @@ class RustBPETokenizer:
     def get_special_tokens(self):
         return self.enc.special_tokens_set
 
-    def id_to_token(self, id):
-        return self.enc.decode([id])
-
-    @lru_cache(maxsize=32)
     def encode_special(self, text):
+        # Resolved once per instance in __init__ rather than memoized on the
+        # method: an `lru_cache` on a method is keyed by `self`, so a hit needs
+        # a strong reference to the instance and therefore pins every tokenizer
+        # (and its `tiktoken.Encoding`) for the life of the process.
         return self.enc.encode_single_token(text)
 
     def get_bos_token_id(self):
@@ -105,14 +104,13 @@ class RustBPETokenizer:
     def encode(self, text, prepend=None, append=None, num_threads=8):
         # text can be either a string or a list of strings
 
+        def as_id(value):
+            return value if isinstance(value, int) else self.encode_special(value)
+
         if prepend is not None:
-            prepend_id = (
-                prepend if isinstance(prepend, int) else self.encode_special(prepend)
-            )
+            prepend_id = as_id(prepend)
         if append is not None:
-            append_id = (
-                append if isinstance(append, int) else self.encode_special(append)
-            )
+            append_id = as_id(append)
 
         if isinstance(text, str):
             ids = self.enc.encode_ordinary(text)
@@ -256,21 +254,6 @@ class RustBPETokenizer:
         mask = mask[:max_tokens]
         return ids, mask
 
-    def visualize_tokenization(self, ids, mask, with_token_id=False):
-        """Small helper function useful in debugging: visualize the tokenization of render_conversation"""
-        RED = "\033[91m"
-        GREEN = "\033[92m"
-        RESET = "\033[0m"
-        GRAY = "\033[90m"
-        tokens = []
-        for i, (token_id, mask_val) in enumerate(zip(ids, mask)):
-            token_str = self.decode([token_id])
-            color = GREEN if mask_val == 1 else RED
-            tokens.append(f"{color}{token_str}{RESET}")
-            if with_token_id:
-                tokens.append(f"{GRAY}({token_id}){RESET}")
-        return "|".join(tokens)
-
     def render_for_completion(self, conversation):
         """
         Used during Reinforcement Learning. In that setting, we want to
@@ -294,25 +277,39 @@ class RustBPETokenizer:
         return ids
 
 
-def get_tokenizer():
+def tokenizer_dir():
+    """Where `tok_train.py` writes and every reader looks.
+
+    One function because the producer and the consumers have to agree on this
+    path byte-for-byte.
+    """
     from nanochat.utils.common import get_base_dir
 
-    base_dir = get_base_dir()
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    return RustBPETokenizer.from_directory(tokenizer_dir)
+    return os.path.join(get_base_dir(), "tokenizer")
+
+
+def token_bytes_path():
+    """The serialized token->byte-length table `tok_train.py` writes."""
+    return os.path.join(tokenizer_dir(), "token_bytes.pt")
+
+
+def get_tokenizer():
+    return RustBPETokenizer.from_directory(tokenizer_dir())
 
 
 def get_token_bytes(device="cpu"):
     import torch
 
-    from nanochat.utils.common import get_base_dir
-
-    base_dir = get_base_dir()
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
-    assert os.path.exists(token_bytes_path), (
-        f"Token bytes not found at {token_bytes_path}? It gets written by tok_train.py"
-    )
-    with open(token_bytes_path, "rb") as f:
+    path = token_bytes_path()
+    try:
+        f = open(path, "rb")
+    except FileNotFoundError:
+        # Operate-and-handle rather than pre-check: the assert form tested
+        # existence and then `open` re-tested it, so the TOCTOU window bought
+        # nothing and a race still surfaced as a bare FileNotFoundError.
+        raise AssertionError(
+            f"Token bytes not found at {path}? It gets written by tok_train.py"
+        ) from None
+    with f:
         token_bytes = torch.load(f, map_location=device)
     return token_bytes

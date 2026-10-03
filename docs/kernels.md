@@ -42,13 +42,30 @@ uv run python -m scripts.export_lcqat --source sft --out exports/lcqat_sft.pt
 
 Freezes codebooks into static FP32 LUTs, replaces FP32 weight matrices with `uint8` index buffers, and saves a minimal artifact for the quantized inference runtime (not resumable for training). After export, `load_model` auto-detects the LC-QAT state from the artifact.
 
-> **Known limitation: export does not work on the default configuration.** `load_model` returns a `DiffusionBlockEngine` for any checkpoint carrying `meta["db"]`, which is every run that used the default `--db-blocks=4`. The engine owns three submodules and is not an `nn.Module`, so the export walk raises on the first module:
->
-> ```
-> AttributeError: 'DiffusionBlockEngine' object has no attribute 'named_modules'
-> ```
->
-> The same missing-method problem hits `_activation_pairs` and `get_submodule`, so fixing it needs the engine to expose a name-addressable tree, not just one loop. Export therefore only works today on a `--db-blocks=0` checkpoint, which records `meta["db"] = None` and loads back as a bare `GPT`. Every export test passes a bare `GPT`, which is why this was not caught. Treat the export path as unverified for DiffusionBlocks runs until that lands.
+Export works on the default configuration: LC-QAT, SparseProp and DiffusionBlocks
+all at their defaults, and the artifact reloads. Three things had to line up for
+that, because each covers a different subtree of what `load_model` returns.
+
+The engine is not an `nn.Module` — it owns three — so the export walk needs a
+name-addressable tree. `DiffusionBlockEngine` now exposes `named_modules()` and
+`get_submodule()` alongside the `state_dict` / `named_parameters` views it
+already had, with the same `db_adapters` / `db_denoise_heads` prefixes, so the
+adapters and denoise heads are exported with the base transformer rather than
+skipped.
+
+Loading back is a separate problem from exporting. `build_model` retrofits the
+bare GPT and then constructs the engine from plain float `nn.Linear`s, and the
+engine's load is `strict=False`, so engine-owned codebook and sparsity keys were
+discarded without a word — the model came back structurally valid and
+numerically wrong. Both retrofits are now gated on the `db_*` state keys that
+say the subtrees were quantized, rather than on the base model's meta.
+
+One asymmetry remains, and it is deliberate: the exported artifact carries the
+sparse CSR buffers, but the reloaded layer is a plain `LCQATLinear` and no
+forward path routes to `sparse_index_linear_cpu` yet — the dense
+`packed_weight_indices` is what actually runs. Exporting the CSR form ahead of a
+runtime that consumes it is harmless because both buffers are written and are
+numerically identical.
 
 ## Benchmarks
 

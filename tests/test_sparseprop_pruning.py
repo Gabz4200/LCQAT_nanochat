@@ -359,7 +359,10 @@ class TestScheduleFromArgs:
         )
 
         parser = argparse.ArgumentParser()
-        parser.add_argument("--sparseprop-sparsity", type=float, default=0.75)
+        # No manual `--sparseprop-sparsity` registration here: the helper owns
+        # the whole SparseProp surface, including the always-on pair. Registering
+        # it first would raise an argparse conflict, which is itself the point --
+        # the flag can no longer be restated by a caller.
         add_sparseprop_pruning_args(parser)
         args = parser.parse_args(argv)
         schedule = schedule_from_args(args)

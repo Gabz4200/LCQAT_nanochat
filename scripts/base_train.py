@@ -26,6 +26,7 @@ from nanochat.data.dataloader import (
 from nanochat.data.tokenizer import get_token_bytes, get_tokenizer
 from nanochat.models.flash_attention import HAS_FA3, USE_FA3
 from nanochat.models.quant.retrofit import add_lcqat_args
+from nanochat.training.diffusion_blocks import add_db_args
 from nanochat.utils.common import (
     COMPUTE_DTYPE,
     COMPUTE_DTYPE_REASON,
@@ -37,6 +38,7 @@ from nanochat.utils.common import (
     print0,
     print_banner,
 )
+from scripts._cli import add_common_cli_args
 from scripts._train.build import (
     assemble_run_config,
     build_base_model,
@@ -57,17 +59,9 @@ print_banner()
 # -----------------------------------------------------------------------------
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
+add_common_cli_args(parser)
 # Logging
-parser.add_argument(
-    "--run",
-    type=str,
-    default="dummy",
-    help="wandb run name ('dummy' disables wandb logging)",
-)
 # Runtime
-parser.add_argument(
-    "--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)"
-)
 # FP8 training
 parser.add_argument(
     "--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)"
@@ -116,19 +110,6 @@ parser.add_argument(
     default=-1,
     help="freeze middle-layer codebook+weight grads after N steps (PRD 3.2), -1 = disabled",
 )
-parser.add_argument(
-    "--no-sparseprop",
-    action="store_false",
-    dest="sparseprop",
-    default=True,
-    help="disable SparseProp sparse backprop (default: SparseProp is always on)",
-)
-parser.add_argument(
-    "--sparseprop-sparsity",
-    type=float,
-    default=0.75,
-    help="sparsity level for SparseProp (fraction of weights pruned, 0.0-1.0)",
-)
 # Scope / gradual schedule / dense-below-threshold. Registered through the
 # shared helper so base_train, chat_sft and chat_rl cannot drift apart.
 from nanochat.models.quant.pruning import (  # noqa: E402
@@ -137,6 +118,7 @@ from nanochat.models.quant.pruning import (  # noqa: E402
 )
 
 add_sparseprop_pruning_args(parser)
+add_db_args(parser)
 parser.add_argument(
     "--efqat-freeze-frac",
     type=float,
@@ -215,58 +197,6 @@ parser.add_argument(
     type=float,
     default=0.008,
     help="learning rate for unembedding parameters (Adam)",
-)
-parser.add_argument(
-    "--db-blocks",
-    type=int,
-    default=4,
-    help=(
-        "number of diffusion blocks for block-wise training (default: 4). "
-        "0 (or any negative value) disables DiffusionBlocks entirely and trains "
-        "a plain autoregressive LM by next-token cross-entropy: no partitioner, "
-        "no denoise heads, no block isolation, every layer trains every step. "
-        "Use it for a conventional baseline -- --db-objective ce is NOT that "
-        "baseline, because it still routes through the engine and still "
-        "gradients only one block at a time."
-    ),
-)
-parser.add_argument(
-    "--db-objective",
-    type=str,
-    default="edm",
-    choices=["edm", "ce"],
-    help=(
-        "block-wise training objective. 'edm' (default) is the DiffusionBlocks "
-        "method: only the active block's layers run, so activations are "
-        "O(L/B) instead of O(L), and the block is trained by score matching "
-        "against its own equi-probability noise range. 'ce' is the escape "
-        "hatch: a full-depth next-token cross-entropy with block-isolated "
-        "gradients, which saves backward memory but no forward FLOPs and gives "
-        "no noise-range specialization."
-    ),
-)
-parser.add_argument(
-    "--db-overlap",
-    type=float,
-    default=0.1,
-    help=(
-        "log-sigma overlap extension gamma between adjacent blocks "
-        "(DiffusionBlocks App. C). 0.0 = disjoint intervals, larger = smoother "
-        "transitions. Paper uses 0.05 for vision/diffusion, 0.1 for text."
-    ),
-)
-parser.add_argument(
-    "--db-block-sampling",
-    type=str,
-    default="step",
-    choices=["step", "micro"],
-    help=(
-        "when to draw the active block. 'step' (default) draws once per "
-        "optimizer step, so every micro-step in a step trains the same block. "
-        "'micro' redraws per micro-step, which degrades block-wise training "
-        "into ordinary gradient accumulation (memory saving kept, noise-range "
-        "specialization lost)."
-    ),
 )
 parser.add_argument(
     "--weight-decay",
@@ -351,12 +281,6 @@ parser.add_argument(
     help="save checkpoints every N steps (-1 = only at end)",
 )
 # Output
-parser.add_argument(
-    "--model-tag",
-    type=str,
-    default=None,
-    help="override model tag for checkpoint directory name",
-)
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # The SparseProp pruning schedule: scope, gradual ramp, dense-below-threshold.

@@ -57,7 +57,11 @@ class ColoredFormatter(logging.Formatter):
         return message
 
 
-def setup_default_logging():
+def setup_default_logging() -> None:
+    """Install the default colored handler once (idempotent, import-safe)."""
+    root = logging.getLogger()
+    if any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+        return
     handler = logging.StreamHandler()
     handler.setFormatter(
         ColoredFormatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")

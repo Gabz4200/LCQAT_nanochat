@@ -364,6 +364,9 @@ class SparsePropLinear(Linear):
         loses at training shapes; measuring it anyway is the policy's
         point (choose by measurement, not by assumption), and the probe
         runs once per mask change.
+
+        Timing uses 1 warmup + 3 repeats (median); CUDA probes synchronize
+        around each sample so queueing does not bias the choice.
         """
         from nanochat.ops.kernels.gpu_loader import vulkan_available
 
@@ -378,13 +381,31 @@ class SparsePropLinear(Linear):
         # transpose it to [B, M] first: gX = gY.T @ W, gW = gY @ x.
         # Probe results are discarded -- the arithmetic is what
         # is timed, so the expressions stand alone.
-        start = time.perf_counter()
-        out = x_flat @ (effective_weight * mask_f).t()
-        if self.bias is not None:
-            out = out + self.bias
-        gY.t() @ (effective_weight * mask_f)
-        (gY @ x_flat) * mask_f
-        dense_s = time.perf_counter() - start
+        def _sync() -> None:
+            if x_flat.is_cuda:
+                torch.cuda.synchronize()
+
+        def _time(fn, repeats: int = 3) -> float:
+            fn()  # warmup
+            _sync()
+            best = float("inf")
+            for _ in range(repeats):
+                start = time.perf_counter()
+                fn()
+                _sync()
+                best = min(best, time.perf_counter() - start)
+            return best
+
+        masked = effective_weight * mask_f
+
+        def _dense() -> None:
+            out = x_flat @ masked.t()
+            if self.bias is not None:
+                out = out + self.bias
+            gY.t() @ masked
+            (gY @ x_flat) * mask_f
+
+        dense_s = _time(_dense)
 
         # Sparse CPU kernels: CSR SpMM forward, SDDMM + SpGEMM backward.
         w_val = gather_values_from_dense(
@@ -393,40 +414,14 @@ class SparsePropLinear(Linear):
         w_val_csc = gather_values_from_dense_csc(
             effective_weight, self.w_row, self.w_ptr_csc
         )
-        start = time.perf_counter()
-        # Forward probe: the output is discarded, the kernel
-        # walk is what is timed.
-        sparseprop_forward_cpu(
-            x_flat.t(), w_val, self.w_col, self.w_ptr, self.bias, out_f
-        )
-        sparseprop_backward_cpu(
-            gY,
-            x_flat.t(),
-            w_val,
-            self.w_col,
-            self.w_ptr,
-            w_val_csc,
-            self.w_row,
-            self.w_ptr_csc,
-            out_f,
-            in_f,
-        )
-        cpu_s = time.perf_counter() - start
 
-        timings = {"dense": dense_s, "cpu": cpu_s}
-
-        # GPU kernel, only when a Vulkan device actually exists.
-        if vulkan_available():
-            from nanochat.ops.sparseprop import (
-                sparseprop_backward_gpu,
-                sparseprop_forward_gpu,
-            )
-
-            start = time.perf_counter()
-            sparseprop_forward_gpu(
+        def _cpu() -> None:
+            # Forward probe: the output is discarded, the kernel
+            # walk is what is timed.
+            sparseprop_forward_cpu(
                 x_flat.t(), w_val, self.w_col, self.w_ptr, self.bias, out_f
             )
-            sparseprop_backward_gpu(
+            sparseprop_backward_cpu(
                 gY,
                 x_flat.t(),
                 w_val,
@@ -438,7 +433,36 @@ class SparsePropLinear(Linear):
                 out_f,
                 in_f,
             )
-            timings["gpu"] = time.perf_counter() - start
+
+        cpu_s = _time(_cpu)
+
+        timings = {"dense": dense_s, "cpu": cpu_s}
+
+        # GPU kernel, only when a Vulkan device actually exists.
+        if vulkan_available():
+            from nanochat.ops.sparseprop import (
+                sparseprop_backward_gpu,
+                sparseprop_forward_gpu,
+            )
+
+            def _gpu() -> None:
+                sparseprop_forward_gpu(
+                    x_flat.t(), w_val, self.w_col, self.w_ptr, self.bias, out_f
+                )
+                sparseprop_backward_gpu(
+                    gY,
+                    x_flat.t(),
+                    w_val,
+                    self.w_col,
+                    self.w_ptr,
+                    w_val_csc,
+                    self.w_row,
+                    self.w_ptr_csc,
+                    out_f,
+                    in_f,
+                )
+
+            timings["gpu"] = _time(_gpu)
 
         best = min(timings, key=timings.get)
         return best
@@ -467,6 +491,10 @@ class SparsePropLinear(Linear):
         Copies weight/bias and applies a magnitude sparsity mask. All weight
         entries at masked positions are zeroed.
         """
+        if linear.weight.is_meta:
+            raise ValueError(
+                "from_linear requires materialized weights (meta device has no data)"
+            )
         module = cls(
             in_features=linear.in_features,
             out_features=linear.out_features,

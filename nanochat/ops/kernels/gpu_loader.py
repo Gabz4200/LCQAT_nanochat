@@ -319,6 +319,15 @@ def _sparseprop_backward_dx_kernel(
 
 
 def _to_ti(t: torch.Tensor, dtype) -> "ti.ndarray":
+    # GPU runners return host CPU tensors: detach, move to CPU, then stage.
+    # Direct `.numpy()` on CUDA/requires-grad tensors raises a confusing
+    # TypeError from inside staging; fail with a clear contract instead.
+    if t.requires_grad:
+        t = t.detach()
+    if t.is_cuda:
+        t = t.cpu()
+    if t.device.type != "cpu":
+        raise ValueError(f"_to_ti stages CPU host tensors, got {t.device}")
     arr = ti.ndarray(dtype, shape=(t.numel(),))
     arr.from_numpy(
         t.reshape(-1)
@@ -366,6 +375,10 @@ def run_quant_attn(
     """Quantized-KV attention; returns [B, Tq, H, D]."""
     _ensure_init()
     b, tq, n_head, head_dim = (int(x) for x in q.shape)
+    if head_dim > GPU_MAX_HEAD_DIM:
+        raise ValueError(
+            f"head_dim {head_dim} exceeds GPU accumulator {GPU_MAX_HEAD_DIM}"
+        )
     seq_len, h_kv, n_bytes = (int(x) for x in k_idx.shape[1:])
     k_size = int(k_lut.shape[1])
     out = ti.ndarray(ti.f32, shape=(b * tq * n_head * head_dim,))
@@ -535,6 +548,12 @@ def run_db_denoise(
     """EDM denoising loss; returns a 0-d FP32 tensor on the host."""
     _ensure_init()
     n = int(pred.numel())
+    if n == 0:
+        raise ValueError("run_db_denoise requires non-empty tensors")
+    if tuple(pred.shape) != tuple(clean.shape):
+        raise ValueError(
+            f"pred shape {tuple(pred.shape)} != clean shape {tuple(clean.shape)}"
+        )
     out = ti.ndarray(ti.f32, shape=(1,))
     _db_denoise_kernel(
         _to_ti(pred, ti.f32),

@@ -93,7 +93,8 @@ class DbDenoiseLossFunction(torch.autograd.Function):
         pred, clean = ctx.saved_tensors
         diff = pred - clean
         scale = grad_output * (2.0 * weight / n)
-        return scale * diff, -scale * diff, None, None
+        # `clean` is the detached target: it takes no gradient.
+        return scale * diff, None, None, None
 
 
 def db_denoise_loss(

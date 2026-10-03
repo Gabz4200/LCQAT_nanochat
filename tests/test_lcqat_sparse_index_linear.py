@@ -138,7 +138,7 @@ class TestSparseSemantics:
             n,
         )
         assert torch.equal(out[:, 1], torch.zeros(t))
-        assert not torch.equal(out[:, 0], torch.zeros(t))
+        assert float(out[:, 0].abs().mean()) > 1e-6, "column 0 is trivially zero"
 
     def test_when_the_listing_is_read_then_the_pruned_slots_are_absent(self) -> None:
         """Every stored column must be a kept slot; none may be a pruned one."""

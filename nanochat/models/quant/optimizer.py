@@ -19,6 +19,8 @@ scalars silently trained at the matrix LR.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch.nn as nn
 
 #: Parameter-name suffixes identifying a codebook step parameter. Stable
@@ -98,21 +100,28 @@ def is_learned_lut_param(name: str) -> bool:
     return name.endswith(LEARNED_LUT_SUFFIXES)
 
 
+def _matches(name: str, key: str) -> bool:
+    """Suffix match so engine nesting (`gpt.lm_head.weight`) still hits."""
+    return name == key or name.endswith("." + key)
+
+
 def role_for_name(name: str) -> str:
     """Return the optimizer role for a fully-qualified parameter name.
 
     Order matters: codebook params live *inside* `transformer.h`, so the codebook
-    check must precede the matrix catch-all.
+    check must precede the matrix catch-all. All other matches are suffix-based
+    so engine nesting (`gpt.lm_head.weight`, `model.resid_lambdas`) still hits.
     """
     if is_codebook_param(name) or is_learned_lut_param(name):
         return "codebook"
-    if name in _SCALAR_ROLES:
-        return _SCALAR_ROLES[name]
-    if name.startswith("lm_head."):
+    for scalar_name, role in _SCALAR_ROLES.items():
+        if _matches(name, scalar_name):
+            return role
+    if _matches(name, "lm_head.weight"):
         return "lm_head"
-    if name.startswith("transformer.wte."):
+    if ".transformer.wte." in f".{name}.":
         return "embed"
-    if name.startswith("value_embeds."):
+    if ".value_embeds." in f".{name}.":
         return "value_embed"
     # Everything else: transformer block weights, engine-owned adapters and
     # denoise heads, and any module added later under the model tree.
@@ -120,7 +129,7 @@ def role_for_name(name: str) -> str:
 
 
 def build_qat_param_groups(
-    model: nn.Module,
+    model: Any,
     matrix_lr: float,
     weight_decay: float,
     codebook_lr: float = 1e-3,
@@ -156,7 +165,7 @@ def build_qat_param_groups(
         "value_embed": embedding_lr * dmodel_lr_scale * 0.5,
         "resid": scalar_lr * 0.01,
         "x0": scalar_lr,
-        "smear": 0.2,
+        "smear": scalar_lr * 0.4,
         "codebook": codebook_lr * dmodel_lr_scale,
         "matrix": matrix_lr,
     }
@@ -185,7 +194,7 @@ def build_qat_param_groups(
     return groups
 
 
-def verify_partition(model: nn.Module, groups: list[dict]) -> None:
+def verify_partition(model: Any, groups: list[dict]) -> None:
     """Assert every model parameter appears in exactly one group.
 
     Guards the failure mode this module exists to prevent: a group builder that

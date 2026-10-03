@@ -281,6 +281,23 @@ class EquiProbabilityPartitioner:
         sigmas[-1] = self.sigma_max
         return sigmas
 
+    def block_for_sigma(self, sigma: float) -> int:
+        """Block index owning `sigma`; the single inference-side owner.
+
+        Shared with `range_for_block` so training and the Euler sampler can
+        never diverge. Exact-boundary hits resolve to the higher-noise (lower
+        block-index) interval.
+        """
+        bounds = self.boundaries()
+        b_count = self.num_blocks
+        for b in range(b_count):
+            if bounds[b] <= sigma <= bounds[b + 1]:
+                return (b_count - 1) - b
+        # Out-of-range sigma (numerical edge): clamp to nearest interval.
+        if sigma < bounds[0]:
+            return b_count - 1
+        return 0
+
 
 def c_noise(sigma: torch.Tensor) -> torch.Tensor:
     return torch.log(sigma) / 4.0
@@ -774,11 +791,29 @@ class DiffusionBlockEngine:
             )
         if legacy_head_sd:
             heads_sd.update({f"0.{k}": v for k, v in legacy_head_sd.items()})
-        self.model.load_state_dict(model_sd, strict=strict)
-        if adapters_sd:
-            self.adapters.load_state_dict(adapters_sd, strict=strict)
-        if heads_sd:
-            self.denoise_heads.load_state_dict(heads_sd, strict=strict)
+        import logging as _logging
+
+        _log = _logging.getLogger(__name__)
+        for label, mod, sd in (
+            ("model", self.model, model_sd),
+            ("adapters", self.adapters, adapters_sd),
+            ("denoise_heads", self.denoise_heads, heads_sd),
+        ):
+            if not sd and not strict:
+                continue
+            result = mod.load_state_dict(sd, strict=strict)
+            if not strict:
+                try:
+                    missing, unexpected = result.missing_keys, result.unexpected_keys
+                    if missing or unexpected:
+                        _log.warning(
+                            "load %s: missing=%s unexpected=%s",
+                            label,
+                            list(missing)[:5],
+                            list(unexpected)[:5],
+                        )
+                except AttributeError as e:
+                    _log.debug("load %s: no missing/unexpected keys (%s)", label, e)
 
     def named_parameters(self, recurse: bool = True, remove_duplicate: bool = False):
         """Yield (name, param) for model + adapters + denoise heads.
@@ -1251,16 +1286,9 @@ class DiffusionBlockEngine:
                 sigma_next = step_sigmas[s + 1]
                 delta_sigma = sigma_curr - sigma_next
 
-                # Determine which block handles this noise level. Block 0 is
-                # the earliest layers and owns the highest noise range (paper
-                # Fig. 6, App. C), so the ascending-interval index is flipped:
-                # high sigma -> block 0, low sigma -> block B-1. Intervals are
-                # [sigma_b, sigma_{b+1}] with b in [0, B-1] ascending.
-                b_idx = 0
-                for b in range(b_count):
-                    if sigmas[b] <= sigma_curr <= sigmas[b + 1]:
-                        b_idx = (b_count - 1) - b
-                        break
+                # Block ownership routes through the partitioner (single owner):
+                # block 0 = earliest layers = highest noise (paper Fig.6/App.C).
+                b_idx = self.partitioner.block_for_sigma(float(sigma_curr))
 
                 c_in, _, _ = edm_preconditioning(
                     sigma_curr, self.partitioner.sigma_data
@@ -1281,13 +1309,20 @@ class DiffusionBlockEngine:
                 conds = self.adapters[b_idx](full_z, sigma_curr.view(1))
 
                 h = full_z
+                sigma_b = sigma_curr.view(1, 1, 1)
                 for i, layer in enumerate(groups[b_idx]):
                     h = self.model.transformer.h[layer](
-                        h, None, (cos, sin), (seq_len, 0), None, cond=conds[i]
+                        h,
+                        None,
+                        (cos, sin),
+                        (seq_len, 0),
+                        None,
+                        cond=conds[i],
+                        sigma=sigma_b,
                     )
 
                 target_h = h[:, -1:, :]
-                pred = self.denoise_heads[b_idx](target_h)
+                pred = maybe_sigma_call(self.denoise_heads[b_idx], target_h, sigma_b)
 
                 # Euler update step: z_{i} = z_{i-1} + (delta_sigma / sigma_{i-1}) * (z_{i-1} - pred)
                 z_curr = z_curr + (delta_sigma / sigma_curr) * (z_curr - pred)
@@ -1322,13 +1357,15 @@ def configure_cpu_training(num_threads: int = 4) -> None:
 
 
 def cpu_adamw_for(engine: DiffusionBlockEngine, lr: float = 3e-4) -> torch.optim.AdamW:
-    """AdamW over every parameter the engine owns, fused for the CPU path.
+    """AdamW over every parameter the engine owns, vectorized for the CPU path.
 
     Takes `engine.parameters()` rather than re-listing the owned subtrees: a
     hand-written list here silently drops the parameters of any subtree added
     later, and AdamW says nothing when it is handed a short list.
     """
-    return torch.optim.AdamW(engine.parameters(), lr=lr, weight_decay=0.01, fused=True)
+    return torch.optim.AdamW(
+        engine.parameters(), lr=lr, weight_decay=0.01, fused=False, foreach=True
+    )
 
 
 def packed_lm_batch(

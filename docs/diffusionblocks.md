@@ -68,3 +68,10 @@ Same batch, same weights, two different kinds of training (`tests/test_db_edm_be
 | Forward | active block only (L/B layers) | full depth (all L layers) |
 
 Raw loss values live on different scales and must never be compared across the two. `--db-blocks=0` remains the conventional LM baseline: no partitioner, no adapters, no heads, every layer trains every step, and none of this pass changes that path (`train_step` is independent of the denoise backend).
+
+## Per-block heads, AdaLN, arbitration, latch
+
+- `denoise_heads`: one ModuleList entry per block (`db_denoise_heads.{b}.`); legacy `db_denoise_head.` migrates to block 0 and raises if num_blocks>1.
+- Per-layer AdaLN: `Block(cond=(gamma,beta))` default None = bit-identical plain block.
+- `_requires_grad_for` is the single requires_grad arbiter (parts[1] for `db_*`, parts[2] for `transformer.h.`).
+- `live_blocks` / latch exclusion freezes inactive blocks (EfQAT).

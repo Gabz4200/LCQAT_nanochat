@@ -34,7 +34,9 @@ def tiny_gpt_lcqat() -> GPT:
     # Built with the DEFAULT preset so that a state_dict roundtrip through
     # `prepare_lcqat_before_load(fresh, state, None, None)` -- which falls back
     # to the default when no meta is supplied -- reconstructs the same config.
-    return retrofit_model(build_tiny_gpt(), PRESETS[DEFAULT_PRESET])
+    # Active (randomized) model: quantizer levels must be fitted to real ranges,
+    # not the zero-init span of c_proj (see build_active_tiny_gpt gotcha).
+    return retrofit_model(build_active_tiny_gpt(), PRESETS[DEFAULT_PRESET])
 
 
 # ---------------------------------------------------------------------------

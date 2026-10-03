@@ -11,7 +11,7 @@ Contract (mirrors flash_attn_with_kvcache's position bookkeeping, with the
 cache written before attention):
     q:            [B, Tq, H, D]     FP32 queries (global positions s-Tq .. s-1)
     k_idx, v_idx: [B, T, H_kv, nb]  uint8 nibble-packed cache (nb = ceil(D/2))
-    k_lut, v_lut: [H_kv, K]         FP32 per-head codebooks, K odd in [3, 15]
+    k_lut, v_lut: [H_kv, K]         FP32 per-head codebooks, K in [3, 16]
     cache_seqlens:[B] int32         valid rows INCLUDING this step's Tq writes
     window_left:  int               left window (-1 = full context), causal right
     returns:      [B, Tq, H, D]     FP32 attention output
@@ -60,8 +60,8 @@ def validate_quant_attn_inputs(
     if n_head % h_kv != 0:
         raise ValueError(f"n_head {n_head} not divisible by H_kv {h_kv}")
     k = k_lut.shape[1]
-    if k < 3 or k > 15:
-        raise ValueError(f"LUT K must be in [3, 15] (nibble-packed), got {k}")
+    if k < 3 or k > 16:
+        raise ValueError(f"LUT K must be in [3, 16] (nibble-packed), got {k}")
     for label, x in (("q", q), ("k_lut", k_lut), ("v_lut", v_lut)):
         if x.dtype != torch.float32:
             raise ValueError(f"{label} must be float32, got {x.dtype}")

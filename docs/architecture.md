@@ -44,10 +44,11 @@ CPU index policy — are in [`AGENTS.md`](../AGENTS.md).
 │   │       ├── ablation_metrics.py      # ablation measurement protocol
 │   │       └── reference/               # pure-PyTorch reference implementations
 │   ├── ops/                             # kernel layer: dispatcher + backends
-│   │   ├── dispatch.py                  # dispatch_gemv / dispatch_quant_attn / dispatch_index_linear
+│   │   ├── dispatch.py                  # dispatch_gemv / dispatch_quant_attn / dispatch_index_linear /
+│   │   │                                #   dispatch_db_denoise / dispatch_sparseprop_{forward,backward}
 │   │   ├── gemv.py                      # mul-less GEMV backends
 │   │   ├── index_linear.py              # index-fetch matmul, any K >= 3
-│   │   ├── sparse_index_linear.py       # CSR variant; cpu-only, raises on any other backend
+│   │   ├── sparse_index_linear.py       # CSR variant; naive oracle + cpu, no GPU/dense fallback
 │   │   ├── quant_attn.py                # quantized KV-cache attention
 │   │   ├── sparseprop.py                # AVX2 sparse forward/backward
 │   │   ├── references/                  # naive PyTorch oracles (CI ground truth)
@@ -76,7 +77,7 @@ CPU index policy — are in [`AGENTS.md`](../AGENTS.md).
 │       ├── common.py                    # TaskMixture | TaskSequence
 │       └── arc.py / gsm8k.py / humaneval.py / mmlu.py / smoltalk.py
 ├── scripts                              # entry points (the imperative shell)
-│   ├── _cli.py                          # add_common_cli_args / add_db_args — one owner
+│   ├── _cli.py                          # add_common_cli_args (db/lcqat args live with their owners)
 │   ├── _train/                          # base_train split by concern
 │   │   ├── build.py                     # model construction, LC-QAT + SparseProp wiring
 │   │   ├── loop.py                      # the training loop

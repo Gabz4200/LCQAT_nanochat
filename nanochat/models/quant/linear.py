@@ -72,9 +72,11 @@ class _CodebookSTE(torch.autograd.Function):
         # `indices` is flat (see forward), so flatten grad_out to match. The
         # sigmoid(softplus) factor from the prefix-sum chain rule comes for free,
         # because autograd differentiates the cumsum of softplus itself.
+        # Cast grad to codebook dtype: forward runs in fp32 but downstream
+        # grad arrives in activation dtype (bf16 under COMPUTE_DTYPE).
         grad_codebook = (
             torch.zeros_like(codebook)
-            .scatter_add_(0, indices, grad_out.reshape(-1))
+            .scatter_add_(0, indices, grad_out.reshape(-1).to(codebook.dtype))
             .mul_(ctx.scale)
         )
         return grad_x, grad_codebook, None, None
@@ -416,7 +418,7 @@ class LCQATLinear(Linear):
             x_q = self._quantize_conditioned(self.act_quantizer, x, sigma)
         else:
             x_q = self._quantize(self.act_quantizer, x, x.numel())
-        if "packed_weight_indices" in self._buffers:
+        if "packed_weight_indices" in dict(self.named_buffers()):
             if self.bias_quantizer is not None:
                 raise ValueError(
                     "packed_weight_indices are installed, so this layer is on "
@@ -466,6 +468,12 @@ class LCQATLinear(Linear):
         """
         from nanochat.ops import dispatch_index_linear
 
+        if self.bias_quantizer is not None:
+            raise ValueError(
+                "packed path has no bias-index buffer; train without "
+                "quantize_bias or strip packed buffers."
+            )
+
         leading = x.shape[:-1]
         act_ids = x_q.indices.reshape(-1, self.in_features)
         y = dispatch_index_linear(
@@ -485,7 +493,10 @@ class LCQATLinear(Linear):
         return y
 
     def quantized_mlp_chain(
-        self, x: torch.Tensor, next_linear: "LCQATLinear"
+        self,
+        x: torch.Tensor,
+        next_linear: "LCQATLinear",
+        sigma: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Fused quantized MLP chain (PRD 6): c_fc index matmul -> out IDs
         -> relu^2 `activation_lut` table -> c_proj index matmul fed with
@@ -499,18 +510,27 @@ class LCQATLinear(Linear):
 
         if self.out_quantizer is None:
             raise RuntimeError("fused MLP chain requires c_fc.out_quantizer")
-        if "activation_lut" not in self._buffers:
+        if "activation_lut" not in dict(self.named_buffers()):
             raise RuntimeError("fused MLP chain requires the activation_lut buffer")
-        if "packed_weight_indices" not in next_linear._buffers:
+        if "packed_weight_indices" not in dict(next_linear.named_buffers()):
             raise RuntimeError("fused MLP chain requires packed c_proj weights")
         if self.activation_lut.dtype != torch.uint8:
             raise ValueError(
                 f"fused MLP chain supports K_act <= 255 (uint8 table), got "
                 f"{self.activation_lut.dtype}"
             )
+        if getattr(getattr(self, "act_quantizer", None), "needs_sigma", False):
+            if sigma is None:
+                raise ValueError(
+                    "quantized_mlp_chain requires sigma for sigma-conditioned "
+                    "activation codebooks"
+                )
 
         leading = x.shape[:-1]
-        x_q = self.act_quantizer(x)
+        if getattr(getattr(self, "act_quantizer", None), "needs_sigma", False):
+            x_q = self.act_quantizer(x, sigma=sigma)  # type: ignore[call-arg]
+        else:
+            x_q = self.act_quantizer(x)
         y = dispatch_index_linear(
             x_q.indices.reshape(-1, self.in_features),
             x_q.codebook,

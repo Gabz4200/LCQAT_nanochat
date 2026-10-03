@@ -36,6 +36,8 @@ def validate_gemv_inputs(
         return
     if weight_indices.numel() and int(weight_indices.max()) > 2:
         raise ValueError("weight_indices must be trits in {0, 1, 2}")
+    if weight_indices.numel() and int(weight_indices.min()) < 0:
+        raise ValueError("weight_indices must be non-negative trits")
     if act_indices.numel() and int(act_indices.max()) >= act_lut.numel():
         raise ValueError(
             f"act index {int(act_indices.max())} out of range "

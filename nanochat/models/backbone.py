@@ -39,7 +39,7 @@ class GPTConfig:
     window_pattern: str = "SSSL"
 
 
-def norm(x):
+def norm(x: torch.Tensor) -> torch.Tensor:
     return F.rms_norm(x, (x.size(-1),))  # note that this will run in bf16, seems ok
 
 
@@ -48,8 +48,9 @@ class Linear(nn.Linear):
     Replaces autocast: master weights stay fp32 for optimizer precision,
     but matmuls run in the activation dtype (typically bf16 from embeddings)."""
 
-    def forward(self, x):
-        return F.linear(x, self.weight.to(dtype=x.dtype))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
+        return F.linear(x, self.weight.to(dtype=x.dtype), bias)
 
 
 def _is_codebook_param(name: str) -> bool:
@@ -58,12 +59,14 @@ def _is_codebook_param(name: str) -> bool:
     return name.endswith(("raw_pos_deltas", "raw_neg_deltas"))
 
 
-def has_ve(layer_idx, n_layer):
+def has_ve(layer_idx: int, n_layer: int) -> bool:
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
 
 
-def apply_rotary_emb(x, cos, sin):
+def apply_rotary_emb(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
     # note: this rotates by -theta, the transpose of the textbook convention. Functionally
     # equivalent (only the relative q/k rotation matters), kept for checkpoint compatibility.
     assert x.ndim == 4  # multihead attention
@@ -75,7 +78,7 @@ def apply_rotary_emb(x, cos, sin):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config: GPTConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
         self.n_head = config.n_head
@@ -187,7 +190,7 @@ def maybe_sigma_call(layer, x, sigma):
 
 
 class MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: GPTConfig):
         super().__init__()
         self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
@@ -204,7 +207,9 @@ class MLP(nn.Module):
         # conditioned codebook + exported buffers fails loudly instead of
         # silently quantizing with the wrong levels.
         c_fc = self.c_fc
-        buffers = getattr(c_fc, "_buffers", {})
+        buffers = (
+            dict(c_fc.named_buffers()) if isinstance(c_fc, torch.nn.Module) else {}
+        )
         if "activation_lut" in buffers and "packed_weight_indices" in buffers:
             if getattr(getattr(c_fc, "act_quantizer", None), "needs_sigma", False):
                 raise RuntimeError(
@@ -240,7 +245,7 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config: GPTConfig, layer_idx: int):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
@@ -289,7 +294,7 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, config, pad_vocab_size_to=64):
+    def __init__(self, config: GPTConfig, pad_vocab_size_to: int = 64):
         """
         NOTE a major footgun: this __init__ function runs in meta device context (!!)
         Therefore, any calculations inside here are shapes and dtypes only, no actual data.
@@ -297,6 +302,8 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        if config.n_embd < 24:
+            raise ValueError(f"smear reads 24 channels, got n_embd={config.n_embd}")
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -663,7 +670,11 @@ class GPT(nn.Module):
         # Smear: mix previous token's embedding into current position (cheap bigram info)
         if kv_cache is None:
             # Training / naive generate: full sequence available, use fast slice
-            assert T > 1, "Training forward pass should have T > 1"
+            if T <= 1:
+                raise ValueError(
+                    "Training forward requires T > 1 (got T=1); use kv_cache for "
+                    "single-token decode."
+                )
             gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(
                 self.smear_gate(x[:, 1:, :24])
             )

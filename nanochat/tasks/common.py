@@ -16,7 +16,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from filelock import FileLock
 
-from nanochat.utils.common import get_base_dir
+from nanochat.utils.common import get_base_dir, print0
 
 
 class HubDataset:
@@ -72,7 +72,7 @@ def load_hub_dataset(repo_id, subset="default", split="train"):
                 filenames = []
                 for shard_index, shard_url in enumerate(shard_urls):
                     filename = f"{shard_index:05d}.parquet"
-                    print(f"Downloading {shard_url} ...")
+                    print0(f"Downloading {shard_url} ...")
                     with urllib.request.urlopen(shard_url) as response:
                         content = response.read()
                     with open(os.path.join(shards_dir, filename), "wb") as f:

@@ -200,7 +200,10 @@ def export_lcqat_checkpoint(
     no sparsity mask keep the dense path unchanged.
 
     Returns the saved state_dict for inspection/testing.
+
+    Flips to eval for export, restoring the prior mode on return.
     """
+    was_training = model.training
     model.eval()
 
     for _, module in model.named_modules():
@@ -280,4 +283,6 @@ def export_lcqat_checkpoint(
     wire_activation_luts(model)
     state_dict = model.state_dict()
     torch.save(state_dict, export_path)
+    if was_training:
+        model.train()
     return state_dict

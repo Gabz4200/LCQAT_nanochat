@@ -146,11 +146,21 @@ def sparse_index_linear(
 ) -> torch.Tensor:
     """Dispatch the CSR index-weight linear to `backend`.
 
+    `naive` runs the pure-PyTorch oracle; `cpu` the compiled kernel. There is
+    no GPU path and no dense fallback -- a silent downgrade would report
+    success for a layer the caller believed was running sparse.
+
     Raises:
-        ValueError: for an unknown backend. There is no dense fallback -- a
-            silent downgrade would report success for a layer the caller
-            believed was running sparse.
+        ValueError: for an unknown backend.
     """
+    if backend == "naive":
+        from nanochat.ops.references.sparse_linear_reference import (
+            reference_sparse_index_linear,
+        )
+
+        return reference_sparse_index_linear(
+            act_indices, act_lut, col_indices, row_ptr, alphabet, m, n
+        )
     if backend != "cpu":
         raise ValueError(
             f"sparse index-linear backend {backend!r} is not available; "

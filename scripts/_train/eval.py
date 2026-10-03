@@ -115,11 +115,3 @@ def run_samples(ctx):
             )
         print0(ctx.tokenizer.decode(sample[0]))
     ctx.model.train()
-
-
-def print_run_summary(get_max_memory, total_training_time, val_bpb, min_val_bpb):
-    """Print a few more stats."""
-    print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
-    print0(f"Total training time: {total_training_time / 60:.2f}m")
-    if val_bpb is not None:
-        print0(f"Minimum validation bpb: {min_val_bpb:.6f}")

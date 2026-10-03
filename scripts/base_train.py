@@ -24,7 +24,8 @@ from nanochat.data.dataloader import (
     tokenizing_distributed_data_loader_with_state_bos_bestfit,
 )
 from nanochat.data.tokenizer import get_token_bytes, get_tokenizer
-from nanochat.models.flash_attention import HAS_FA3
+from nanochat.models.flash_attention import HAS_FA3, USE_FA3
+from nanochat.models.quant.retrofit import add_lcqat_args
 from nanochat.utils.common import (
     COMPUTE_DTYPE,
     COMPUTE_DTYPE_REASON,
@@ -78,55 +79,7 @@ parser.add_argument(
     choices=["rowwise", "tensorwise"],
     help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)",
 )
-parser.add_argument(
-    "--no-lcqat",
-    action="store_false",
-    dest="lcqat",
-    default=True,
-    help="disable LC-QAT (default: LC-QAT is always on; pass this to run plain float training)",
-)
-parser.add_argument(
-    "--lcqat-preset",
-    type=str,
-    default="asym",
-    choices=["asym", "small", "prd"],
-    help=(
-        "per-layer K allocation. 'asym' (default) uses the same total level "
-        "counts as 'small' but splits them by sign: m_neg=0 for the two "
-        "non-negative MLP tensors (`relu(x).square()` feeds mlp.c_proj), which "
-        "turns a symmetric 15 with 7 dead levels into 8 usable ones. 'small' is "
-        "the symmetric maximum-compression table, 'prd' is the PRD table "
-        "(8-bit down_proj). Each K also accepts an explicit split via "
-        "--lcqat-k-map, e.g. '0-7/0-7'."
-    ),
-)
-parser.add_argument(
-    "--lcqat-k-map",
-    type=str,
-    default="",
-    help="override K per module substring, e.g. 'mlp.c_proj:255/255,attn.c_v:15/15'",
-)
-parser.add_argument(
-    "--codebook-lr",
-    type=float,
-    default=1e-3,
-    help="learning rate for codebook step parameters (PRD: 10-50x network weights)",
-)
-parser.add_argument(
-    "--codebook-grad-scale",
-    type=str,
-    default="inv_sqrt_n",
-    choices=["none", "inv_sqrt_n"],
-    help=(
-        "PRD 2.4 codebook gradient scaling. 'inv_sqrt_n' (default) scales the "
-        "codebook gradient by 1/sqrt(numel) -- in a 4096x4096 layer 16.7M "
-        "elements pool into one K-entry codebook, and unscaled the step "
-        "parameters oscillate relative to the weights. 'none' uses the plain "
-        "STE. Note the two interact multiplicatively with --codebook-lr: with "
-        "N = B*T*D in the millions the activation codebook gradient is ~1000x "
-        "smaller under 'inv_sqrt_n', so this is a real trade, not a free win."
-    ),
-)
+add_lcqat_args(parser)
 # Knowledge Distillation (PRD 3.1)
 parser.add_argument(
     "--kd-teacher-source",
@@ -156,9 +109,6 @@ parser.add_argument(
     default=2.0,
     help="softmax temperature for KL distillation (PRD 3.1)",
 )
-# Denoiser distillation: the EDM-native form of the same anchor. --kd-alpha
-# needs logits, which the denoising objective never produces, so this is a
-# separate opt-in path rather than a reuse of it. Registered in add_w6_args.
 # EfQAT selective layer freezing (PRD 3.2)
 parser.add_argument(
     "--efqat-freeze-after",
@@ -199,7 +149,12 @@ parser.add_argument(
 # hardware knob, the same argument add_sparseprop_pruning_args makes above.
 from nanochat.models.quant.w6 import add_w6_args  # noqa: E402
 
+# `--kd-denoiser-alpha` and `--efqat-latch-blocks` arrive with this block.
+# Denoiser distillation is the EDM-native form of the same KD anchor: --kd-alpha
+# needs logits, which the denoising objective never produces, so it is a separate
+# opt-in path rather than a reuse of it.
 add_w6_args(parser)
+
 # Model architecture
 parser.add_argument(
     "--depth", type=int, default=20, help="depth of the Transformer model"
@@ -433,10 +388,7 @@ wandb_run = (
 )
 
 # Flash Attention status
-from nanochat.models.flash_attention import USE_FA3  # noqa: E402
-
-using_fa3 = USE_FA3
-if using_fa3:
+if USE_FA3:
     print0("✓ Using Flash Attention 3: efficient, new and awesome.")
 else:
     print0("!" * 80)
@@ -582,9 +534,14 @@ train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
     device=device,
     resume_state_dict=dataloader_resume_state_dict,
 )
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
-    tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device
-)
+
+
+def build_val_loader():
+    return tokenizing_distributed_data_loader_bos_bestfit(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device
+    )
+
+
 x, y, dataloader_state_dict = next(
     train_loader
 )  # kick off load of the very first batch of data

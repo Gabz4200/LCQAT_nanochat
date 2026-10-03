@@ -10,7 +10,6 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-s
 """
 
 import argparse
-import gc
 import os
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -21,10 +20,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import wandb
 
+from nanochat.callbacks.training import log_step_metrics, manage_gc
 from nanochat.data.tokenizer import get_token_bytes
 from nanochat.models.flash_attention import HAS_FA3
 from nanochat.models.quant import lcqat_config_from_args, retrofit_summary
-from nanochat.models.quant.retrofit import LayerKConfig
+from nanochat.models.quant.retrofit import LayerKConfig, add_lcqat_args
 from nanochat.modules.checkpoint_manager import (
     load_model,
     load_optimizer_state,
@@ -51,6 +51,11 @@ from nanochat.utils.common import (
     get_peak_flops,
     is_ddp_initialized,
     print0,
+)
+from scripts._train.build import (
+    build_grad_scaler,
+    make_adamw,
+    restore_optimizer_momentum,
 )
 from scripts.chat_eval import run_chat_eval
 
@@ -81,52 +86,7 @@ parser.add_argument(
     default=1,
     help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)",
 )
-parser.add_argument(
-    "--no-lcqat",
-    action="store_false",
-    dest="lcqat",
-    default=True,
-    help="disable LC-QAT (default: LC-QAT is always on; pass this to run plain float training)",
-)
-parser.add_argument(
-    "--lcqat-preset",
-    type=str,
-    default="asym",
-    choices=["asym", "small", "prd"],
-    help=(
-        "per-layer K allocation. 'asym' (default) splits each codebook by sign, "
-        "giving m_neg=0 to the two non-negative MLP tensors so no level is spent "
-        "on a sign they never take. 'small' is the symmetric max-compression "
-        "table, 'prd' the PRD table."
-    ),
-)
-parser.add_argument(
-    "--lcqat-k-map",
-    type=str,
-    default="",
-    help="override K per module substring, e.g. 'mlp.c_proj:255/255'",
-)
-parser.add_argument(
-    "--codebook-lr",
-    type=float,
-    default=1e-3,
-    help="learning rate for codebook step parameters (PRD: 10-50x network weights)",
-)
-parser.add_argument(
-    "--codebook-grad-scale",
-    type=str,
-    default="inv_sqrt_n",
-    choices=["none", "inv_sqrt_n"],
-    help=(
-        "PRD 2.4 codebook gradient scaling. 'inv_sqrt_n' (default) scales the "
-        "codebook gradient by 1/sqrt(numel) -- in a 4096x4096 layer 16.7M "
-        "elements pool into one K-entry codebook, and unscaled the step "
-        "parameters oscillate relative to the weights. 'none' uses the plain "
-        "STE. Note the two interact multiplicatively with --codebook-lr: with "
-        "N = B*T*D in the millions the activation codebook gradient is ~1000x "
-        "smaller under 'inv_sqrt_n', so this is a real trade, not a free win."
-    ),
-)
+add_lcqat_args(parser)
 # Training horizon
 parser.add_argument(
     "--num-iterations",
@@ -514,21 +474,12 @@ param_groups = build_qat_param_groups(
 )
 # Fail here rather than shipping a run where a whole role silently never trains.
 verify_partition(engine, param_groups)
-print0(
-    "Optimizer groups: "
-    + ", ".join(f"{g['role']}={len(g['params'])}" for g in param_groups)
-)
-optimizer = torch.optim.AdamW(
-    param_groups,
-    fused=(device_type == "cpu"),
-)
-for group in optimizer.param_groups:
-    group["initial_lr"] = group["lr"]
+optimizer = make_adamw(param_groups, device_type)
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
-# Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
-# pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and
-# restore our fresh SFT LRs after loading.
+# Note: `restore_optimizer_momentum` overwrites param_group metadata (LRs, betas,
+# etc.) with the pretrained values. Since pretraining warmdown brings LRs to ~0,
+# we must save and restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
 if args.load_optimizer and lcqat_started_from_float:
     # Retrofit added a codebook param group that the float pretrain optimizer
@@ -542,53 +493,9 @@ elif args.load_optimizer:
     )
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
-        loaded_momentum = False
-        try:
-            optimizer.load_state_dict(optimizer_data)
-            loaded_momentum = True
-        except ValueError:
-            # The saved optimizer was produced by an older code path whose
-            # parameter grouping differs from the current one (e.g. a Muon
-            # stage that has since been removed, or duplicate codebook params
-            # from a non-flattened SparsePropLinearLCQAT). load_state_dict
-            # hard-fails on group-count mismatch.
-            saved_param_count = sum(
-                len(g["params"]) for g in optimizer_data.get("param_groups", [])
-            )
-            current_param_count = sum(len(g["params"]) for g in optimizer.param_groups)
-            if saved_param_count != current_param_count:
-                # The saved and current models have a different number of
-                # parameters (different architecture/stage, e.g. a Muon-based
-                # pretrain checkpoint vs. the current AdamW-only model). The
-                # saved state's integer param indices map onto the old flat
-                # param list, not the current Parameter objects, so any
-                # positional copy would attach momentum to the wrong params.
-                # Warm-start is unsafe here; start fresh.
-                print0(
-                    f"Pretrained optimizer skipped: saved {saved_param_count} params "
-                    f"vs. current {current_param_count} (architecture mismatch); "
-                    f"starting with a fresh optimizer"
-                )
-            else:
-                # Same param count, different grouping: copy momentum buffers
-                # per Parameter identity and keep our fresh param groups
-                # (LRs, betas, weight decay) intact.
-                id_to_param = {
-                    id(p): p
-                    for group in optimizer.param_groups
-                    for p in group["params"]
-                }
-                copied = 0
-                for pid, state in optimizer_data.get("state", {}).items():
-                    target = id_to_param.get(pid)
-                    if target is None:
-                        continue
-                    optimizer.state[id(target)] = state
-                    copied += 1
-                print0(
-                    f"Loaded optimizer momentum for {copied}/{len(id_to_param)} params "
-                    f"from pretrained checkpoint (group layout mismatch; LRs reset)"
-                )
+        loaded_momentum = restore_optimizer_momentum(
+            optimizer, optimizer_data, source="pretrained checkpoint"
+        )
         del optimizer_data
         for group, base_lr in zip(optimizer.param_groups, base_lrs):
             group["lr"] = base_lr
@@ -602,9 +509,7 @@ elif args.load_optimizer:
         )
 
 # GradScaler for fp16 training (bf16/fp32 don't need it)
-scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
-if scaler is not None:
-    print0("GradScaler enabled for fp16 training")
+scaler = build_grad_scaler()
 
 # Override the initial learning rate as a fraction of the base learning rate
 for group in optimizer.param_groups:
@@ -776,14 +681,19 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
 
 
 train_loader = sft_data_generator_bos_bestfit("train")
-build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
+
+
+def build_val_loader():
+    return sft_data_generator_bos_bestfit("val")
+
+
 progress = 0  # will go from 0 to 1 over the course of the epoch
 
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 # Same shape as base_train but uses progress (0→1) instead of absolute step counts,
 # because SFT doesn't always know num_iterations in advance (dataset-driven stopping).
-def get_lr_multiplier(progress):
+def lr_multiplier_from_progress(progress):
     if progress < args.warmup_ratio:
         return (progress + 1e-8) / args.warmup_ratio
     elif progress <= 1.0 - args.warmdown_ratio:
@@ -1015,7 +925,7 @@ while True:
             progress, approx_progress
         )  # only increase progress monotonically
     # step the optimizer
-    lrm = get_lr_multiplier(progress)
+    lrm = lr_multiplier_from_progress(progress)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
     if scaler is not None:
@@ -1052,31 +962,26 @@ while True:
     print0(
         f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time / 60:.2f}m"
     )
-    if step % 10 == 0:
-        wandb_run.log(
-            {
-                "step": step,
-                "total_training_flops": flops_so_far,
-                "total_training_time": total_training_time,
-                "train/loss": debiased_smooth_loss,
-                "train/lrm": lrm,
-                "train/dt": dt,
-                "train/tok_per_sec": tok_per_sec,
-                "train/mfu": mfu,
-                "train/epoch": current_epoch,
-            }
-        )
+    log_step_metrics(
+        wandb_run,
+        {
+            "step": step,
+            "total_training_flops": flops_so_far,
+            "total_training_time": total_training_time,
+            "train/loss": debiased_smooth_loss,
+            "train/lrm": lrm,
+            "train/dt": dt,
+            "train/tok_per_sec": tok_per_sec,
+            "train/mfu": mfu,
+            "train/epoch": current_epoch,
+        },
+        10,
+        step,
+    )
+    manage_gc(step, first_step_of_run=(step == 1))
 
-    # The garbage collector spends ~500ms scanning for cycles quite frequently.
-    # We manually manage it to avoid these pauses during training.
-    if step == 1:
-        gc.collect()  # manually collect a lot of garbage from setup
-        gc.freeze()  # freeze all currently surviving objects and exclude them from GC
-        gc.disable()  # disable GC entirely except:
-    elif step % 5000 == 0:  # every 5000 steps...
-        gc.collect()  # manually collect, just to be safe for very long runs
-
-# print a few more stats
+# Not `print_run_summary`: that helper formats bpb to 6 places and this script
+# has always printed 4, so reusing it would change the log line.
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time / 60:.2f}m")
 print0(f"Minimum validation bpb: {min_val_bpb:.4f}")

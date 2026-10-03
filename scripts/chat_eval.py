@@ -17,6 +17,7 @@ import torch.distributed as dist
 from nanochat.modules.checkpoint_manager import load_model
 from nanochat.modules.engine import Engine
 from nanochat.tasks.arc import ARC
+from nanochat.tasks.common import EVAL_TYPE_CATEGORICAL, EVAL_TYPE_GENERATIVE
 from nanochat.tasks.gsm8k import GSM8K
 from nanochat.tasks.humaneval import HumanEval
 from nanochat.tasks.mmlu import MMLU
@@ -129,8 +130,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
         if max_problems is None
         else min(len(task_object), max_problems)
     )
-    ceil_div = lambda x, y: -(-x // y)
-    num_batches = ceil_div(num_problems, batch_size)
+    num_batches = -(-num_problems // batch_size)
 
     # Run the evaluation
     letter_to_id_cache = {}  # many letters will repeat often, let's save the tokenizer some work
@@ -223,7 +223,7 @@ def run_chat_eval(
     }[task_name]
     task_object = task_module()
     # Run the evaluation
-    if task_object.eval_type == "generative":
+    if task_object.eval_type == EVAL_TYPE_GENERATIVE:
         acc = run_generative_eval(
             task_object,
             tokenizer,
@@ -235,7 +235,7 @@ def run_chat_eval(
             top_k,
             max_problems=max_problems,
         )
-    elif task_object.eval_type == "categorical":
+    elif task_object.eval_type == EVAL_TYPE_CATEGORICAL:
         acc = run_categorical_eval(
             task_object, tokenizer, model, batch_size, max_problems=max_problems
         )

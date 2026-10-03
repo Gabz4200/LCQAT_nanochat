@@ -18,6 +18,7 @@ import math
 import torch
 
 from nanochat.models.backbone import GPT, GPTConfig
+from nanochat.models.quant.packing import index_bytes_for_k
 from nanochat.models.quant.retrofit import PRESETS, get_layer_config, spec_k
 from nanochat.modules.engine import QuantizedKVCache
 
@@ -58,17 +59,6 @@ def nearest_depth(target: float = 7.5e9) -> int:
     return min(range(10, 61), key=lambda d: abs(param_count(d) - target))
 
 
-def bytes_per_index(k: int) -> float:
-    """Bytes per weight index at level count `k`, matching packing.py formats."""
-    if k == 3:
-        return 1.0 / 5  # pack_trits: 5 trits/byte
-    if k <= 15:
-        return 0.5  # pack_nibbles: 2 values/byte
-    if k <= 255:
-        return 1.0  # one uint8 per weight
-    return 4.0  # int32
-
-
 def weight_bytes(model: GPT) -> tuple[int, int]:
     """(packed_matrix_bytes, bf16_embedding_and_scalar_bytes)."""
     packed = bf16 = 0
@@ -81,7 +71,7 @@ def weight_bytes(model: GPT) -> tuple[int, int]:
         if spec is None:
             bf16 += p.numel() * 2  # embeddings / lm_head / gates: bf16
             continue
-        packed += out * bytes_per_index(spec_k(spec.weight))
+        packed += out * index_bytes_for_k(spec_k(spec.weight))
     return packed, bf16
 
 

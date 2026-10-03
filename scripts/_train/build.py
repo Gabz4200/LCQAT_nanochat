@@ -395,6 +395,7 @@ def build_engine(
         for flag, value in (
             ("--db-objective", args.db_objective),
             ("--db-block-sampling", args.db_block_sampling),
+            ("--db-denoise-backend", args.db_denoise_backend),
             ("--kd-denoiser-alpha", args.kd_denoiser_alpha),
             ("--efqat-latch-blocks", args.efqat_latch_blocks),
         ):
@@ -402,6 +403,7 @@ def build_engine(
                 value not in (0, 0.0, "", None)
                 and not (flag == "--db-objective" and value == "edm")
                 and not (flag == "--db-block-sampling" and value == "step")
+                and not (flag == "--db-denoise-backend" and value == "cpu")
             ):
                 raise SystemExit(
                     f"{flag}={value!r} is meaningless with --db-blocks<=0: there are "
@@ -428,7 +430,11 @@ def build_engine(
             sigma_data=0.5,
         )
         engine = DiffusionBlockEngine(
-            model, partitioner, device=device, dtype=COMPUTE_DTYPE
+            model,
+            partitioner,
+            device=device,
+            dtype=COMPUTE_DTYPE,
+            denoise_backend=args.db_denoise_backend,
         )
         print0(
             f"Initialized DiffusionBlocks Engine with {num_db_blocks} independent blocks"

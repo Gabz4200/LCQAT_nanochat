@@ -194,7 +194,9 @@ else:
         sigma_max=80.0,
         sigma_data=0.5,
     )
-    db_engine = DiffusionBlockEngine(base_model, partitioner)
+    db_engine = DiffusionBlockEngine(
+        base_model, partitioner, denoise_backend=args.db_denoise_backend
+    )
 
 # LC-QAT: retrofit the engine-owned Linear layers (adapters + denoise heads)
 # so the whole training pipeline is LC-QAT. The base model was already

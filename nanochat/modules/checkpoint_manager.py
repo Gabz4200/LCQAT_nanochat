@@ -21,6 +21,7 @@ from nanochat.models.quant.retrofit import (
     prepare_exported_subtree_buffers as _prepare_exported_buffers,
 )
 from nanochat.training.diffusion_blocks import (
+    NOISE_MAP_VERSION,
     DiffusionBlockEngine,
     EquiProbabilityPartitioner,
 )
@@ -200,6 +201,19 @@ def build_model(checkpoint_dir, step, device, phase, lcqat=None):
     db_meta = meta_data.get("db")
     num_blocks = db_meta.get("num_blocks", 4) if db_meta is not None else 0
     if db_meta is not None:
+        # The block/noise map was corrected in v2 (block 0 now owns the
+        # highest sigma range, per the paper Fig. 6 / App. C; v1 had it
+        # backwards). A v1 checkpoint resumed under the corrected map would
+        # silently retarget every block's noise range, so refuse it loudly
+        # instead of training garbage that looks healthy. Absent key means v1.
+        if db_meta.get("noise_map_version", 1) != NOISE_MAP_VERSION:
+            raise RuntimeError(
+                f"checkpoint declares meta['db'] with noise_map_version="
+                f"{db_meta.get('noise_map_version', 1)}, but this build trains "
+                f"noise map v{NOISE_MAP_VERSION} (block 0 owns the highest "
+                "sigma range). The block/noise assignment changed, so this "
+                "checkpoint cannot be resumed or evaluated; retrain it."
+            )
         # The engine's own parameters (adapters, denoise heads) are zero-initialized
         # at construction (diffusion_blocks.py NoiseConditionedBlockAdapter /
         # denoise_head). A checkpoint that declares meta["db"] but carries no

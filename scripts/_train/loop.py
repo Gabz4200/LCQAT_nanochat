@@ -372,6 +372,7 @@ def train_loop(ctx):
                     overlap=args.db_overlap,
                     attn_mask=train_attn_mask,
                     clean=clean,
+                    backend=args.db_denoise_backend,
                 )
                 if ctx.engine.distiller is not None:
                     step_kd_logged = step_kd_logged + float(ctx.engine.last_kd_loss)

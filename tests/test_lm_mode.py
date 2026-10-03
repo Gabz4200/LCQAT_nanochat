@@ -16,71 +16,16 @@ These tests pin the two properties that make the mode usable as a baseline:
 """
 
 import os
-import subprocess
-import sys
 
 import pytest
-
-
-def _subprocess_python() -> str:
-    """The interpreter that can actually import this project's dependencies.
-
-    `sys.executable` is only correct when pytest itself runs from the project
-    venv. Under a plain `python -m pytest` against the system interpreter it
-    points at /usr/bin/python, and every subprocess test then dies at
-    `import wandb` before reaching any of the code under test -- which is how
-    tests/test_w0_smoke.py came to have subprocess tests that never ran.
-
-    Resolve the venv explicitly: `sys.prefix` is the environment pytest is
-    running in, so its bin/python is the interpreter with the dependencies.
-    """
-    return os.path.join(sys.prefix, "bin", "python")
-
-
 import torch
 
-# d6 / seq 64 / batch 2 keeps this inside the 7.6 GB host budget, matching
-# tests/test_w0_smoke.py. Explicit model tag per test so a run cannot clobber a
-# shared checkpoint directory.
-SMOKE_ARGS = [
-    "--depth",
-    "6",
-    "--num-iterations",
-    "2",
-    "--max-seq-len",
-    "64",
-    "--device-batch-size",
-    "2",
-    "--total-batch-size",
-    "256",
-    "--run",
-    "dummy",
-    "--eval-every",
-    "-1",
-    "--core-metric-every",
-    "-1",
-    "--save-every",
-    "-1",
-    "--sample-every",
-    "-1",
-]
+from tests.conftest import run_base_train
 
 
 def _run(extra, tag, timeout=900):
-    return subprocess.run(
-        [
-            _subprocess_python(),
-            "-m",
-            "scripts.base_train",
-            *SMOKE_ARGS,
-            "--model-tag",
-            tag,
-            *extra,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
+    """A per-test checkpoint directory, so runs cannot resume each other's."""
+    return run_base_train(extra, model_tag=tag, timeout=timeout)
 
 
 def _assert_ok(proc):

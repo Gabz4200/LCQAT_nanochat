@@ -69,10 +69,20 @@ def test_arms_are_distinguishable() -> None:
     whole point of the gate.
     """
     actual, _ = fingerprint()
-    losses = {actual[f"{other}/loss"] for other in ("plain_lm", "lcqat", "sparseprop")}
-    assert len(losses) > 1, (
-        "every arm reports the same loss, so the fingerprint is not "
-        "discriminating and would pass even a completely broken forward"
+    arms = ("plain_lm", "lcqat", "sparseprop")
+    losses = {arm: actual[f"{arm}/loss"] for arm in arms}
+    # Every pair, not just "more than one distinct value": a gate where two of
+    # the three arms agree is half blind, and `len(set(...)) > 1` would pass it.
+    collisions = [
+        (a, b)
+        for i, a in enumerate(arms)
+        for b in arms[i + 1 :]
+        if losses[a] == losses[b]
+    ]
+    assert not collisions, (
+        f"arms report identical losses: {collisions} -- {losses}. The "
+        "fingerprint is not discriminating and would pass even a completely "
+        "broken forward."
     )
 
 

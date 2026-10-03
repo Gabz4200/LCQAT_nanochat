@@ -14,8 +14,17 @@ from nanochat.models.quant.sparseprop import (
 )
 
 
-@pytest.fixture
-def tiny_model():
+def build_tiny_gpt():
+    """A depth-2 GPT with the shape this file's tests use.
+
+    One definition, because this block was repeated four times in the file and
+    the copies were not interchangeable: `retrofit_model` and
+    `inject_sparseprop_layers` both mutate in place and re-parent modules, so
+    every arm of a comparison needs its own instance. `init_weights()`
+    randomizes nothing, but the callers that need live zero-inits must call
+    `build_active_tiny_gpt` instead -- a zero `c_proj` transmits no gradient and
+    every gradient assertion over it passes vacuously.
+    """
     from nanochat.models.backbone import GPT, GPTConfig
 
     config = GPTConfig(
@@ -29,7 +38,29 @@ def tiny_model():
     )
     with torch.device("meta"):
         model = GPT(config)
-    model.to_empty(device="cpu")
+    model = model.to_empty(device="cpu")
+    model.init_weights()
+    return model
+
+
+#: A 4x6 mask with no row or column fully zero, so every row keeps at least one
+#: nnz (the per-row floor `magnitude_mask` enforces).
+SAMPLE_MASK_ROWS = (
+    (1, 0, 1, 0, 1, 0),
+    (0, 1, 0, 1, 0, 1),
+    (1, 1, 1, 0, 0, 1),
+    (0, 0, 1, 1, 1, 0),
+)
+
+
+def sample_mask() -> torch.Tensor:
+    """A fresh copy of `SAMPLE_MASK_ROWS` as a bool tensor."""
+    return torch.tensor(SAMPLE_MASK_ROWS, dtype=torch.bool)
+
+
+@pytest.fixture
+def tiny_model():
+    model = build_tiny_gpt()
     model.init_weights()
     return model
 
@@ -42,15 +73,7 @@ class TestSparsePropLinearAutograd:
         # sparsity=0.0 → all-ones mask, no zeroing; we apply a custom mask below
         sparse = SparsePropLinear.from_linear(lin, sparsity=0.0)
         with torch.no_grad():
-            mask = torch.tensor(
-                [
-                    [1, 0, 1, 0, 1, 0],
-                    [0, 1, 0, 1, 0, 1],
-                    [1, 1, 1, 0, 0, 1],
-                    [0, 0, 1, 1, 1, 0],
-                ],
-                dtype=torch.bool,
-            )
+            mask = sample_mask()
             sparse._set_mask(mask)
 
         x = torch.randn(8, 6, dtype=torch.float32, requires_grad=True)
@@ -69,15 +92,7 @@ class TestSparsePropLinearAutograd:
         lin = nn.Linear(6, 4, bias=True)
         sparse = SparsePropLinear.from_linear(lin, sparsity=0.0)
 
-        mask = torch.tensor(
-            [
-                [1, 0, 1, 0, 1, 0],
-                [0, 1, 0, 1, 0, 1],
-                [1, 1, 1, 0, 0, 1],
-                [0, 0, 1, 1, 1, 0],
-            ],
-            dtype=torch.bool,
-        )
+        mask = sample_mask()
         sparse._set_mask(mask)
 
         x = torch.randn(8, 6, dtype=torch.float32)
@@ -578,22 +593,7 @@ def _fresh_tiny_gpt() -> nn.Module:
     reusing one model across arms leaves the arms sharing weight tensors and
     makes any gradient comparison trivially equal.
     """
-    from nanochat.models.backbone import GPT, GPTConfig
-
-    config = GPTConfig(
-        sequence_len=32,
-        vocab_size=64,
-        n_layer=2,
-        n_head=2,
-        n_kv_head=2,
-        n_embd=32,
-        window_pattern="L",
-    )
-    with torch.device("meta"):
-        model = GPT(config)
-    model = model.to_empty(device="cpu")
-    model.init_weights()
-    return model
+    return build_tiny_gpt()
 
 
 class TestSparsePropLearnedActivationLUT:
@@ -615,21 +615,7 @@ class TestSparsePropLearnedActivationLUT:
         from nanochat.models.quant.export import attach_learnable_activation_luts
 
         def build():
-            from nanochat.models.backbone import GPT, GPTConfig
-
-            config = GPTConfig(
-                sequence_len=32,
-                vocab_size=64,
-                n_layer=2,
-                n_head=2,
-                n_kv_head=2,
-                n_embd=32,
-                window_pattern="L",
-            )
-            with torch.device("meta"):
-                model = GPT(config)
-            model = model.to_empty(device="cpu")
-            model.init_weights()
+            model = build_tiny_gpt()
             retrofit_model(model, LayerKConfig(min_linear_dim=1))
             n = attach_learnable_activation_luts(
                 model, relaxation="logits", act_body="pwl"

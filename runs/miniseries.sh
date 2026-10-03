@@ -9,6 +9,8 @@ export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="$HOME/.cache/nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 
+source "$(dirname "${BASH_SOURCE[0]}")/lib_depth.sh"
+
 # Setup (skip with SKIP_SETUP=1)
 if [ -z "$SKIP_SETUP" ]; then
     # uv
@@ -58,22 +60,8 @@ for d in "${DEPTHS[@]}"; do
     TAG="${SERIES_NAME}_miniseries_d${d}"
     START_TIME=$(date +%s)
 
-    # Reduce --device-batch-size to avoid OOM at larger depths
-    if [ $d -ge 28 ]; then
-        DEVICE_BATCH_SIZE_ARG="--device-batch-size=8"
-    elif [ $d -ge 20 ]; then
-        DEVICE_BATCH_SIZE_ARG="--device-batch-size=16"
-    else
-        DEVICE_BATCH_SIZE_ARG="--device-batch-size=32"
-    fi
-    # DiffusionBlocks engine is on by default; scale the block count with depth.
-    if [ $d -ge 26 ]; then
-        DB_BLOCKS_ARG="--db-blocks=8"
-    elif [ $d -ge 16 ]; then
-        DB_BLOCKS_ARG="--db-blocks=6"
-    else
-        DB_BLOCKS_ARG="--db-blocks=4"
-    fi
+    DEVICE_BATCH_SIZE_ARG=$(device_batch_arg "$d")
+    DB_BLOCKS_ARG=$(db_blocks_arg "$d")
 
     # LC-QAT, SparseProp, and DiffusionBlocks are on by default in this fork.
     torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- \

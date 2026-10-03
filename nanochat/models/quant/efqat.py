@@ -87,6 +87,11 @@ class SelectiveFreezer:
         self.freeze_middle_frac = float(freeze_middle_frac)
         self._frozen = False
         self._frozen_params: set[int] = set()
+        # Names of the frozen parameters, tracked alongside the ids because
+        # `is_trainable` is consulted once per parameter per block activation:
+        # resolving a name to a parameter means walking `named_parameters()`,
+        # which would make every activation O(P^2).
+        self._frozen_names: set[str] = set()
 
     @staticmethod
     def is_critical(name: str) -> bool:
@@ -103,11 +108,7 @@ class SelectiveFreezer:
             return True
         if self.is_critical(name):
             return True
-        return id(self._lookup(name)) not in self._frozen_params
-
-    def _lookup(self, name: str) -> nn.Parameter | None:
-        params = dict(self.model.named_parameters())
-        return params.get(name)
+        return name not in self._frozen_names
 
     def _layer_params(self) -> list[tuple[int, str, nn.Parameter]]:
         """Return (layer_index, param_name, param) for every transformer.h param."""
@@ -159,6 +160,7 @@ class SelectiveFreezer:
             if start <= layer_idx < end and not self.is_critical(name):
                 p.requires_grad_(False)
                 self._frozen_params.add(id(p))
+                self._frozen_names.add(name)
                 frozen += 1
         self._frozen = True
         return frozen
@@ -186,6 +188,7 @@ class SelectiveFreezer:
                 p.requires_grad_(True)
                 count += 1
         self._frozen_params.clear()
+        self._frozen_names.clear()
         self._frozen = False
         return count
 
@@ -247,13 +250,19 @@ class BlockLatchFreezer:
                     return int(parts[1])
         return None
 
-    def block_parameter_names(self, block_idx: int) -> list[str]:
-        """Every engine parameter name attributed to `block_idx`."""
-        return [
-            name
-            for name, _ in self.engine.named_parameters()
-            if self.block_of(name) == block_idx
-        ]
+    def _names_by_block(self) -> dict[int, list[tuple[str, nn.Parameter]]]:
+        """Every engine parameter grouped by the block it belongs to, in one walk.
+
+        `named_parameters()` is O(P), and the latch plus the name query both
+        need it, so grouping once keeps latching B blocks at one traversal
+        rather than B.
+        """
+        by_block: dict[int, list[tuple[str, nn.Parameter]]] = {}
+        for name, p in self.engine.named_parameters():
+            b = self.block_of(name)
+            if b is not None:
+                by_block.setdefault(b, []).append((name, p))
+        return by_block
 
     # -- the latch -----------------------------------------------------------
 
@@ -265,6 +274,19 @@ class BlockLatchFreezer:
         """Sorted list of latched block indices (for logging / checkpointing)."""
         return sorted(self._latched)
 
+    def _latch_named(
+        self, block_idx: int, entries: list[tuple[str, nn.Parameter]]
+    ) -> int:
+        """Freeze one block's already-resolved parameters and record the latch."""
+        frozen = 0
+        for _, p in entries:
+            if p.requires_grad:
+                p.requires_grad_(False)
+                p.grad = None
+                frozen += 1
+        self._latched.add(int(block_idx))
+        return frozen
+
     def latch_block(self, block_idx: int) -> int:
         """Permanently freeze `block_idx`'s parameters. Idempotent.
 
@@ -273,21 +295,18 @@ class BlockLatchFreezer:
         b = int(block_idx)
         if b in self._latched:
             return 0
-        params = dict(self.engine.named_parameters())
-        frozen = 0
-        for name, p in params.items():
-            if self.block_of(name) != b:
-                continue
-            if p.requires_grad:
-                p.requires_grad_(False)
-                p.grad = None
-                frozen += 1
-        self._latched.add(b)
-        return frozen
+        return self._latch_named(b, self._names_by_block().get(b, []))
 
     def latch_blocks(self, block_indices: Iterable[int]) -> int:
         """Latch several blocks; returns the total number of params frozen."""
-        return sum(self.latch_block(b) for b in block_indices)
+        by_block = self._names_by_block()
+        total = 0
+        for block_idx in block_indices:
+            b = int(block_idx)
+            if b in self._latched:
+                continue
+            total += self._latch_named(b, by_block.get(b, []))
+        return total
 
     def is_trainable(self, name: str) -> bool:
         """Whether `name` may receive gradients right now.

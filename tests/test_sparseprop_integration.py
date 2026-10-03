@@ -60,8 +60,16 @@ def sample_mask() -> torch.Tensor:
 
 @pytest.fixture
 def tiny_model():
+    # Active weights: zero-init c_proj transmits no gradient, so gradient-flow
+    # tests on the zero model pass vacuously. Randomize projections off zero,
+    # preserving this file's (n_layer=2, n_embd=32) shape.
+    import torch as _torch
+
     model = build_tiny_gpt()
-    model.init_weights()
+    with _torch.no_grad():
+        for block in model.transformer.h:
+            _torch.nn.init.normal_(block.attn.c_proj.weight, std=0.02)
+            _torch.nn.init.normal_(block.mlp.c_proj.weight, std=0.02)
     return model
 
 
@@ -585,14 +593,26 @@ class TestSparsePropDenseGEMMPath:
         )
 
 
-def _fresh_tiny_gpt() -> nn.Module:
+def _fresh_tiny_gpt(active: bool = True) -> nn.Module:
     """A newly initialized tiny GPT.
 
     Every arm of a comparison needs its own instance: `retrofit_model` and
     `inject_sparseprop_layers` both mutate in place and re-parent modules, so
     reusing one model across arms leaves the arms sharing weight tensors and
     makes any gradient comparison trivially equal.
+
+    Gradient-flow callers need `active=True` (randomized projections); the zero
+    `c_proj` transmits no gradient and assertions pass vacuously.
     """
+    if active:
+        import torch as _torch
+
+        model = build_tiny_gpt()
+        with _torch.no_grad():
+            for block in model.transformer.h:
+                _torch.nn.init.normal_(block.attn.c_proj.weight, std=0.02)
+                _torch.nn.init.normal_(block.mlp.c_proj.weight, std=0.02)
+        return model
     return build_tiny_gpt()
 
 

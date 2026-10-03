@@ -72,6 +72,11 @@ def safe_eval_expression(formula: str):
 
 @contextmanager
 def timeout(duration, formula):
+    """SIGALRM timeout (Unix main-thread only; worker threads raise).
+
+    Single-threaded eval path only; do not use from a thread pool.
+    """
+
     def timeout_handler(signum, frame):
         raise Exception(f"'{formula}': timed out after {duration} seconds")
 
@@ -294,7 +299,10 @@ class QuantizedKVCache:
 
     @staticmethod
     def _quantize(x: torch.Tensor, codebooks: torch.Tensor) -> torch.Tensor:
-        """[B, T, H, D] float -> uint8 codebook indices via midpoint bucketize."""
+        """[B, T, H, D] float -> uint8 codebook indices via midpoint bucketize.
+
+        O(H) launches (one bucketize per head); fine for decode.
+        """
         x_fp32 = x.detach().to(torch.float32)
         b, t, h, d = x_fp32.shape
         indices = torch.empty(b, t, h, d, dtype=torch.uint8, device=x.device)

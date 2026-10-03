@@ -377,6 +377,28 @@ at::Tensor lcqat_sparse_index_linear(
 
   const int64_t T = act_indices.size(0);
   const int64_t nnz = col_indices.size(0);
+  const int64_t K_act = act_lut.size(0);
+  TORCH_CHECK(alphabet.size(0) == nnz,
+              "alphabet length must equal nnz (col_indices length)");
+  // Validate listing on entry: row_ptr monotone, in range, endpoints exact.
+  {
+    auto ptr_acc = ptr.accessor<int32_t, 1>();
+    TORCH_CHECK(ptr_acc[0] == 0, "row_ptr[0] must be 0");
+    TORCH_CHECK(ptr_acc[M] == nnz, "row_ptr[M] must equal nnz");
+    for (int64_t m = 0; m <= M; ++m) {
+      TORCH_CHECK(ptr_acc[m] >= 0 && ptr_acc[m] <= nnz,
+                  "row_ptr out of range");
+      if (m > 0) TORCH_CHECK(ptr_acc[m] >= ptr_acc[m - 1],
+                             "row_ptr must be non-decreasing");
+    }
+    auto cols_acc = cols.accessor<int32_t, 1>();
+    for (int64_t p = 0; p < nnz; ++p) {
+      TORCH_CHECK(cols_acc[p] >= 0 && cols_acc[p] < N,
+                  "col_indices out of range [0, N)");
+    }
+    TORCH_CHECK(int64_t(act_i.max().item<int64_t>()) < K_act,
+                "act_indices value exceeds act_lut size");
+  }
 
   auto act_i = act_indices.contiguous();
   auto lut = act_lut.contiguous();

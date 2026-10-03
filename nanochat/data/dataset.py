@@ -24,8 +24,14 @@ MAX_SHARD = 6542  # the last datashard is shard_06542.parquet
 index_to_filename = lambda index: (
     f"shard_{index:05d}.parquet"
 )  # format of the filenames
-base_dir = get_base_dir()
-DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
+
+
+def _data_dir() -> str:
+    return os.path.join(get_base_dir(), "base_data_climbmix")
+
+
+# Kept for backwards compat; prefer _data_dir() (no import-time mkdir).
+DATA_DIR = _data_dir()
 
 
 def list_parquet_files(data_dir=None, warn_on_legacy=False):
@@ -62,7 +68,7 @@ def list_parquet_files(data_dir=None, warn_on_legacy=False):
             print("=" * 80)
             print()
         # attempt a fallback to the legacy data directory
-        data_dir = os.path.join(base_dir, "base_data")
+        data_dir = os.path.join(get_base_dir(), "base_data")
 
     parquet_files = sorted(
         [

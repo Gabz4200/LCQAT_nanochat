@@ -241,11 +241,10 @@ class BiasQuantizer(nn.Module):
             dst.copy_(src)
 
     def _check_shape(self, x: torch.Tensor) -> None:
-        if x.numel() != self.out_features:
+        if tuple(x.shape) != (self.out_features,):
             raise ValueError(
-                f"bias has {x.numel()} entries, expected out_features="
-                f"{self.out_features}; a mismatch would broadcast into a "
-                f"silently wrong addend"
+                f"bias has shape {tuple(x.shape)}, expected out_features=({self.out_features},); "
+                "a broadcastable-but-wrong shape would silently corrupt the addend"
             )
 
     def extra_repr(self) -> str:

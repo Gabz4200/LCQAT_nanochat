@@ -445,7 +445,10 @@ class TestMeasurement:
         measurements is measuring the other's tensor."""
         linear = quantized(quantize_bias=True)
         report = measure_bias_quantization(linear, torch.randn(4, IN_FEATURES), "asym")
-        assert report.bias.nmse != report.weight.nmse
+        assert abs(report.bias.nmse - report.weight.nmse) > 1e-6, (
+            f"bias {report.bias.nmse} vs weight {report.weight.nmse}: "
+            "identical numbers mean one measurement scored the other's tensor"
+        )
         assert math.isfinite(report.bias_nmse_over_weight_nmse)
 
     def test_when_measured_then_the_bias_term_uses_the_bias_quantizer(self) -> None:

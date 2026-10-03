@@ -477,15 +477,17 @@ def get_layer_config(module_name: str, config: LayerKConfig) -> LayerQuantSpec |
     carry that precondition on its own.
     """
     role = None
-    if "attn.c_q" in module_name or "attn.c_k" in module_name:
+    # Anchored on ".c_q" suffix segments so hypothetical `c_qkv`-style names
+    # do not false-positive; first-match-wins for k_map is documented.
+    if ".attn.c_q" in f".{module_name}" or ".attn.c_k" in f".{module_name}":
         role = _ROLE_QK
-    elif "attn.c_v" in module_name:
+    elif ".attn.c_v" in f".{module_name}":
         role = _ROLE_V
-    elif "attn.c_proj" in module_name:
+    elif ".attn.c_proj" in f".{module_name}":
         role = _ROLE_O
-    elif "mlp.c_fc" in module_name:
+    elif ".mlp.c_fc" in f".{module_name}":
         role = _ROLE_FC
-    elif "mlp.c_proj" in module_name:
+    elif ".mlp.c_proj" in f".{module_name}":
         role = _ROLE_DOWN
     if role is None:
         return None

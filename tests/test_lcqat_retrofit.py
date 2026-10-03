@@ -29,7 +29,9 @@ from nanochat.models.quant.retrofit import (
     spec_k,
     spec_split,
 )
-from tests.conftest import build_tiny_gpt
+from tests.conftest import (
+    build_tiny_gpt,  # NOTE: structural only; gradient tests must use build_active_tiny_gpt (zero c_proj passes vacuously)
+)
 
 
 def _k_of(model: nn.Module, name: str) -> tuple[int, int]:

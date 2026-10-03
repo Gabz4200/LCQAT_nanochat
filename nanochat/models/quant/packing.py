@@ -126,6 +126,10 @@ def pack_trits(trits: torch.Tensor) -> torch.Tensor:
 
     Byte b of a row encodes flat digits d_0..d_4 (LSB-first) as sum(d_t * 3^t);
     the tail is padded with digit 0.
+
+    NOTE: the range check is skipped under `torch.compile` (data-dependent
+    `.max()` would graph-break). Corrupt indices then pack silently in the
+    compiled/export path; validate before compiling.
     """
     if trits.ndim != 2:
         raise ValueError(
@@ -166,6 +170,8 @@ def pack_nibbles(indices: torch.Tensor) -> torch.Tensor:
 
     Applies row-wise over any leading dims (even index of each pair goes to the
     low nibble), matching the PRD kernel's decode.
+
+    NOTE: the range check is skipped under `torch.compile` (see `pack_trits`).
     """
     if indices.ndim == 0:
         raise ValueError("pack_nibbles expects at least a 1-D tensor")

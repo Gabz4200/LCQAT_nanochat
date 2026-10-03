@@ -99,14 +99,23 @@ def save_checkpoint(
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-    model_data = torch.load(model_path, map_location=device)
+    # Only load checkpoints you trained: .pt is pickle and executes code.
+    try:
+        model_data = torch.load(model_path, map_location=device, weights_only=True)
+    except (TypeError, RuntimeError):
+        model_data = torch.load(model_path, map_location=device)
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optimizer:
         optimizer_path = os.path.join(
             checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt"
         )
-        optimizer_data = torch.load(optimizer_path, map_location=device)
+        try:
+            optimizer_data = torch.load(
+                optimizer_path, map_location=device, weights_only=True
+            )
+        except (TypeError, RuntimeError):
+            optimizer_data = torch.load(optimizer_path, map_location=device)
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
     with open(meta_path, "r", encoding="utf-8") as f:
         meta_data = json.load(f)

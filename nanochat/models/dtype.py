@@ -24,6 +24,10 @@ _DTYPE_MAP = {
 def _detect_compute_dtype() -> tuple[torch.dtype, str]:
     env = os.environ.get("NANOCHAT_DTYPE")
     if env is not None:
+        if env not in _DTYPE_MAP:
+            raise ValueError(
+                f"Invalid NANOCHAT_DTYPE={env!r}. Expected one of {sorted(_DTYPE_MAP)}."
+            )
         return _DTYPE_MAP[env], f"set via NANOCHAT_DTYPE={env}"
     if torch.cuda.is_available():
         # bf16 requires SM 80+ (Ampere: A100, A10, etc.)

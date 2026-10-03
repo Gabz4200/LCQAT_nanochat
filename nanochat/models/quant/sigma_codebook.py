@@ -147,11 +147,9 @@ class SigmaConditionedCodebook(nn.Module):
             )
         if not bool(torch.all(anchors[1:] > anchors[:-1])):
             raise ValueError("anchors must be strictly increasing")
-        # Not persistent: it is fully determined by num_anchors and
-        # SIGMA_PIVOT (or by an explicit construction-time choice), so saving it
-        # would only create a chance for a checkpoint's anchors to disagree
-        # with its codebooks' shapes.
-        self.register_buffer("anchors", anchors, persistent=False)
+        # Persistent so a run with custom `anchors=` resumes with the same
+        # bucket boundaries instead of silently re-bucketing to defaults.
+        self.register_buffer("anchors", anchors, persistent=True)
 
         self.codebooks = nn.ModuleList(
             [
@@ -217,12 +215,12 @@ class SigmaConditionedCodebook(nn.Module):
         return QuantizedOutput(value=value, indices=indices, codebook=codebook)
 
     def bucketize(self, x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+        sigma = resolve_batch_sigma(sigma, x.shape[0])
         idx = self.anchor_index(sigma.reshape(-1))
-        out = torch.empty(
-            (*x.shape[:-1], x.shape[0]), dtype=torch.int64, device=x.device
-        )
+        out = torch.empty(x.shape[:-1], dtype=torch.int64, device=x.device)
+        # x is (B, ...) with one sigma row per batch element.
         for b, i in enumerate(idx.tolist()):
-            out[..., b] = self.codebooks[int(i)].bucketize(x[b])
+            out[b] = self.codebooks[int(i)].bucketize(x[b])
         return out
 
     def compile_for_inference(self) -> None:

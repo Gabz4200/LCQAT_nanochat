@@ -1,4 +1,7 @@
 """
+NOTE: `getcwd`/`chdir` are nulled; sandboxed code doing relative-path reads fails.
+The tempdir-cwd + scrubbed env already contains writes; drop those two names to allow reads.
+
 Sandboxed execution utilities for running Python code that comes out of an LLM.
 Inspired by the OpenAI HumanEval code:
 https://github.com/openai/human-eval/blob/master/human_eval/execution.py

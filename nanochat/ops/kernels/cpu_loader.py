@@ -66,7 +66,7 @@ def load_cpu_index_linear_extension():
     TORCH_LIBRARY_FRAGMENT, never a second TORCH_LIBRARY on the same namespace
     -- the latter SIGABRTs during dlopen.)
     """
-    return _load("nanochat_lcqt_cpu_index_linear", "index_linear.cpp")
+    return _load("nanochat_lcqat_cpu_index_linear", "index_linear.cpp")
 
 
 def load_cpu_sparseprop_extension():

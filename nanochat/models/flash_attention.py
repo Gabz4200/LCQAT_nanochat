@@ -73,7 +73,7 @@ def _resolve_use_fa3():
 USE_FA3 = _resolve_use_fa3()
 
 
-def _sdpa_attention(q, k, v, window_size, enable_gqa, attn_mask=None):
+def _sdpa_attention(q, k, v, window_size, enable_gqa, attn_mask=None, causal=False):
     """
     SDPA attention with sliding window and custom attention mask support.
     q, k, v are (B, H, T, D) format.
@@ -94,6 +94,16 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa, attn_mask=None):
                 mask = mask & window_mask
             else:
                 mask = mask.masked_fill(~window_mask, float("-inf"))
+        if causal and Tq == Tk:
+            # AND causality: the explicit mask encodes packing, not order.
+            device = q.device
+            row_idx = torch.arange(Tq, device=device).unsqueeze(1)
+            col_idx = torch.arange(Tk, device=device).unsqueeze(0)
+            causal_mask = col_idx <= row_idx
+            if mask.dtype == torch.bool:
+                mask = mask & causal_mask
+            else:
+                mask = mask.masked_fill(~causal_mask, float("-inf"))
         return F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, enable_gqa=enable_gqa
         )
@@ -152,7 +162,9 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), attn_mask=None)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
     enable_gqa = q.size(1) != k.size(1)
-    y = _sdpa_attention(q, k, v, window_size, enable_gqa, attn_mask=attn_mask)
+    y = _sdpa_attention(
+        q, k, v, window_size, enable_gqa, attn_mask=attn_mask, causal=causal
+    )
     return y.transpose(1, 2)  # back to (B, T, H, D)
 
 
@@ -196,7 +208,18 @@ def flash_attn_with_kvcache(
 
     # SDPA fallback: manually manage KV cache
     B, T_new, H, D = q.shape
-    pos = cache_seqlens[0].item()  # assume uniform position across batch
+    if cache_seqlens is None:
+        raise ValueError("cache_seqlens is required for SDPA KV-cache path")
+    if int(cache_seqlens.numel()) != B:
+        raise ValueError(
+            f"cache_seqlens batch {int(cache_seqlens.numel())} != query batch {B}"
+        )
+    if bool((cache_seqlens[1:] != cache_seqlens[0]).any()):
+        raise ValueError(
+            "Non-uniform cache_seqlens across batch is not supported in the SDPA "
+            "fallback; use uniform positions or FA3."
+        )
+    pos = int(cache_seqlens[0].item())  # uniform position across batch (checked)
 
     # Insert new k, v into cache (in-place, matching FA3 behavior)
     if k is not None and v is not None:

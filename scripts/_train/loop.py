@@ -334,8 +334,11 @@ def train_loop(ctx):
         if args.sparseprop:
             pruned = ctx.sparse_schedule.apply(ctx.trainable_root, step)
             if pruned is not None:
+                # `ctx.trainable_root`, matching the `apply` above: in LM mode
+                # (`--db-blocks=0`) `ctx.engine` is None, and collecting over it
+                # raises instead of reporting a count.
                 n_sparse_above = len(
-                    ctx.sparse_schedule.layers_above_threshold(ctx.engine)
+                    ctx.sparse_schedule.layers_above_threshold(ctx.trainable_root)
                 )
                 print0(
                     f"Step {step:05d} | SparseProp pruned to {pruned:.4f} sparsity; "

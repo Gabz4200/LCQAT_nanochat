@@ -766,6 +766,65 @@ class DiffusionBlockEngine:
         for owned in self._owned:
             yield from owned.modules()
 
+    def named_modules(
+        self,
+        memo: set | None = None,
+        prefix: str = "",
+        remove_duplicate: bool = True,
+    ):
+        """Yield `(name, module)` for model + adapters + denoise heads.
+
+        The name-addressable sibling of `modules()`, and the one export needs:
+        `export_lcqat_checkpoint` walks `named_modules()` to strip FP32 shadow
+        weights, and its activation-LUT wiring then resolves a dotted path back
+        with `get_submodule`. Without this, every default run -- the ones
+        declaring `meta["db"]`, i.e. every run that used the default
+        `--db-blocks=4` -- raised `AttributeError` at export, because
+        `load_model` returns the engine rather than the bare GPT.
+
+        Signature and `memo` dedup semantics deliberately mirror
+        `nn.Module.named_modules` so the engine is a drop-in for any consumer
+        that walks a model tree. The `db_adapters` / `db_denoise_heads` prefixes
+        are the same contract `named_parameters` and `state_dict` use, so a name
+        from this walk resolves through `get_submodule` and keys a state_dict
+        entry.
+
+        `memo` is threaded across all three subtrees, not per-subtree: it is what
+        stops a module reachable from two of them from being yielded twice, and
+        a fresh set per subtree would quietly disable that.
+        """
+        for name, module in self.model.named_modules(memo, prefix, remove_duplicate):
+            yield name, module
+        for name, module in self.adapters.named_modules(
+            memo, "db_adapters", remove_duplicate
+        ):
+            yield name, module
+        for name, module in self.denoise_heads.named_modules(
+            memo, "db_denoise_heads", remove_duplicate
+        ):
+            yield name, module
+
+    def get_submodule(self, target: str):
+        """Resolve a dotted name from `named_modules()` back to a module.
+
+        `nn.Module` spelling, including `""` returning the engine itself and a
+        bare `db_adapters` / `db_denoise_heads` returning the whole subtree.
+        Raises `AttributeError` for an unknown path rather than returning None,
+        so a bad lookup is loud instead of looking like "this layer has no
+        activation quantizer".
+        """
+        if target == "":
+            return self
+        for attr, owned in (
+            ("db_adapters", self.adapters),
+            ("db_denoise_heads", self.denoise_heads),
+        ):
+            if target == attr:
+                return owned
+            if target.startswith(f"{attr}."):
+                return owned.get_submodule(target[len(attr) + 1 :])
+        return self.model.get_submodule(target)
+
     def block_layers(self) -> list[list[int]]:
         return _layer_groups(len(self.model.transformer.h), self.partitioner.num_blocks)
 

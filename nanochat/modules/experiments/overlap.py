@@ -30,9 +30,10 @@ def measure_overlap_out_of_band(
 ) -> float:
     """Fraction of sampled `(sigma, block)` pairs outside the *nominal* band.
 
-    The band is the partitioner's own `boundaries()[b], boundaries()[b + 1]` --
-    the disjoint equi-probability partition. `sample_sigma(b, overlap=g)` draws
-    from `[lo/alpha, hi*alpha]` with `alpha = (hi/lo) ** g`, so this fraction is
+    The band is the partitioner's own `range_for_block(block)` -- the disjoint
+    equi-probability interval that block owns under the v2 noise map (block 0
+    takes the top interval). `sample_sigma(b, overlap=g)` draws from
+    `[lo/alpha, hi*alpha]` with `alpha = (hi/lo) ** g`, so this fraction is
     expected to *rise* with `g`: overlap deliberately widens the sampling
     interval past the nominal band, which is the mechanism by which it absorbs
     the mass that would otherwise be misrouted (§12.1).
@@ -43,13 +44,11 @@ def measure_overlap_out_of_band(
     would fall by construction and test nothing (§10.3).
     """
     partitioner = EquiProbabilityPartitioner(num_blocks=args.ablation_blocks)
-    bounds = partitioner.boundaries()
     generator = torch.Generator().manual_seed(seed)
     out_of_band = 0
     total = 0
     for block in range(args.ablation_blocks):
-        lo = float(bounds[block].item())
-        hi = float(bounds[block + 1].item())
+        lo, hi = (float(v) for v in partitioner.range_for_block(block))
         for _ in range(args.overlap_samples):
             sigma = float(
                 partitioner.sample_sigma(

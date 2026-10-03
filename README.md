@@ -162,7 +162,7 @@ It uses `--db-blocks=2` rather than the default 4, deliberately: on a toy depth 
 | ISA dispatch | `ops/native/cpu/gemv.cpp` | AVX-512 / AVX2 / scalar chosen at runtime via cpuid, so the extension builds and runs on machines with no AVX-512 |
 | Storage-bound kernels | `ops/native/cpu/index_linear.cpp`, `quant_attn.cpp` | Deliberately `-O3` scalar. Both read packed indices in place with no materialized fp32 matrix, so the bottleneck is memory and LUT gathers rather than FMA throughput |
 | Zero-skip | `ops/sparse_index_linear.py` | A stored slot whose value is exactly `0.0` is skipped, not accumulated — on the hot path because LC-QAT's zero anchor makes `0.0` a real weight |
-| Sparse training path | `nanochat/models/quant/sparseprop.py` | Masked dense GEMM, *not* an nnz walk — see [docs/sparseprop.md](docs/sparseprop.md) |
+| Sparse training path | `nanochat/models/quant/sparseprop.py` | Measured crossover per layer: masked dense GEMM below 80% sparsity (the default regime), `nnz` walk above — see [docs/sparseprop.md](docs/sparseprop.md) |
 | KV cache | `QuantizedKVCache` | K/V stored as nibble-packed uint8 codebook indices, resolved through per-(layer, head) FP32 codebooks *inside* the kernel, so the cache never materializes as bf16 |
 
 **CPU is memory-bandwidth-bound, so FLOP reductions are the wrong thing to optimize for.** Two of the findings in this README come down to that. The nnz-walking sparse kernel does 4× *fewer* multiply-accumulates than the dense GEMM it replaced and still lost by an order of magnitude, because a per-nnz gather of a batch-float row cannot vectorize the way a packed GEMM micro-kernel does. And the index-linear kernels are scalar on purpose: with the weights read in place in packed form there is no arithmetic to hide the gathers behind.
@@ -200,10 +200,12 @@ total                   : 36,701,290
 and the loop itself, at 1,200–2,000 tok/s on four cores:
 
 ```
-step 00000/00200 (0.00%) | loss: 0.466746 | lrm: 0.01 | dt: 376.55ms | tok/sec: 1,359 | epoch: 1
-step 00020/00200 (10.00%) | loss: 0.414501 | lrm: 0.51 | dt: 309.57ms | tok/sec: 1,653 | epoch: 1
-step 00199/00200 (99.50%) | loss: 0.304096 | lrm: 0.06 | dt: 409.06ms | tok/sec: 1,251 | epoch: 1
+step 00000/00200 (0.00%) | loss: 0.061637 | lrm: 0.01 | dt: 981.47ms | tok/sec: 521 | epoch: 1
+step 00020/00200 (10.00%) | loss: 0.856505 | lrm: 0.51 | dt: 682.23ms | tok/sec: 750 | epoch: 1
+step 00199/00200 (99.50%) | loss: 0.109227 | lrm: 0.06 | dt: 757.69ms | tok/sec: 675 | epoch: 1
 ```
+
+Don't read a trend into three steps: σ is resampled every step and `w(σ)` reweights it, so the per-step loss jumps around by design — that is the EDM objective working as specified, not instability (see [docs/diffusionblocks.md](docs/diffusionblocks.md)). The loss-decreases assertion is pinned by the overfit test, not by eyeballing a trace.
 
 Two steps of the same 200 come out as prose:
 
@@ -279,7 +281,7 @@ Reference pages, one per mechanism:
 | [docs/quantization.md](docs/quantization.md) | Codebook mechanics, the full flag table, KD anchoring, EfQAT freezing and per-block latching, denoiser distillation, sigma-conditioned codebooks, per-channel tables, activation LUTs |
 | [docs/kernels.md](docs/kernels.md) | Mul-less GEMV, index-linear and sparse-CSR kernels, quantized export, the three benchmark scripts |
 | [docs/sparseprop.md](docs/sparseprop.md) | Sparsity flags, why the training path is a masked dense GEMM rather than an `nnz` walk, the four defect fixes, measured cost |
-| [docs/diffusionblocks.md](docs/diffusionblocks.md) | The block-wise engine, `--db-blocks=0`, and the two caveats about the EDM default |
+| [docs/diffusionblocks.md](docs/diffusionblocks.md) | The block-wise engine, the versioned block/noise map, the compiled EDM loss kernel, clean-past conditioning, `--db-blocks=0`, and why EDM and AR losses must never be compared |
 | [docs/architecture.md](docs/architecture.md) | Package layout and the functional-core boundary |
 
 The ablation harness (`scripts/lcqat_ablation.py`) measures nine claims this repo

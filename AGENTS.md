@@ -146,6 +146,7 @@ A mapping or objective change breaks checkpoints: bump the version stamp, reject
 ## PR Guidelines
 
 - Use conventional commits (`feat(scope):`, `fix(scope):`, footers such as `BREAKING CHANGE: ...`). Keep one logical change per commit, present tense, imperative mood, subject under 72 chars.
+- Keep the body short. Three to five lines, and only for what the diff cannot show: the measurement that justifies the change, the defect it fixes, the trade-off it accepts. A body that restates the diff, narrates the edit, or hedges about the tooling is noise. Put rationale in `docs/`, not in the log.
 - Never `--force` push, never `--no-verify`, never touch git config. When a hook-gated commit fails, fix and create a new commit.
 - Include behavior docs in the change: `docs/diffusionblocks.md` and README `--help` text ship with the code, not after it.
 - EDM does not train `lm_head`. Under `--db-objective edm` the loss does score-matching on denoised embeddings, so `lm_head` gets no gradient (`.grad is None`). `tests/test_db_edm_behavior.py` pins this. `lm_head` is ~23% of a small model's parameters and the only map from hidden state to token ids, so an EDM-trained checkpoint cannot generate text; it projects through random-weight logits. Any run with generation or coherence as an acceptance criterion must use `--db-objective ce`. DiffusionBlocks applies in both modes; only the block objective differs.

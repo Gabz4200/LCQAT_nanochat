@@ -186,7 +186,7 @@ Follows DeepSeekV3 and using torchtitan as reference:
 
 - **FP8 for routed experts**: Use `torch._scaled_grouped_mm` with a custom `_Float8GroupedMatmul` autograd function, with bf16 fallback for weight gradient (avoiding the per-group column-wise Triton kernels).
 
-What's really needed is a fused "FlashMoE" kernel that handles routing + expert dispatch + matmul in one shot (like FlashAttention did for attention), with all the needed features. This doesn't exist yet. Rawdogging MoE with current PyTorch primitives is painful — lots of sorting, gathering, scattering, and layout wrangling around the actual compute.
+What's really needed is a fused "FlashMoE" kernel that handles routing + expert dispatch + matmul in one shot (like FlashAttention did for attention), with everything it needs. This doesn't exist yet. Rawdogging MoE with current PyTorch primitives is painful — lots of sorting, gathering, scattering, and layout wrangling around the actual compute.
 
 ### Verdict
 
@@ -380,7 +380,7 @@ Memory usage also decreases quite a bit, by ~9GB (activations stored as FP8 inst
 
 Seeing 17% speedup is encouraging but we're still not done yet because each step is now in lower precision and less powerful individually, so to make up for the precision drop we have to train longer. Empirically, running some sweeps overnight on d24 scale, I saw that the actual speedup (when you match performance) is closer to 5%. It's possible that our LLMs at ~d24 scale are still too small to confidently enjoy the speedups that come from fp8 for bigger models.
 
-### Key Learnings
+### FP8 findings at d24 scale
 
 For nanochat at approximate scale of interest (~GPT-2 capability, ~d24):
 
@@ -487,7 +487,7 @@ As for optimal hyperparameters:
 - **Init:** Zero-init embedding, so starts as identity (tried small noisy init, it's worse)
 - **Optimizer:** AdamW with same LR as token embeddings
 
-### Key Learnings
+### Adapter injection findings
 
 1. **Gating didn't help at our scale.** The paper's context-aware gating mechanism (sigmoid dot-product gate) added parameters and complexity without improvement. modded-nanogpt found the same: "simple direct addition to the residual stream outperformed by a decent margin."
 
@@ -601,7 +601,7 @@ Both gave ~0.002 improvement, but combining them caused conflicts. Fine-tuning f
 
 Flat plateau from 0.90-0.96, then sharp cliff at 0.97+.
 
-### Key Learnings
+### Ablation findings across scales
 
 1. **Hyperparameters are scale-dependent.** What works at d12 doesn't transfer to d20. The elaborate fine-tuning that won at d12 actively hurts at d20.
 

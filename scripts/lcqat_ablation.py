@@ -3,10 +3,10 @@
 """
 Ablation driver for the LC-QAT claims.
 
-Runs the nine paired sweeps §6.5 of the handoff asks for -- codebook split,
+Runs the nine paired sweeps §6.5 of the handoff asks for (codebook split,
 codebook gradient scaling, training objective, block sampling, sigma overlap,
 SparseProp sparsity/scope/gradual pruning, activation-LUT relaxation/body,
-sigma-conditioned codebooks, and bias quantization -- and writes a leaderboard
+sigma-conditioned codebooks, and bias quantization) and writes a leaderboard
 to `dev/LEADERBOARD.md`.
 
 ## What this measures, and what it does not
@@ -39,7 +39,7 @@ they answer are about wiring and cost, not about accuracy:
   parameter count, whether the fp8 knot export resolves to a bit-identical
   index table, and the fitted body's error against `relu^2`.
 * **Sigma conditioning** (`shared` vs `conditioned`): codebook parameter count
-  and artifact bytes. **Structural only** -- see the note in `run_sigma_cond`.
+  and artifact bytes. **Structural only**; see the note in `run_sigma_cond`.
 
 The ninth measures a real fidelity number, on the bias alone:
 
@@ -98,7 +98,7 @@ training run, and none of them establishes an end-to-end quality claim:
   model runs.
 * `sigma_cond` counts codebook parameters and bytes. Its distributional premise
   -- that a block's activation distribution varies with sigma in a way a
-  conditioned codebook could exploit -- is recorded as **UNVERIFIED**, because
+  conditioned codebook could exploit is recorded as **UNVERIFIED**, because
   the handoff's own probe (§12.2) failed to find it. No accuracy claim is made
   for it and none should be read into its row.
 * `bias_quant` runs `--bias-quant-steps` (default 5) SGD steps on one random
@@ -133,8 +133,8 @@ uv run python scripts/lcqat_ablation.py --dry-run
 Exits non-zero if a measured claim comes out the wrong way for a variant the
 write-up advertises, so CI catches a regression in the method itself rather
 than leaving it to be noticed. Only *structural* claims are gated. A
-measurement that contradicts a documented expectation -- a losing `smoothpwl`,
-a growing overlap error rate -- is reported in the row's `note` and is not a
+measurement that contradicts a documented expectation (a losing `smoothpwl`,
+a growing overlap error rate) is reported in the row's `note` and is not a
 failure, because a probe finding is a result and not a regression.
 """
 
@@ -491,7 +491,7 @@ def register_args(parser: argparse.ArgumentParser) -> None:
             "'conditioned' (default here) is the B-fold codebook; '' is the "
             "shared static codebook it is measured against. 'modulated' shares "
             "one codebook and is not a separate arm, so it is accepted but not "
-            "swept -- its artifact size equals the shared one by construction."
+            "swept; its artifact size equals the shared one by construction."
         ),
     )
     group.add_argument(
@@ -525,7 +525,7 @@ def register_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "SGD steps the `bias_quant` experiment takes on the bias codebook. "
             "Enough to establish the table is live (its parameters move), not "
-            "enough to fit it -- this is a micro-probe, not a training run."
+            "enough to fit it. This is a micro-probe, not a training run."
         ),
     )
     group.add_argument(
@@ -539,7 +539,7 @@ def register_args(parser: argparse.ArgumentParser) -> None:
             "magnitude ~5, where one fp32 ULP is ~6e-7, while the gradient this "
             "probe produces is ~3e-5. A learning rate of 1e-2 therefore asks for "
             "an update of ~3e-7, which is at or below the spacing between "
-            "representable values -- the parameter comes back bit-identical and "
+            "representable values: the parameter comes back bit-identical and "
             "the row reports a live codebook as dead. Measured, not assumed: at "
             "1e-2 two of three seeds moved 0.0, at 1.0 every seed moves."
         ),
@@ -596,7 +596,7 @@ def register_args(parser: argparse.ArgumentParser) -> None:
         default=2048,
         help="Sigma draws per diffusion block in the `overlap` experiment.",
     )
-    # The whole SparseProp surface -- scope, sparsity, gradual schedule, dense
+    # The whole SparseProp surface (scope, sparsity, gradual schedule, dense
     # threshold -- comes from the shared helper, so this driver cannot drift
     # from `base_train` on a flag that changes what a pruning mask means. It
     # includes `--sparseprop-sparsity`, which used to be registered here as well
@@ -934,7 +934,7 @@ def check_claims(rows: list[AblationRow], n_elements: int) -> list[str]:
                     f"{row.value_variant:.6g} against an FP32 baseline of "
                     f"{row.value_baseline:.6g}. A K-level codebook over a spread "
                     "bias cannot reproduce it exactly, so the table is not being "
-                    "read -- the probe is degenerate, not free."
+                    "read; the probe is degenerate, not free."
                 )
             if row.value_variant >= 1.0:
                 problems.append(
@@ -994,7 +994,7 @@ def write_leaderboard(path: Path, table: str) -> None:
     section = (
         f"{marker}\n"
         f"_Generated by `scripts/lcqat_ablation.py` on "
-        f"{time.strftime('%Y-%m-%d %H:%M:%S')} -- do not edit by hand._\n\n"
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')} - do not edit by hand._\n\n"
         f"{table}"
         f"\n{end_marker}\n"
     )

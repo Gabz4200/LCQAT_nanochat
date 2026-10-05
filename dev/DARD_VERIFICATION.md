@@ -147,10 +147,26 @@ minutes on CPU is well below the fluency threshold — but repetition-4 is 0.00 
 all five prompts, so it is not degenerating into loops. `night4` (EDM
 objective) produced 2.12 bits/char for comparison.
 
-All five prompts return the *same* continuation. That is the greedy decoder
-following a model whose unconditional distribution has not yet separated from
-the prompt-independent mode, at this size and budget; it is not a repetition
-failure, and it is why every prompt scores rep4=0.00.
+### A correction worth recording
+
+An earlier revision of this report stated that all five prompts returned the
+same continuation, and attributed it to the greedy decoder. Both halves were
+wrong. Top-k sampling was already in use (`temperature=0.8, top_k=40`); the
+real cause was that `GPT.generate` seeds its own generator from a `seed`
+argument that defaults to the constant **42**, so every prompt drew from the
+same RNG stream.
+
+Measured, with sampling held constant and only the seed varied:
+
+| | distinct continuations |
+|---|---|
+| `seed=42` for every prompt | 2 of 5 |
+| `seed=100+i` per prompt | 5 of 5 |
+
+`scripts/dard_report.py` now passes a distinct seed per prompt. The corrected
+run keeps repetition-4 at 0.00 on all five prompts with genuinely distinct
+continuations. Reporting the identical-output observation without first
+varying the seed would have blamed the decoder for an RNG artifact.
 
 ## Gates
 

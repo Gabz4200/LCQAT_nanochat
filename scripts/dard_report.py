@@ -38,6 +38,17 @@ PROMPTS = [
 ]
 
 
+def seeds_for(n_prompts: int, base: int) -> list[int]:
+    """One distinct RNG seed per prompt, starting at `base`.
+
+    `GPT.generate` seeds its own generator from its `seed` argument, which
+    defaults to a constant 42. Reusing that default across prompts makes every
+    prompt sample the same stream, so identical-looking output can be an RNG
+    artifact rather than a property of the model.
+    """
+    return [base + i for i in range(n_prompts)]
+
+
 def repetition_rate(text: str, n: int = 4) -> float:
     """Fraction of n-grams in `text` that have appeared before.
 
@@ -78,6 +89,12 @@ def main() -> None:
     parser.add_argument("--step", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=60)
     parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1000,
+        help="base RNG seed; prompt i uses seed + i",
+    )
     args = parser.parse_args()
 
     model, step = load_base_model(args.model_tag, args.step)
@@ -87,16 +104,22 @@ def main() -> None:
         f"({sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params) ===\n"
     )
 
-    for prompt in PROMPTS:
+    for i, prompt in enumerate(PROMPTS):
         # `GPT.generate` streams: it takes a list of ids and yields one id at a
         # time, so the full sequence is the prompt plus everything yielded.
         ids = tokenizer.encode(prompt)
+        # A distinct seed per prompt. `generate` seeds its own generator from
+        # this argument, and the default is a constant 42 -- so without it
+        # every prompt draws from the *same* RNG stream and, at a small token
+        # budget, comes back with the same continuation. That reads as "the
+        # model ignores the prompt", which is a different (and wrong) finding.
         generated = list(
             model.generate(
                 ids,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
                 top_k=40,
+                seed=args.seed + i,
             )
         )
         text = tokenizer.decode(list(ids) + generated)

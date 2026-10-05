@@ -131,7 +131,7 @@ The engine publishes `last_dard_logits` and does **not** add the penalty itself;
 
 With only the above, the penalty reads the *final* block's hidden state. But `denoise_step` executes one block per step, and `_activate_block` froze the others — so the rule penalty reached **no** transformer layer at all. Measured before the fix: layers with non-zero DARD gradient = `[]`. The rules were being enforced against a representation no rule could shape.
 
-The fix projects **every** block's own hidden state through the **same** `lm_head` (`_run_block_denoiser(collect_block_logits=True)`) and makes every block require grad, so the penalty reaches all of them. No second head, no new parameters, no new checkpoint keys. Measured after: every layer of every block, non-zero, for every sampled block index.
+The fix projects **every** block's own hidden state through the **same** `lm_head` (`_run_block_denoiser(collect_block_logits=True)`) and makes every block require grad, so the penalty reaches all of them. One weight does the work: no second head, and no new parameters or checkpoint keys. Measured after: every layer of every block, non-zero, for every sampled block index.
 
 **This trades away forward isolation.** Running every block is L layers per step, not L/B — the saving DiffusionBlocks exists for. So it is opt-in (`set_dard(..., per_block_head=False)` to decline), not a silent default. `tests/test_dbcpu_denoise.py::test_when_ce_and_edm_objectives_then_only_edm_isolates_the_forward` caught the regression when it was on by default, and two tests now pin both sides: `test_when_the_per_block_head_is_off_then_block_isolation_is_preserved` and `test_when_dard_is_off_then_no_block_logits_are_collected`.
 

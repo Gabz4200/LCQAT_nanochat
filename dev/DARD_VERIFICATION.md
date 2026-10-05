@@ -111,7 +111,7 @@ lm_head: 2.53e+02
 ```
 
 **Cost, honestly.** Running every block is L layers per step, not L/B. That is
-forward isolation — the property DiffusionBlocks exists for — so the per-block
+forward isolation, the property DiffusionBlocks exists for, so the per-block
 head is opt-in via `set_dard(..., per_block_head=False)`. This was not free:
 the first version was on by default and broke
 `test_when_ce_and_edm_objectives_then_only_edm_isolates_the_forward`
@@ -142,8 +142,8 @@ budget; it was resized to 16 steps / batch 12288, which measures 13.03 min.
 | bits/char on held-out text | **1.6237** |
 | repetition-4, 5/5 prompts | **0.00** |
 
-The text is not yet English — a 3-layer 15M-parameter model trained for 13
-minutes on CPU is well below the fluency threshold — but repetition-4 is 0.00 on
+The text is not yet English. A 3-layer 15M-parameter model trained for 13
+minutes on CPU sits well below the fluency threshold, but repetition-4 is 0.00 on
 all five prompts, so it is not degenerating into loops. `night4` (EDM
 objective) produced 2.12 bits/char for comparison.
 
@@ -164,9 +164,10 @@ Measured, with sampling held constant and only the seed varied:
 | `seed=100+i` per prompt | 5 of 5 |
 
 `scripts/dard_report.py` now passes a distinct seed per prompt. The corrected
-run keeps repetition-4 at 0.00 on all five prompts with genuinely distinct
-continuations. Reporting the identical-output observation without first
-varying the seed would have blamed the decoder for an RNG artifact.
+run keeps repetition-4 at 0.00 on all five prompts, with each prompt's
+continuation distinct from the others. Reporting the identical-output
+observation without first varying the seed would have blamed the decoder for
+an RNG artifact.
 
 ## Gates
 

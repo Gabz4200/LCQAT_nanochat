@@ -130,6 +130,16 @@ from nanochat.models.quant.w6 import (  # noqa: E402
 )
 
 add_w6_args(parser)
+# DARD: always-on auxiliary rule loss, `--no-dard` to disable. Same shared
+# helper base_train and chat_sft use so the three entry points cannot drift
+# apart. Here it rides on the policy gradient's logits (see the RL loop).
+from nanochat.models.dard.cli import (  # noqa: E402
+    add_dard_args,
+    build_dard,
+    validate_dard_args,
+)
+
+add_dard_args(parser)
 # Evaluation / checkpointing
 parser.add_argument(
     "--eval-every", type=int, default=60, help="evaluate pass@k every N steps"
@@ -441,6 +451,28 @@ print0(f"Calculated examples per rank: {examples_per_rank}")
 
 # Kick off the training loop
 batch_iterator = get_batch()
+
+# DARD rule set: mined from the first rollout's tokens, or loaded from
+# --dard-rules. Attached to the engine so the rule penalty reads the same
+# distribution the policy gradient does.
+validate_dard_args(args)
+dard_loss_fn, dard_balancer = (None, None)
+if args.dard:
+    _rl_seed = next(batch_iterator)
+    dard_loss_fn, dard_balancer, dard_messages = build_dard(
+        args,
+        vocab_size=db_engine.model.config.vocab_size,
+        device=device,
+        mine_tokens=_rl_seed[1].reshape(-1),
+    )
+    for line in dard_messages:
+        print0(line)
+    print0(
+        f"DARD rule penalty attached (lambda_global={dard_balancer.lambda_global}, "
+        f"gamma={dard_loss_fn.gamma})"
+    )
+    db_engine.set_dard(dard_loss_fn)
+
 for step in range(num_steps):
     # Evaluate the model once in a while and log to wandb
     if step % args.eval_every == 0:
@@ -528,6 +560,18 @@ for step in range(num_steps):
             # Note, there is no need to add PPO ratio+clip because we are on policy
             # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
             loss = -pg_obj
+            if dard_loss_fn is not None:
+                # The rule penalty is a *policy-regularizer*, added to the
+                # gradient the same way. It is deliberately a uniform additive
+                # term rather than a per-position one: weighting positions by
+                # advantage here would make the aux loss reinforce the same
+                # tokens REINFORCE already liked, which is a different (and
+                # self-reinforcing) objective rather than a rule constraint.
+                aux = dard_loss_fn(db_engine.last_dard_logits)
+                if dard_balancer is not None:
+                    loss, _ = dard_balancer(loss, aux)
+                else:
+                    loss = loss + aux
             loss.backward()
             print0(
                 f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}"

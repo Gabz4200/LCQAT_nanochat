@@ -75,7 +75,7 @@ def _run_objective_arm(
         sigma = torch.ones(())
         c_in, _c_out, _w = edm_preconditioning(sigma, engine.partitioner.sigma_data)
         block_input = probe if objective == OBJECTIVE_CE else c_in * probe
-        out = engine._run_block_denoiser(0, block_input, sigma, probe.size(1))
+        out = engine._run_block_denoiser(0, block_input, sigma, probe.size(1)).pred
         mse = float((out - probe).square().mean())
         power = float(probe.square().mean())
     return sum(losses) / len(losses), (mse / power if power > 0 else float("inf"))

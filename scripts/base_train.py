@@ -52,7 +52,7 @@ from scripts._train.build import (
     convert_to_fp8,
 )
 from scripts._train.eval import EvalContext
-from scripts._train.loop import LoopContext, train_loop
+from scripts._train.loop import LoopContext, load_dard_sidecar, train_loop
 
 print_banner()
 
@@ -136,6 +136,17 @@ from nanochat.models.quant.w6 import add_w6_args  # noqa: E402
 # needs logits, which the denoising objective never produces, so it is a separate
 # opt-in path rather than a reuse of it.
 add_w6_args(parser)
+
+# DARD (Differentiable Algebraic Rule Distillation). Always-on auxiliary loss
+# over AML-mined algebraic rules; `--no-dard` disables it. Registered through
+# its own helper for the same no-drift reason as the two helpers above.
+from nanochat.models.dard.cli import (  # noqa: E402
+    add_dard_args,
+    build_dard,
+    validate_dard_args,
+)
+
+add_dard_args(parser)
 
 # Model architecture
 parser.add_argument(
@@ -471,6 +482,45 @@ x, y, dataloader_state_dict = next(
 )  # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
+# DARD rule set: mined from the first batch's tokens, or loaded from
+# --dard-rules. Built *after* the dataloader because mining needs real tokens,
+# and *before* the loop because the rule penalty is attached to the engine once
+# and then reused every step. `--no-dard` leaves both None and every downstream
+# branch computes exactly the objective it did before this feature existed.
+validate_dard_args(args)
+dard_loss_fn, dard_balancer = (None, None)
+if args.dard:
+    # A resume must reuse the checkpoint's rule set, not re-mine. Mining
+    # depends on whichever batch is in hand, so re-mining here would silently
+    # swap the objective mid-run -- the rules being enforced at step N+1 would
+    # not be the ones the loss curve up to step N was measured against. The
+    # checkpoint is authoritative whenever it carries DARD state.
+    saved_dard = load_dard_sidecar(base.checkpoint_dir, args.resume_from_step, device)
+    if saved_dard:
+        dard_loss_fn, dard_balancer = saved_dard
+        dard_loss_fn.train()
+        dard_balancer.train()
+        dard_messages = [
+            f"DARD: restored {dard_loss_fn.premise.shape[0]} compiled rules and "
+            "the balancer EMA from the checkpoint sidecar"
+        ]
+    else:
+        dard_loss_fn, dard_balancer, dard_messages = build_dard(
+            args,
+            vocab_size=model.config.vocab_size,
+            device=device,
+            mine_tokens=x.reshape(-1),
+        )
+    for line in dard_messages:
+        print0(line)
+    print0(
+        f"DARD rule penalty attached (lambda_global={dard_balancer.lambda_global}, "
+        f"gamma={dard_loss_fn.gamma})"
+    )
+    if engine is not None:
+        engine.set_dard(dard_loss_fn)
+
+# -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
 
 # num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
@@ -545,6 +595,8 @@ train_loop(
         efqat_freezer=efqat_freezer,
         block_latch_freezer=block_latch_freezer,
         efqat_latch_targets=efqat_latch_targets,
+        dard_loss_fn=dard_loss_fn,
+        dard_balancer=dard_balancer,
         use_diffusion_blocks=use_diffusion_blocks,
         num_db_blocks=num_db_blocks,
         checkpoint_dir=checkpoint_dir,

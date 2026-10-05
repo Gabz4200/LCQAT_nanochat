@@ -11,6 +11,7 @@ Evaluation blocks, checkpoint saving and the end-of-run summary stay in `eval`.
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 
@@ -23,6 +24,7 @@ from nanochat.callbacks.training import (
     manage_gc,
     print_run_summary,
 )
+from nanochat.models.dard.loss import dard_state, load_dard_state
 from nanochat.models.quant.w6 import describe_sigma_codebooks
 from nanochat.modules.checkpoint_manager import save_checkpoint
 from nanochat.utils.common import is_ddp_initialized, print0
@@ -65,6 +67,9 @@ class LoopContext:
     efqat_freezer: object
     block_latch_freezer: object
     efqat_latch_targets: list
+    #: The DARD auxiliary loss and its EMA balancer; None under `--no-dard`.
+    dard_loss_fn: object | None
+    dard_balancer: object | None
     use_diffusion_blocks: bool
     num_db_blocks: int
     checkpoint_dir: str
@@ -184,6 +189,23 @@ def save_step_checkpoint(
             "sparseprop": ctx.sparse_schedule.to_meta(
                 args.sparseprop, args.sparseprop_sparsity
             ),
+            # DARD provenance. The tensors (rule CSR matrices + balancer EMA)
+            # go to a sidecar `.pt`, because this dict is `json.dump`ed and
+            # cannot hold them. What lands in the JSON is only what a resume
+            # needs to decide whether the sidecar applies.
+            "dard": (
+                {
+                    "has_sidecar": True,
+                    "num_rules": int(ctx.dard_loss_fn.premise.shape[0]),
+                    "vocab_size": int(ctx.dard_loss_fn.vocab_size),
+                    "gamma": float(ctx.dard_loss_fn.gamma),
+                    "lambda_global": float(ctx.dard_balancer.lambda_global),
+                    "ema_decay": float(ctx.dard_balancer.ema_decay),
+                    "steps": int(ctx.dard_balancer.steps),
+                }
+                if ctx.dard_loss_fn is not None and ctx.dard_balancer is not None
+                else None
+            ),
             "device_batch_size": args.device_batch_size,
             "max_seq_len": args.max_seq_len,
             "total_batch_size": ctx.total_batch_size,
@@ -196,6 +218,42 @@ def save_step_checkpoint(
         },
         rank=ctx.ddp_rank,
     )
+    # DARD's tensors go in a sidecar next to the checkpoint. They cannot ride
+    # in the meta dict (that is `json.dump`ed) and they are not part of
+    # engine.state_dict() (the DARD modules are optimizer-side attachments).
+    # Without this file a resume re-mines from whichever batch it sees next and
+    # silently enforces different rules than the loss curve was measured under.
+    if ctx.dard_loss_fn is not None and ctx.dard_balancer is not None:
+        save_dard_sidecar(
+            ctx.checkpoint_dir, step, ctx.dard_loss_fn, ctx.dard_balancer, ctx.ddp_rank
+        )
+
+
+def save_dard_sidecar(checkpoint_dir, step, loss_fn, balancer, rank=0) -> None:
+    """Write the DARD rule set + balancer EMA beside the step's checkpoint.
+
+    A separate file rather than a meta field because `save_checkpoint` writes
+    meta as JSON and these are sparse tensors. `weights_only=True` on load is
+    deliberate: only tensors and primitives, never pickled code.
+    """
+    if rank != 0:
+        return
+    path = os.path.join(checkpoint_dir, f"dard_{step:06d}.pt")
+    torch.save(dard_state(loss_fn, balancer), path)
+    print0(f"Saved DARD rule state to: {path}")
+
+
+def load_dard_sidecar(checkpoint_dir, step, device):
+    """Load a DARD sidecar written by `save_dard_sidecar`, or None if absent.
+
+    None is a legitimate answer -- a checkpoint predating DARD, or one saved
+    with `--no-dard`, has no sidecar -- and the caller then mines fresh rather
+    than resuming a rule set that does not exist.
+    """
+    path = os.path.join(checkpoint_dir, f"dard_{step:06d}.pt")
+    if not os.path.exists(path):
+        return None
+    return load_dard_state(torch.load(path, map_location=device, weights_only=True))
 
 
 def train_loop(ctx):
@@ -355,14 +413,35 @@ def train_loop(ctx):
         # log: a KD term that stays at 0.0 for a whole run means the twin is not
         # actually being compared against, not that the gap vanished.
         step_kd_logged = 0.0
+        # Reported alongside the total for the same reason as the KD term: the
+        # balanced loss is normalized to ~1 by construction, so the *raw* rule
+        # penalty is the only thing in the log that shows whether DARD is still
+        # doing anything. A run that silently mined zero rules logs 0.0 here
+        # forever and its balanced loss looks perfectly healthy.
+        step_dard_logged = 0.0
 
         for micro_step in range(grad_accum_steps):
+            # DARD needs a vocabulary distribution. The CE and KD branches
+            # already hold `logits`; the two branches below do not, so
+            # `d_logits` is filled by the branch that can produce them and the
+            # penalty is evaluated once, after the branch, rather than inside
+            # each of the four.
+            d_logits = None
+            d_block_logits = None
             if not ctx.use_diffusion_blocks:
                 # Plain autoregressive LM training. `model` here is the LC-QAT
                 # (and possibly SparseProp) retrofitted GPT, so this is the
                 # conventional next-token objective over the same quantized model
                 # the DiffusionBlocks arms train, differing only in the objective.
-                loss = ctx.model(x, targets=y, attn_mask=train_attn_mask)
+                if ctx.dard_loss_fn is not None:
+                    d_logits = ctx.model(x, targets=None, attn_mask=train_attn_mask)
+                    loss = F.cross_entropy(
+                        d_logits.reshape(-1, d_logits.size(-1)),
+                        y.reshape(-1),
+                        ignore_index=-1,
+                    )
+                else:
+                    loss = ctx.model(x, targets=y, attn_mask=train_attn_mask)
             elif args.db_objective == "edm":
                 # `block_idx=None` under --db-block-sampling micro, which redraws
                 # per micro-step (the ablation arm).
@@ -376,6 +455,16 @@ def train_loop(ctx):
                 )
                 if ctx.engine.distiller is not None:
                     step_kd_logged = step_kd_logged + float(ctx.engine.last_kd_loss)
+                if ctx.dard_loss_fn is not None:
+                    # The denoiser's own logits, from the same lm_head
+                    # projection the Euler sampler uses. Read out of the engine
+                    # rather than recomputed, so the penalty sees exactly the
+                    # distribution the denoiser step was trained on.
+                    d_logits = ctx.engine.last_dard_logits
+                    # Sum the penalty over EVERY block's distribution, not just
+                    # the final one: each is that block's own hidden state
+                    # through the shared head, so the rules shape all blocks.
+                    d_block_logits = ctx.engine.last_block_logits
             elif ctx.kd_loss_fn is not None:
                 # KD anchoring needs logits, so the CE objective asks for them
                 # explicitly (targets=None) and computes the CE term here.
@@ -393,10 +482,41 @@ def train_loop(ctx):
                 loss = (
                     1.0 - ctx.kd_loss_fn.alpha
                 ) * loss_ce + ctx.kd_loss_fn.alpha * loss_kd
+                if ctx.dard_loss_fn is not None:
+                    d_logits = student_logits
             else:
-                loss = ctx.engine.train_step(
-                    x, y, block_idx=block_idx, attn_mask=train_attn_mask
-                )
+                if ctx.dard_loss_fn is not None:
+                    d_logits = ctx.model(x, targets=None, attn_mask=train_attn_mask)
+                    loss = F.cross_entropy(
+                        d_logits.reshape(-1, d_logits.size(-1)),
+                        y.reshape(-1),
+                        ignore_index=-1,
+                    )
+                else:
+                    loss = ctx.engine.train_step(
+                        x, y, block_idx=block_idx, attn_mask=train_attn_mask
+                    )
+            if d_logits is not None and ctx.dard_loss_fn is not None:
+                # `d_logits` carries the graph; so does `loss`, so the two terms
+                # are balanced *before* the single backward below rather than
+                # summed. Both stay differentiable through the same forward.
+                # When the engine published per-block distributions, the penalty
+                # is summed over them so every block is reached; otherwise it is
+                # the single distribution.
+                if d_block_logits:
+                    # `sum()` over a 1-element generator returns the element
+                    # itself rather than a tensor, so build the stack
+                    # explicitly and mean over it.
+                    aux = torch.stack(
+                        [ctx.dard_loss_fn(v) for v in d_block_logits.values()]
+                    ).mean()
+                else:
+                    aux = ctx.dard_loss_fn(d_logits)
+                step_dard_logged = step_dard_logged + float(aux.detach())
+                if ctx.dard_balancer is not None:
+                    loss, _ = ctx.dard_balancer(loss, aux)
+                else:
+                    loss = loss + aux
             train_loss = loss.detach()  # for logging
             loss = (
                 loss / grad_accum_steps
@@ -464,8 +584,10 @@ def train_loop(ctx):
         epoch = f"{ctx.dataloader_state_dict['epoch']} pq: {ctx.dataloader_state_dict['pq_idx']} rg: {ctx.dataloader_state_dict['rg_idx']}"
         kd_mean = step_kd_logged / max(grad_accum_steps, 1)
         kd_str = f" | kd: {kd_mean:.6f}" if ctx.kd_denoiser else ""
+        dard_mean = step_dard_logged / max(grad_accum_steps, 1)
+        dard_str = f" | dard: {dard_mean:.6f}" if ctx.dard_loss_fn is not None else ""
         print0(
-            f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{kd_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time / 60:.2f}m{eta_str}"
+            f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{kd_str}{dard_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time / 60:.2f}m{eta_str}"
         )
         if step % 100 == 0:
             log_data = {
@@ -484,6 +606,12 @@ def train_loop(ctx):
             # with the data term, so a silently-dead anchor is otherwise invisible.
             if ctx.kd_denoiser is not None:
                 log_data["train/kd_denoiser"] = kd_mean
+            if ctx.dard_loss_fn is not None:
+                # The raw (pre-normalization) penalty. Logged because the
+                # balanced total is normalized to ~1 by construction, so a
+                # rule set that quietly stopped enforcing anything would be
+                # invisible in `train/loss` alone.
+                log_data["train/dard_rule_penalty"] = dard_mean
             # EfQAT latch progress: how many diffusion blocks have been permanently
             # retired. Plateaus at `num_db_blocks` once all of them have finished
             # specializing to their noise range.

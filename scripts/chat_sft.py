@@ -155,6 +155,15 @@ from nanochat.models.quant.w6 import (  # noqa: E402
 )
 
 add_w6_args(parser)
+# DARD: always-on auxiliary rule loss, `--no-dard` to disable. Same shared
+# helper base_train uses so the three entry points cannot drift apart.
+from nanochat.models.dard.cli import (  # noqa: E402
+    add_dard_args,
+    build_dard,
+    validate_dard_args,
+)
+
+add_dard_args(parser)
 parser.add_argument(
     "--final-lr-frac",
     type=float,
@@ -661,6 +670,29 @@ def lr_multiplier_from_progress(progress):
 # -----------------------------------------------------------------------------
 # Training loop
 x, y = next(train_loader)  # prefetch the very first batch of data
+
+# DARD rule set: mined from the first batch, or loaded from --dard-rules.
+# Built here rather than at flag time because mining needs real tokens, and
+# before the loop because the penalty is attached to the engine once and reused
+# every step. `--no-dard` leaves both None and every branch below computes the
+# objective it did before this feature existed.
+validate_dard_args(args)
+dard_loss_fn, dard_balancer = (None, None)
+if args.dard:
+    dard_loss_fn, dard_balancer, dard_messages = build_dard(
+        args,
+        vocab_size=base_model.config.vocab_size,
+        device=device,
+        mine_tokens=x.reshape(-1),
+    )
+    for line in dard_messages:
+        print0(line)
+    print0(
+        f"DARD rule penalty attached (lambda_global={dard_balancer.lambda_global}, "
+        f"gamma={dard_loss_fn.gamma})"
+    )
+    engine.set_dard(dard_loss_fn)
+
 min_val_bpb = float("inf")
 smooth_train_loss = 0  # EMA of training loss
 ema_beta = 0.9  # EMA decay factor
@@ -850,8 +882,13 @@ while True:
     # log: a KD term that stays at 0.0 for a whole run means the twin is not
     # actually being compared against, not that the gap vanished.
     step_kd_logged = 0.0
+    # The raw rule penalty, logged for the same reason as the KD term: the
+    # balanced total is normalized to ~1, so a rule set that stopped enforcing
+    # anything would otherwise be invisible in the loss curve.
+    step_dard_logged = 0.0
 
     for micro_step in range(grad_accum_steps):
+        d_logits = None
         if args.db_objective == "edm":
             loss, _ = engine.denoise_step(
                 x,
@@ -862,8 +899,25 @@ while True:
             )
             if engine.distiller is not None:
                 step_kd_logged = step_kd_logged + float(engine.last_kd_loss)
+            d_logits = engine.last_dard_logits
+        elif dard_loss_fn is not None:
+            # The CE path has no logits unless asked, so the penalty branch
+            # computes the CE term here from them. Mirrors GPT.forward exactly.
+            d_logits = base_model(x, targets=None)
+            loss = F.cross_entropy(
+                d_logits.reshape(-1, d_logits.size(-1)),
+                y.reshape(-1),
+                ignore_index=-1,
+            )
         else:
             loss = engine.train_step(x, y)
+        if d_logits is not None and dard_loss_fn is not None:
+            aux = dard_loss_fn(d_logits)
+            step_dard_logged = step_dard_logged + float(aux.detach())
+            if dard_balancer is not None:
+                loss, _ = dard_balancer(loss, aux)
+            else:
+                loss = loss + aux
         train_loss = loss.detach()  # for logging
         loss = (
             loss / grad_accum_steps

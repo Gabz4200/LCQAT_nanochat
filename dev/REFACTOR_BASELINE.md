@@ -14,23 +14,22 @@ OMP_NUM_THREADS=4
 1019 passed, 13 skipped, 1 warning in 431.83s (0:07:11)
 ```
 
-The numerical fingerprint recorded at the same commit lives in `tests/numerical_reference.json`.
-All 13 values were identical before and after the restructure.
+The numerical fingerprint from the same commit lives in `tests/numerical_reference.json`.
+All 13 values matched before and after the restructure.
 
 ## Dependency-direction pass
 
 A post-restructure AST audit (real `import` statements, not text search) found
-`nanochat/models/` still importing the imperative shell. Three genuine leaks
-were closed:
+three cases of `nanochat/models/` importing the imperative shell:
 
 | Leak | Fix |
 |---|---|
-| `backbone.py`, `fp8.py`, `flash_attention.py` imported `COMPUTE_DTYPE` from `nanochat/utils/common.py` | The dtype policy moved to `nanochat/models/dtype.py`; `utils/common.py` re-exports it for the shell. It is a model decision — every `Linear` casts to it in forward |
-| `retrofit.py` and `backbone.py` called the shell's `print0` | Replaced with `warnings.warn`. Both were reporting a model-layer fact, and importing the logging shell inverted the direction |
+| `backbone.py`, `fp8.py`, `flash_attention.py` imported `COMPUTE_DTYPE` from `nanochat/utils/common.py` | Dtype policy moved to `nanochat/models/dtype.py`; `utils/common.py` re-exports it. Every `Linear` casts to it in forward, so it is a model decision |
+| `retrofit.py` and `backbone.py` called the shell's `print0` | Replaced with `warnings.warn`; both reported a model-layer fact, and importing the logging shell inverted the direction |
 
-`nanochat/models/quant/experiments/` was also moved to `nanochat/modules/experiments/`:
+`nanochat/models/quant/experiments/` also moved to `nanochat/modules/experiments/`:
 ablation measurements import `training/diffusion_blocks.py`, so they are harness
 code, not model math. The audit now reports **0** core-to-shell imports.
 
-`models/ -> nanochat.ops` remains, and is intended: `ops` is the sanctioned kernel
-boundary between the core and the hardware.
+`models/ -> nanochat.ops` remains by design: `ops` is the kernel boundary
+between the core and the hardware.

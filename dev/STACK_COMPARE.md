@@ -22,15 +22,13 @@ steady-state steps.
 * **SparseProp cost** is `lcqat_sp` vs `lcqat` (plain LM) and
   `lcqat_db_sp` vs `lcqat_db` (denoiser). Each pair changes one flag.
 * **DiffusionBlocks cost** is `lcqat_db` vs `lcqat`, but that pair also
-  changes the objective, so only the timing is attributable.
-* Medians discard the first 2 steps, which pay lazy
-  allocation and first-call kernel setup and land 10-40x above steady
-  state. Every arm discards the same count.
+  changes the objective, so only the timing carries over.
+* Medians drop the first 2 steps, which pay lazy allocation and
+  first-call kernel setup at 10-40x steady state. Every arm drops the same count.
 
 ## Which comparisons are clean
 
-The arms form a 2x2, but only the two one-switch diagonals isolate a
-single mechanism:
+Only the two one-switch pairs isolate a single mechanism:
 
 | comparison | changes | verdict |
 |---|---|---|
@@ -39,18 +37,18 @@ single mechanism:
 | lcqat_db vs lcqat | DiffusionBlocks *and* objective | timing only |
 | lcqat_db_sp vs lcqat_sp | DiffusionBlocks *and* objective | timing only |
 
-The two cross pairs change the objective as well as the engine: edm
-trains a denoiser against a resampled sigma, plain LM trains next-token
-cross-entropy. **Their losses are not comparable and must not be pooled.**
-Only their step times are comparable, since both move the same tokens per step.
+The cross pairs change the objective as well as the engine: edm trains a
+denoiser against a resampled sigma, plain LM trains next-token cross-entropy.
+**Their losses are not comparable and must not be pooled.**
+Step times remain comparable, since both move the same tokens per step.
 
 ## What this does not establish
 
-* Validation bpb is flat within each SparseProp pair, so these runs are a
-  **cost** measurement, not a quality one. A quality claim needs longer runs
-  at a depth where sparsity bites.
-* 30 iterations at depth 6 is enough for the loss to move and for the arms
-  to separate on time, and not enough for anything else.
+* Validation bpb is flat within each SparseProp pair, so these runs measure
+  **cost**, not quality. A quality claim needs longer runs at a depth where
+  sparsity bites.
+* 30 iterations at depth 6 move the loss enough for the arms to separate on
+  time, and for nothing else.
 
 ## SparseProp verdict (measured, not asserted)
 

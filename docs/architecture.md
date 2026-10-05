@@ -1,13 +1,16 @@
 # Architecture
 
-The package is split along a **functional-core / imperative-shell** line.
-`nanochat/models/` holds pure tensor math with no I/O, optimizer, or logging;
-everything touching hardware, persistence, or lifecycle lives in the shell
-packages beside it. `nanochat/ops/` sits between them, so the math never imports
-a kernel directly. `tests/test_architecture_boundary.py` enforces the rule.
+This page maps the package layout and the one boundary that matters: pure tensor math in `nanochat/models/` versus hardware, persistence, and lifecycle in the shell around it. Read it before adding a module or moving code across packages.
 
-The repo-specific guardrails — which flags are always-on, the export contract, the
-CPU index policy — are in [`AGENTS.md`](../AGENTS.md).
+Fastest check that the boundary holds:
+
+```bash
+uv run pytest tests/test_architecture_boundary.py -q
+```
+
+The core never imports the shell. `nanochat/models/` must not import from `modules/`, `training/`, `data/`, `callbacks/`, `utils/`, or `tasks/`. Report a model-layer fact with `warnings.warn` or by returning a value, never with `print0`. A decision the layers consume (for example `COMPUTE_DTYPE` in `nanochat/models/dtype.py`) belongs in the core; the shell may re-export it. The one sanctioned exception runs downward: `nanochat/models/` may import `nanochat/ops/`, the kernel boundary. `nanochat/modules/experiments/` is harness, not model math, so measurements there may import `training/`.
+
+Repo-specific guardrails (always-on flags, the export contract, the CPU index policy) live in [`AGENTS.md`](../AGENTS.md).
 
 ## Package layout
 
@@ -102,8 +105,8 @@ CPU index policy — are in [`AGENTS.md`](../AGENTS.md).
 │   ├── LEADERBOARD.md                   # Time-to-GPT-2 docs + generated ablation table
 │   ├── STACK_COMPARE.md                 # four-arm SparseProp/DiffusionBlocks comparison
 │   ├── LOG.md                           # training experiment log
-│   ├── lc_qat_pseudoPaper.md            # the LC-QAT spec the implementation follows
-│   ├── combination.md  HANDOFF_symbiosis.md  REFACTOR_BASELINE.md
+│   ├── lcqat_spec.md                    # LC-QAT spec, symbiosis, measured deviations
+│   ├── REFACTOR_BASELINE.md
 │   └── *_analysis.ipynb, *.png, *.pdf
 ├── docs                                 # reference documentation (docs/README.md indexes it)
 │   ├── quantization.md                 # LC-QAT, KD, EfQAT, sigma-conditioned, per-channel

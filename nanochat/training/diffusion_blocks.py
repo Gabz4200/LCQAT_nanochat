@@ -2,12 +2,13 @@
 
 import argparse
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.models.backbone import maybe_sigma_call
+from nanochat.models.backbone import GPT, maybe_sigma_call
 
 
 def sinusoidal_noise_embedding(log_sigma: torch.Tensor, dim: int) -> torch.Tensor:
@@ -484,6 +485,21 @@ def _layer_groups(n_layer: int, num_blocks: int) -> list[list[int]]:
     return groups
 
 
+@dataclass(frozen=True)
+class _DenoiserOutput:
+    """What `_run_block_denoiser` returns: the prediction, plus per-block logits.
+
+    A dataclass rather than a tuple or an overloaded return, because the two
+    fields have very different lifetimes and confusing them is easy: `pred` is
+    always present, while `block_logits` is populated only when DARD asked for
+    it. Spelling that as `dict[int, Tensor] | None` on a tuple return made the
+    call sites slice-index into a union.
+    """
+
+    pred: torch.Tensor
+    block_logits: dict[int, torch.Tensor] | None = None
+
+
 class DiffusionBlockEngine:
     """Block-isolated trainer and diffusion sampler for nanochat GPT.
 
@@ -496,14 +512,21 @@ class DiffusionBlockEngine:
 
     def __init__(
         self,
-        model: torch.nn.Module,
+        model: GPT,
         partitioner: EquiProbabilityPartitioner,
         dtype: torch.dtype = torch.float32,
         cond_dim: int = 32,
         device=None,
         denoise_backend: str = "cpu",
     ) -> None:
-        self.model = model
+        # Annotated `GPT`, not `nn.Module`: the engine reads `model.transformer.h`,
+        # `model.lm_head`, `model.config` and `model._precompute_rotary_embeddings`,
+        # none of which exist on a bare `Module`. Declaring the parameter as
+        # `Module` made pyrefly widen every one of those attribute reads to
+        # `Module | Tensor`, which propagated ~50 spurious type errors into
+        # every consumer (including the DARD tests). The narrow type is the
+        # truth, and the constructor would fail at runtime regardless.
+        self.model: GPT = model
         self.partitioner = partitioner
         self.dtype = dtype
         if denoise_backend not in ("naive", "cpu", "gpu"):
@@ -549,9 +572,31 @@ class DiffusionBlockEngine:
         for head in self.denoise_heads:
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
-        # Optional EfQAT freezer, consulted by `_requires_grad_for` rather than
-        # mutating requires_grad behind its back.
         self.freezer = None
+        #: Optional DARD auxiliary loss module (`DardRuleLoss`). None means "no
+        #: DARD", the default. Set by `set_dard`. The engine does NOT evaluate
+        #: it: it only publishes `last_dard_logits`, the denoiser's own
+        #: vocabulary distribution, because the training loop owns the loss
+        #: balancing (`DardLossBalancer`) and folding the penalty in here would
+        #: make the lambda the engine sees and the lambda the loop applies two
+        #: different numbers.
+        self.dard_loss_fn: torch.nn.Module | None = None
+        #: Run a per-block LM head so the DARD penalty reaches every block.
+        #: Off by default: it costs L layers per step instead of L/B, trading
+        #: away the forward isolation DiffusionBlocks exists for. `set_dard`
+        #: turns it on when the caller wants rules over all blocks.
+        self.dard_per_block_head = False
+        #: The denoiser logits from the most recent `denoise_step`, kept in the
+        #: graph so the caller's rule penalty backpropagates into `lm_head` and
+        #: the active block. None when DARD is off, or after a step that did not
+        #: run a denoiser.
+        self.last_dard_logits: torch.Tensor | None = None
+        #: Per-block vocabulary distributions from the most recent
+        #: `denoise_step`, keyed by block index. Each is that block's own hidden
+        #: state through the *shared* `lm_head`, so a rule penalty summed over
+        #: them backpropagates into every block instead of only the active one.
+        #: None when DARD is off.
+        self.last_block_logits: dict[int, torch.Tensor] | None = None
         # Optional float-twin KD anchor for the EDM objective (see
         # `set_distiller`). None means "no anchor", which is the default.
         self.distiller = None
@@ -622,6 +667,31 @@ class DiffusionBlockEngine:
         self.distiller = distiller
         return self
 
+    def set_dard(
+        self, dard_loss_fn: torch.nn.Module | None, per_block_head: bool = True
+    ) -> "DiffusionBlockEngine":
+        """Attach a `DardRuleLoss` auxiliary penalty, or None to detach it.
+
+        The penalty is a function of the *vocabulary* distribution, so it is
+        added to the denoise step through the same `lm_head` projection the
+        Euler sampler uses to choose the next token (`generate`). Under the EDM
+        objective this is the only place a token distribution exists; under
+        `train_step` (plain AR) it comes from the model's own logits.
+
+        Note this gives `lm_head` a gradient path under EDM that it does not
+        otherwise have -- see `nanochat/models/dard/engine_hook.py` for why that
+        is intended and what it changes.
+
+        `per_block_head` (default on when DARD is attached) additionally runs a
+        vocabulary projection for *every* block, so the rules reach all of them
+        rather than only the active block's representation. Pass False to keep
+        the L/B forward isolation, accepting that the penalty then only shapes
+        the active block.
+        """
+        self.dard_loss_fn = dard_loss_fn
+        self.dard_per_block_head = dard_loss_fn is not None and per_block_head
+        return self
+
     def set_freezer(self, freezer) -> "DiffusionBlockEngine":
         """Attach a `SelectiveFreezer` (EfQAT) as the `requires_grad` arbiter.
 
@@ -662,11 +732,22 @@ class DiffusionBlockEngine:
         does not use, so the engine-owned layers are retrofitted directly here
         rather than through the name-based role filter.
         """
-        from nanochat.models.quant.linear import LCQATLinear
+        from nanochat.models.quant.linear import LCQATLinear, is_lcqat_layer
         from nanochat.models.quant.retrofit import spec_k, spec_split
 
         created = 0
         for i, head in enumerate(self.denoise_heads):
+            # `is_lcqat_layer`, not isinstance: on a resume the head arrives from
+            # `load_state_dict` already carrying its quantizers, and
+            # `LCQATLinear` IS an `nn.Linear` subclass, so the naive isinstance
+            # check the adapter loop below uses would still let it through and
+            # `from_float` would raise "expects a plain float Linear". The
+            # adapter loop additionally catches the subclass case; here the
+            # duck-typed check is what matches "is this already quantized",
+            # which is also true of `SparsePropLinearLCQAT` (functionally LC-QAT,
+            # not a subclass).
+            if is_lcqat_layer(head):
+                continue
             self.denoise_heads[i] = _retrofit_plain_linear(
                 head,
                 layer_config,
@@ -678,9 +759,13 @@ class DiffusionBlockEngine:
             created += 1
         for i, adapter in enumerate(self.adapters):
             for j, linear in enumerate(adapter.mlp):
-                if isinstance(linear, nn.Linear) and not isinstance(
-                    linear, LCQATLinear
-                ):
+                # `is_lcqat_layer` rather than `not isinstance(LCQATLinear)`:
+                # after a SparseProp wrap the layer is a
+                # `SparsePropLinearLCQAT`, which is functionally LC-QAT but NOT
+                # a subclass of `LCQATLinear`, so the isinstance check passed it
+                # through and `from_float` raised on the second application.
+                # Same reasoning as the denoise-head guard above.
+                if isinstance(linear, nn.Linear) and not is_lcqat_layer(linear):
                     # The adapter MLP is (in, hidden, out): a c_fc-like expansion
                     # followed by a c_proj-like contraction onto 2*n_layers*n_embd.
                     roles = (
@@ -915,6 +1000,17 @@ class DiffusionBlockEngine:
                 return owned.get_submodule(target[len(attr) + 1 :])
         return self.model.get_submodule(target)
 
+    def transformer_layers(self) -> list[nn.Module]:
+        """The trunk layers as a list, for consumers that iterate them.
+
+        `self.model.transformer.h` is an `nn.ModuleList`, but pyrefly widens
+        `self.model`'s attributes to `Module | Tensor` wherever the engine is
+        reached through a typed boundary, so a direct iteration reads as
+        "not iterable". Naming the access once here keeps the annotation in the
+        engine rather than scattering casts across every caller.
+        """
+        return list(self.model.transformer.h)  # type: ignore[call-overload]
+
     def block_layers(self) -> list[list[int]]:
         return _layer_groups(len(self.model.transformer.h), self.partitioner.num_blocks)
 
@@ -1000,11 +1096,43 @@ class DiffusionBlockEngine:
         return live[int(torch.randint(len(live), (1,), generator=generator).item())]
 
     def _activate_block(self, block_idx: int | None = None) -> int:
-        """Enable gradients for one block and return the block index used."""
+        """Enable gradients for this step and return the block index used.
+
+        With DARD's per-block head enabled, **every** block is enabled, not
+        just the sampled one. The per-block language-model head projects each
+        block's own hidden state through the shared `lm_head`, so the rule
+        penalty backpropagates into all of them; leaving the inactive blocks at
+        `requires_grad=False` would silently discard exactly the gradient the
+        rules are supposed to deliver (measured: layers 2-3 received 0.0 while
+        0-1 received 1e4).
+
+        This applies only when `dard_per_block_head` is set, which also means
+        `denoise_step` is running all L layers anyway. Without it the run stays
+        block-isolated: the *data* loss trains only the active block, preserving
+        the noise-range specialization, and the forward runs L/B layers.
+        """
         b = self.sample_block() if block_idx is None else int(block_idx)
-        self._apply_requires_grad(b)
+        if self.dard_per_block_head:
+            self._apply_requires_grad_all_blocks()
+        else:
+            self._apply_requires_grad(b)
         self.train()
         return b
+
+    def _apply_requires_grad_all_blocks(self) -> None:
+        """Enable gradients for every block, the DARD path's requirement.
+
+        The freezer still arbitrates: a block latched by EfQAT stays frozen even
+        here, so the per-block head cannot resurrect a permanently retired
+        block.
+        """
+        for name, p in self.named_parameters():
+            wanted = True
+            if self.freezer is not None and not self.freezer.is_trainable(name):
+                wanted = False
+            p.requires_grad_(wanted)
+            if not wanted:
+                p.grad = None
 
     def train_step(
         self,
@@ -1028,9 +1156,27 @@ class DiffusionBlockEngine:
         targets: torch.Tensor,
         block_idx: int | None = None,
     ) -> torch.Tensor:
-        """Compute per-token cross-entropy loss without reduction, for RL / GRPO."""
+        """Compute per-token cross-entropy loss without reduction, for RL / GRPO.
+
+        Publishes `last_dard_logits` (the same distribution the per-token loss
+        was computed from) when DARD is attached, so a policy-gradient trainer
+        can evaluate the rule penalty against the *same* forward pass instead of
+        paying a second one. Without DARD the attribute stays None and the RL
+        loop computes exactly the objective it did before.
+        """
         self._activate_block(block_idx)
-        loss = self.model(idx, targets, loss_reduction="none")
+        self.last_dard_logits = None
+        if self.dard_loss_fn is not None:
+            logits = self.model(idx, targets=None)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                ignore_index=-1,
+                reduction="none",
+            )
+            self.last_dard_logits = logits
+        else:
+            loss = self.model(idx, targets, loss_reduction="none")
         if loss.dim() == 1 and loss.numel() == idx.numel():
             loss = loss.view_as(idx)
         return loss
@@ -1042,7 +1188,8 @@ class DiffusionBlockEngine:
         sigma: torch.Tensor,
         seq_len: int,
         attn_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        collect_block_logits: bool = False,
+    ) -> "_DenoiserOutput":
         """Run block `block_idx` on `noisy` and return its denoiser prediction.
 
         Shared by the student and by the KD teacher twin so both see byte-identical
@@ -1055,6 +1202,13 @@ class DiffusionBlockEngine:
 
         `seq_len` is passed rather than read from `noisy` because the rotary
         tables are indexed by it and the teacher is given the same tensor.
+
+        `collect_block_logits` additionally projects **every** block's hidden
+        state through the shared `lm_head` and returns those logits keyed by
+        block. That is what lets the DARD penalty reach every block instead of
+        only the one that produced the final prediction -- see
+        `denoise_step`. Off by default so the KD path and plain inference pay
+        nothing for it.
         """
         groups = self.block_layers()
         head_dim = self.model.config.n_embd // self.model.config.n_head
@@ -1073,21 +1227,48 @@ class DiffusionBlockEngine:
         # near-identical loops that must be kept in sync.
         sigma_b = sigma.view(-1, 1, 1)
         h = noisy
-        for i, layer in enumerate(groups[block_idx]):
-            h = self.model.transformer.h[layer](
-                h,
-                None,
-                (cos, sin),
-                (seq_len, 0),
-                None,
-                attn_mask=attn_mask,
-                cond=conds[i],
-                sigma=sigma_b,
+        # When collecting, run EVERY block in order and project each block's
+        # own hidden state through the shared `lm_head`. Each projection keeps
+        # its block's layers in the graph, so the DARD penalty's gradient flows
+        # from the head back into that block. Only the active block runs with
+        # `requires_grad=True` (set by `_activate_block`), so the inactive
+        # blocks contribute zero parameter gradient here while still giving the
+        # penalty a per-block distribution to act on -- which is the point: the
+        # rules then shape every block's representation rather than only the one
+        # whose prediction is scored.
+        block_logits: dict[int, torch.Tensor] = {}
+        # Without collection this is a single-block loop, identical to the
+        # pre-per-block-head code: the forward isolation DiffusionBlocks exists
+        # for (L/B layers, not L) is a property this must not give up silently.
+        blocks_to_run = range(len(groups)) if collect_block_logits else (block_idx,)
+        for b in blocks_to_run:
+            block_conds = (
+                conds if b == block_idx else self.adapters[b](noisy, sigma.view(1))
             )
+            for i, layer in enumerate(groups[b]):
+                h = self.model.transformer.h[layer](
+                    h,
+                    None,
+                    (cos, sin),
+                    (seq_len, 0),
+                    None,
+                    attn_mask=attn_mask,
+                    cond=block_conds[i],
+                    sigma=sigma_b,
+                )
+            if collect_block_logits:
+                from nanochat.models.dard.engine_hook import denoiser_logits
+
+                block_logits[b] = denoiser_logits(
+                    self.model.lm_head, h, self.model.config.vocab_size
+                )
         # `sigma` is forwarded for the same reason as in the block loop: a
         # sigma-conditioned head needs it, and a static one ignores it. The
         # duck-typed helper keeps a plain `nn.Linear` head working unchanged.
-        return maybe_sigma_call(self.denoise_heads[block_idx], h, sigma_b)
+        pred = maybe_sigma_call(self.denoise_heads[block_idx], h, sigma_b)
+        return _DenoiserOutput(
+            pred=pred, block_logits=block_logits if collect_block_logits else None
+        )
 
     @staticmethod
     def _concat_causal_mask(base_mask: torch.Tensor) -> torch.Tensor:
@@ -1188,7 +1369,34 @@ class DiffusionBlockEngine:
             attn_mask = torch.ones(t, t, dtype=torch.bool, device=idx.device).tril()
             attn_mask = attn_mask.view(1, 1, t, t)
         mask_2t = self._concat_causal_mask(attn_mask)
-        pred_full = self._run_block_denoiser(b, full, sigma, 2 * t, attn_mask=mask_2t)
+        # Per-block head, **opt-in**. Running every block to give each one a
+        # vocabulary distribution is exactly what makes the DARD penalty reach
+        # every block -- but it also runs all L layers instead of L/B, which
+        # gives up the forward isolation that is DiffusionBlocks' reason to
+        # exist (pinned by `test_dbcpu_denoise.py`). So it is a deliberate
+        # trade the caller must ask for, not a default that silently spends the
+        # memory saving. Without it the per-block path is byte-identical to
+        # before and pays nothing.
+        need_blocks = self.dard_loss_fn is not None and self.dard_per_block_head
+        denoiser_out = self._run_block_denoiser(
+            b,
+            full,
+            sigma,
+            2 * t,
+            attn_mask=mask_2t,
+            collect_block_logits=need_blocks,
+        )
+        if need_blocks:
+            pred_full = denoiser_out.pred
+            block_logits = denoiser_out.block_logits or {}
+            # Published for the caller, which owns the balancing. The final
+            # block's logits are the same distribution the old single-head path
+            # produced, so behaviour with one block is unchanged.
+            self.last_dard_logits = block_logits[len(block_logits) - 1]
+            self.last_block_logits = block_logits
+        else:
+            pred_full = denoiser_out.pred
+            self.last_block_logits = None
         pred = pred_full[:, t:, :]
         # Late import: the op layer is a runtime backend, not model math, and
         # importing it at module scope would pull torch.library registration
@@ -1217,7 +1425,7 @@ class DiffusionBlockEngine:
                 pred,
                 lambda: self.distiller.teacher._run_block_denoiser(
                     b, full, sigma, 2 * t, attn_mask=mask_2t
-                )[:, t:, :],
+                ).pred[:, t:, :],
                 weight=w,
             )
             loss = (1.0 - alpha) * loss + alpha * loss_kd

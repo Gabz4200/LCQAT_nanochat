@@ -14,11 +14,13 @@ Usage (drop-in replacement for FA3):
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
 """
 
+import typing
+
 import torch
 import torch.nn.functional as F
 
 
-def _load_flash_attention_3():
+def _load_flash_attention_3() -> typing.Any:
     """Try to load Flash Attention 3."""
     if not torch.cuda.is_available():
         return None

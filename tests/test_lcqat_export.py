@@ -10,6 +10,7 @@ import math
 import pytest
 import torch
 
+from nanochat.models.backbone import GPT
 from nanochat.models.quant import (
     PRESETS,
     LCQATLinear,
@@ -31,6 +32,7 @@ from nanochat.modules.experiments.tiny_models import build_active_tiny_gpt
 from nanochat.training.diffusion_blocks import (
     DiffusionBlockEngine,
     EquiProbabilityPartitioner,
+    NoiseConditionedBlockAdapter,
 )
 
 
@@ -110,6 +112,7 @@ def test_when_loading_exported_db_artifact_then_engine_owns_its_quantized_layers
     source.to_empty(device="cpu")
     source.init_weights()
     quantized = retrofit_model(source, PRESETS[DEFAULT_PRESET])
+    assert isinstance(quantized, GPT), "retrofit must return a GPT"
     engine = DiffusionBlockEngine(quantized, EquiProbabilityPartitioner(num_blocks=2))
     engine.apply_lcqat(PRESETS[DEFAULT_PRESET])
 
@@ -138,11 +141,17 @@ def test_when_loading_exported_db_artifact_then_engine_owns_its_quantized_layers
         "exported db_* state dropped on reload: "
         f"{sorted(exported_db_keys - set(loaded.state_dict()))[:5]}"
     )
-    adapter = loaded.adapters[0].mlp[0]
-    assert getattr(adapter, "weight_quantizer", None) is not None, (
+    # `adapters` is `nn.ModuleList`; narrow so `.mlp[0]` resolves as a
+    # typed sequence rather than through `Module.__getattr__`.
+    adapter = loaded.adapters[0]
+    assert isinstance(adapter, NoiseConditionedBlockAdapter), (
         f"adapter reloaded as plain {type(adapter).__name__}: export/load are asymmetric"
     )
-    assert not hasattr(adapter, "weight"), "shadow weight survived the roundtrip"
+    inner = adapter.mlp[0]
+    assert getattr(inner, "weight_quantizer", None) is not None, (
+        f"adapter reloaded as plain {type(inner).__name__}: export/load are asymmetric"
+    )
+    assert not hasattr(inner, "weight"), "shadow weight survived the roundtrip"
     assert "db_adapters.0.mlp.0.packed_weight_indices" in loaded.state_dict()
 
 
@@ -179,6 +188,7 @@ def test_when_loading_exported_sparseprop_artifact_then_it_reloads(
     from nanochat.modules import checkpoint_manager as cm
 
     source = retrofit_model(build_active_tiny_gpt(), PRESETS[DEFAULT_PRESET])
+    assert isinstance(source, GPT), "retrofit must return a GPT"
     inject_sparseprop_layers(source, sparsity=0.75, with_lcqat=True)
     state = export_lcqat_checkpoint(source, str(tmp_path / "sp.pt"), sparse=True)
     assert any(k.endswith("sparse_row_ptr") for k in state)
@@ -205,6 +215,9 @@ def test_when_loading_exported_sparseprop_artifact_then_it_reloads(
         str(ckpt), 1, torch.device("cpu"), "eval"
     )
 
+    # `build_model` returns `nn.Module`; the artifact is a GPT, so narrow
+    # before reading `transformer.h[0]`.
+    assert isinstance(loaded, GPT), "loaded artifact is not a GPT"
     layer = loaded.transformer.h[0].attn.c_q
     # Strips weights, gains the index buffer, and keeps the artifact's CSR
     # structure registered rather than silently discarded.
@@ -242,6 +255,7 @@ def test_when_loading_exported_artifact_then_learnable_lut_params_are_dropped(
 
     torch.manual_seed(3)
     source = retrofit_model(tiny_gpt_factory(), PRESETS[DEFAULT_PRESET])
+    assert isinstance(source, GPT), "retrofit must return a GPT"
     _attach_luts(source, PRESETS[DEFAULT_PRESET])
     state = export_lcqat_checkpoint(source, str(tmp_path / "lut.pt"))
     learnable = [k for k in state if "learnable_activation_lut" in k]
@@ -271,6 +285,7 @@ def test_when_loading_exported_artifact_then_learnable_lut_params_are_dropped(
     )
 
     assert not any("learnable_activation_lut" in k for k in loaded.state_dict())
+    assert isinstance(loaded, GPT), "loaded artifact is not a GPT"
     assert loaded.transformer.h[0].mlp.c_fc.activation_lut is not None
     ids = torch.randint(0, loaded.config.vocab_size, (1, 8))
     with torch.no_grad():
@@ -286,6 +301,7 @@ def test_when_loading_exported_artifact_then_loads_and_runs(
 
     torch.manual_seed(1)
     source = retrofit_model(tiny_gpt_factory(), PRESETS["prd"])
+    assert isinstance(source, GPT), "retrofit must return a GPT"
     float_baseline = copy.deepcopy(source)
     source.eval()
     float_baseline.eval()
@@ -317,6 +333,7 @@ def test_when_build_model_with_exported_artifact_then_eval_runs_and_train_reject
 
     torch.manual_seed(2)
     source = retrofit_model(tiny_gpt_factory(), PRESETS["prd"])
+    assert isinstance(source, GPT), "retrofit must return a GPT"
     float_baseline = copy.deepcopy(source)
     source.eval()
     float_baseline.eval()
@@ -335,6 +352,8 @@ def test_when_build_model_with_exported_artifact_then_eval_runs_and_train_reject
     model, _, loaded_meta = cm.build_model(
         str(tmp_path / "ck"), 1, torch.device("cpu"), "eval"
     )
+    # No meta["db"] was saved, so `build_model` returns the bare GPT.
+    assert not isinstance(model, DiffusionBlockEngine)
     assert loaded_meta["lcqat"]["down_weight"] == 255
     torch.manual_seed(9)
     ids = torch.randint(0, model.config.vocab_size, (2, 16))

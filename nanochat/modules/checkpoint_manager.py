@@ -163,11 +163,18 @@ def _prepare_exported_db_buffers(engine, model_data: dict) -> None:
         _prepare_exported_buffers(getattr(engine, attr), subtree_state)
 
 
-def build_model(checkpoint_dir, step, device, phase, lcqat=None):
+def build_model(
+    checkpoint_dir,
+    step,
+    device,
+    phase,
+    lcqat=None,
+) -> "tuple[GPT | DiffusionBlockEngine, object, dict]":
     """
     A bunch of repetitive code to build a model from a given checkpoint.
     Returns:
-    - base model - uncompiled, not wrapped in DDP
+    - base model - uncompiled, not wrapped in DDP (the engine itself
+      when the checkpoint declares `meta["db"]`)
     - tokenizer
     - meta data saved during base model training
 
@@ -203,7 +210,7 @@ def build_model(checkpoint_dir, step, device, phase, lcqat=None):
     with torch.device("meta"):
         model = GPT(model_config)
     model.to_empty(device=device)
-    model.init_weights()  # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    model.init_weights()  # need the rotary embeddings initialized; TODO: fix model re-init
     # Check if DiffusionBlocks state was saved in metadata or state keys
     # Do this BEFORE the strict load so malformed db checkpoints fail with
     # the intended message instead of an incidental LUT key error.

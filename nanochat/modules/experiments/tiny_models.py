@@ -13,12 +13,22 @@ assertion over it passes vacuously.
 
 from __future__ import annotations
 
+import copy
+from typing import TypeVar
+
 import torch
 
-from nanochat.models.backbone import GPT, GPTConfig
+from nanochat.models.backbone import (
+    GPT,
+    Block,
+    BlockList,
+    GPTConfig,
+    Linear,
+)
 from nanochat.training.diffusion_blocks import (
     DiffusionBlockEngine,
     EquiProbabilityPartitioner,
+    NoiseConditionedBlockAdapter,
 )
 
 
@@ -54,15 +64,16 @@ def build_active_tiny_gpt() -> GPT:
     return model
 
 
-def _fresh_like(template: torch.nn.Module) -> torch.nn.Module:
+_M = TypeVar("_M", bound=torch.nn.Module)
+
+
+def _fresh_like(template: _M) -> _M:
     """A deep copy of `template` with independently randomized weights.
 
     Shape is inherited from the template rather than recomputed, which is the
     point: these structures have non-obvious dimensions (the ResFormer value
     embedding is vocab-sized, the ve_gate is vocab-channel-sized).
     """
-    import copy
-
     module = copy.deepcopy(template)
     with torch.no_grad():
         for p in module.parameters():
@@ -70,7 +81,7 @@ def _fresh_like(template: torch.nn.Module) -> torch.nn.Module:
     return module
 
 
-def _ve_gate_like(model) -> torch.nn.Module:
+def _ve_gate_like(model: GPT) -> Linear:
     """A `ve_gate` with the right shape, taken from any block that has one."""
     for block in model.transformer.h:
         if block.attn.ve_gate is not None:
@@ -78,15 +89,13 @@ def _ve_gate_like(model) -> torch.nn.Module:
     raise AssertionError("no block in the model has a ve_gate to copy the shape from")
 
 
-def _fresh_block_like(model, layer_idx: int) -> torch.nn.Module:
+def _fresh_block_like(model: GPT, layer_idx: int) -> Block:
     """Build a fresh Block for `layer_idx`, with its `ve_gate` matching the depth.
 
     Uses the real `Block` constructor so the value-embedding / gate pairing is
     derived by the same `has_ve(layer_idx, n_layer)` rule the model uses, instead
     of being copied from a block that was built for a different index.
     """
-    from nanochat.models.backbone import Block
-
     block = Block(model.config, layer_idx)
     block.to_empty(device=next(model.transformer.h[0].parameters()).device)
     with torch.no_grad():
@@ -95,7 +104,7 @@ def _fresh_block_like(model, layer_idx: int) -> torch.nn.Module:
     return block
 
 
-def resize_to(model: torch.nn.Module, n_layer: int) -> None:
+def resize_to(model: GPT, n_layer: int) -> None:
     """Grow or shrink `transformer.h` to `n_layer` blocks, fixing the per-layer scalars.
 
     `GPT.forward` indexes `resid_lambdas` / `x0_lambdas` by layer, so the layer
@@ -111,12 +120,12 @@ def resize_to(model: torch.nn.Module, n_layer: int) -> None:
     existing = list(model.transformer.h)
     n_old = len(existing)
     if n_layer < n_old:
-        model.transformer.h = torch.nn.ModuleList(existing[:n_layer])
+        model.transformer.h = BlockList(existing[:n_layer])
     else:
         rebuilt = existing[:n_layer]
         for i in range(n_old, n_layer):
             rebuilt.append(_fresh_block_like(model, i))
-        model.transformer.h = torch.nn.ModuleList(rebuilt)
+        model.transformer.h = BlockList(rebuilt)
     # `GPT.forward` indexes several per-layer structures by index, so a depth
     # change has to resize all of them, not just the lambdas. These are lists /
     # ModuleDicts built in `__init__`, so they are cheap to extend or truncate.
@@ -163,7 +172,9 @@ def resize_to(model: torch.nn.Module, n_layer: int) -> None:
         has_gate = block.attn.ve_gate is not None
         assert has_ve == has_gate, f"layer {i}: ve/gate mismatch"
         if has_ve:
-            assert model.value_embeds[str(i)].weight.shape[0] == model.config.vocab_size
+            entry = model.value_embeds[str(i)]
+            assert isinstance(entry, torch.nn.Embedding)
+            assert entry.weight.shape[0] == model.config.vocab_size
 
 
 def make_engine(
@@ -187,9 +198,13 @@ def make_engine(
     if active:
         with torch.no_grad():
             for head in engine.denoise_heads:
+                assert isinstance(head, torch.nn.Linear)
                 head.weight.normal_(std=0.05)
             for adapter in engine.adapters:
-                adapter.mlp[-1].weight.normal_(std=0.05)
+                assert isinstance(adapter, NoiseConditionedBlockAdapter)
+                last = adapter.mlp[-1]
+                assert isinstance(last, torch.nn.Linear)
+                last.weight.normal_(std=0.05)
     return engine
 
 

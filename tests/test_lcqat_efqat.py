@@ -7,7 +7,7 @@ from nanochat.models.quant import PRESETS, retrofit_model
 from nanochat.models.quant.efqat import CRITICAL_PATTERNS, SelectiveFreezer
 
 
-def _tiny_lcqat_model():
+def _tiny_lcqat_model() -> GPT:
     config = GPTConfig(
         sequence_len=64,
         vocab_size=128,
@@ -21,7 +21,11 @@ def _tiny_lcqat_model():
         model = GPT(config)
     model.to_empty(device="cpu")
     model.init_weights()
-    return retrofit_model(model, PRESETS["small"])
+    # `retrofit_model` returns `nn.Module`; the return type above is the
+    # real `GPT`, which has `transformer.h` as a typed `BlockList`. The
+    # retrofit mutates in place and returns the same object.
+    retrofit_model(model, PRESETS["small"])
+    return model  # type: ignore[return-value]
 
 
 def _non_critical_codebook_params(layer):

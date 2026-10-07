@@ -40,7 +40,7 @@ class RustBPETokenizer:
     @classmethod
     def train_from_iterator(cls, text_iterator, vocab_size):
         # 1) train using rustbpe
-        tokenizer = rustbpe.Tokenizer()
+        tokenizer = rustbpe.Tokenizer()  # type: ignore[missing-attribute] -- rustbpe ships no type stubs; Tokenizer exists at runtime
         # the special tokens are inserted later in __init__, we don't train them here
         vocab_size_no_special = vocab_size - len(SPECIAL_TOKENS)
         assert vocab_size_no_special >= 256, (
@@ -107,23 +107,21 @@ class RustBPETokenizer:
         def as_id(value):
             return value if isinstance(value, int) else self.encode_special(value)
 
-        if prepend is not None:
-            prepend_id = as_id(prepend)
-        if append is not None:
-            append_id = as_id(append)
+        prepend_id: int | None = as_id(prepend) if prepend is not None else None
+        append_id: int | None = as_id(append) if append is not None else None
 
         if isinstance(text, str):
             ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
+            if prepend_id is not None:
                 ids.insert(0, prepend_id)  # TODO: slightly inefficient here? :( hmm
-            if append is not None:
+            if append_id is not None:
                 ids.append(append_id)
         elif isinstance(text, list):
             ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
+            if prepend_id is not None:
                 for ids_row in ids:
                     ids_row.insert(0, prepend_id)  # TODO: same
-            if append is not None:
+            if append_id is not None:
                 for ids_row in ids:
                     ids_row.append(append_id)
         else:
@@ -285,7 +283,9 @@ def tokenizer_dir():
     """
     from nanochat.utils.common import get_base_dir
 
-    return os.path.join(get_base_dir(), "tokenizer")
+    base_dir = get_base_dir()
+    assert base_dir is not None  # always a str at runtime; the helper is untyped
+    return os.path.join(base_dir, "tokenizer")
 
 
 def token_bytes_path():

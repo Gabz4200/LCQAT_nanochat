@@ -7,15 +7,21 @@ heads were left in place, so the model evaluated as garbage while looking
 healthy.
 """
 
+import typing
+
 import pytest
 import torch
+import torch.nn as nn
 
 from nanochat.models.quant import PRESETS, retrofit_model
+from nanochat.models.quant.linear import LCQATLinear
 from nanochat.models.quant.retrofit import DEFAULT_PRESET
+from nanochat.models.quant.sparseprop import SparsePropLinear
 from nanochat.modules.checkpoint_manager import build_model, save_checkpoint
 from nanochat.training.diffusion_blocks import (
     DiffusionBlockEngine,
     EquiProbabilityPartitioner,
+    NoiseConditionedBlockAdapter,
 )
 from tests.conftest import build_active_tiny_gpt
 
@@ -149,28 +155,38 @@ def test_when_db_engine_layers_are_quantized_then_build_model_retrofits_them(
     built, _tokenizer, _meta = build_model(
         str(tmp_path), 1, torch.device("cpu"), phase="eval"
     )
+    # The checkpoint declares meta["db"], so `built` is the engine,
+    # not the bare GPT: the adapters and denoise heads are its own.
+    assert isinstance(built, DiffusionBlockEngine)
 
-    adapter = built.adapters[0].mlp[0]
-    head = built.denoise_heads[0]
+    # `ModuleList.__getitem__` types to `Module` and
+    # `Module.__getattr__` to `Tensor`; narrow both.
+    adapter = typing.cast(NoiseConditionedBlockAdapter, built.adapters[0]).mlp[0]
+    head = typing.cast(nn.Linear, built.denoise_heads[0])
     for name, module in (("adapter", adapter), ("denoise head", head)):
-        assert getattr(module, "weight_quantizer", None) is not None, (
+        # The retrofit swaps both for `LCQATLinear` subclasses
+        # (`weight_quantizer` there; `sparsity_mask` on
+        # `SparsePropLinear`).
+        quantizer = typing.cast(LCQATLinear, module).weight_quantizer
+        sparsity_mask = typing.cast(SparsePropLinear, module).sparsity_mask
+        assert quantizer is not None, (
             f"{name} came back unquantized: {type(module).__name__}"
         )
-        assert module.sparsity_mask is not None, f"{name} came back without sparsity"
+        assert sparsity_mask is not None, f"{name} came back without sparsity"
         # Not just "is quantized" -- the trained state has to be the state that
         # loads. A freshly initialized codebook would pass the check above.
         key = "db_denoise_heads.0.weight_quantizer.raw_pos_deltas"
         if name == "adapter":
             key = "db_adapters.0.mlp.0.weight_quantizer.raw_pos_deltas"
-        assert torch.equal(module.weight_quantizer.raw_pos_deltas, saved[key]), (
-            f"{name} loaded a fresh codebook, not the trained one"
-        )
+        assert torch.equal(
+            quantizer.raw_pos_deltas, typing.cast(torch.Tensor, saved[key])
+        ), f"{name} loaded a fresh codebook, not the trained one"
         mask_key = (
             "db_adapters.0.mlp.0.sparsity_mask"
             if name == "adapter"
             else "db_denoise_heads.0.sparsity_mask"
         )
-        assert torch.equal(module.sparsity_mask, saved[mask_key])
+        assert torch.equal(sparsity_mask, saved[mask_key])
 
 
 def test_when_db_engine_layers_are_quantized_then_no_db_key_is_silently_dropped(

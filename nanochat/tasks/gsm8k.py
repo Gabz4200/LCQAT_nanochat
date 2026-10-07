@@ -95,21 +95,16 @@ class GSM8K(Task):
         }
         return conversation
 
-    def evaluate(self, conversation, assistant_response):
+    def evaluate(self, problem, completion):
         """
-        Given (conversation, completion), return evaluation outcome (0 = wrong, 1 = correct)
+        Given (problem, completion), return evaluation outcome (0 = wrong, 1 = correct)
         Note that:
-        - the conversation has both user AND assistant message (containing the ground truth answer)
-        - the assistant_response is usually the alternative assistant message achieved via sampling
-
-        TODO: Technically, assistant_response should be a Message (either a string or a list of parts)
-              We can handle this later possibly. For now just assume string.
+        - the problem has both user AND assistant message (containing the ground truth answer)
+        - the completion is usually the alternative assistant message achieved via sampling
         """
-        assert isinstance(assistant_response, str), (
-            "Assuming simple string response for now"
-        )
+        assert isinstance(completion, str), "Assuming simple string response for now"
         # First extract the ground truth answer
-        assistant_message = conversation["messages"][-1]
+        assistant_message = problem["messages"][-1]
         assert assistant_message["role"] == "assistant", (
             "Last message must be from the Assistant"
         )
@@ -121,7 +116,7 @@ class GSM8K(Task):
         ]  # this contains the final answer in GSM8K
         # Extract both the ground truth answer and the predicted answer
         ref_num = extract_answer(last_text_part)
-        pred_num = extract_answer(assistant_response)
+        pred_num = extract_answer(completion)
         # Compare and return the success as int
         is_correct = int(pred_num == ref_num)
         return is_correct

@@ -1,5 +1,5 @@
 """
-New and upgraded chat mode because a lot of the code has changed since the last one.
+Interactive chat with a trained model.
 
 Intended to be run single GPU only atm:
 python -m scripts.chat_cli
@@ -7,6 +7,7 @@ python -m scripts.chat_cli
 
 import argparse
 
+from nanochat.data.tokenizer import RustBPETokenizer
 from nanochat.modules.checkpoint_manager import load_model
 from nanochat.modules.engine import Engine
 from nanochat.utils.common import autodetect_device_type, compute_init
@@ -48,6 +49,9 @@ ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type
 model, tokenizer, meta = load_model(
     args.source, device, phase="eval", model_tag=args.model_tag, step=args.step
 )
+# `load_model` is duck-typed through `build_model`; the checkpoint always
+# round-trips a `RustBPETokenizer` (written by `save_checkpoint`).
+assert isinstance(tokenizer, RustBPETokenizer)
 
 # Special tokens for the chat state machine
 bos = tokenizer.get_bos_token_id()

@@ -9,13 +9,14 @@ detection helpers shared by scripts/base_train.py and checkpoint_manager.
 from __future__ import annotations
 
 import argparse
+import typing
 import warnings
 from dataclasses import dataclass, fields, replace
 
 import torch
 import torch.nn as nn
 
-from nanochat.models.io import CodebookSpec, LayerQuantSpec
+from nanochat.models.io import CodebookSpec, LayerQuantSpec, ModuleTree
 from nanochat.models.quant.activation import ACT_BODIES, ACT_BODY_PWL
 from nanochat.models.quant.codebook import split_from_k
 from nanochat.models.quant.codebook import validate_split as _validate_split
@@ -501,7 +502,14 @@ def get_layer_config(module_name: str, config: LayerKConfig) -> LayerQuantSpec |
     if out_field is None:
         return LayerQuantSpec(weight=k_weight, activation=k_act)
     quantize_out = bool(getattr(config, out_field))
-    out_spec = getattr(config, out_spec_field) if quantize_out else None
+    # `out_spec_field` is set exactly when `out_field` is (see the _ROLE_*
+    # tuples), so the extra `is not None` is implied -- it only narrows the
+    # type for the checker, and never changes which branch runs.
+    out_spec = (
+        getattr(config, out_spec_field)
+        if quantize_out and out_spec_field is not None
+        else None
+    )
     return LayerQuantSpec(
         weight=k_weight,
         activation=k_act,
@@ -524,7 +532,10 @@ def _is_fp8_linear(module: nn.Module) -> bool:
     return isinstance(module, Float8Linear) or "Float8" in type(module).__name__
 
 
-def retrofit_model(model: nn.Module, config: LayerKConfig) -> nn.Module:
+_M = typing.TypeVar("_M", bound=nn.Module)
+
+
+def retrofit_model(model: _M, config: LayerKConfig) -> _M:
     """Recursively replace eligible nn.Linear modules with LCQATLinear, in place.
 
     Skips lm_head and any module below `min_linear_dim` (mirrors the FP8
@@ -593,7 +604,7 @@ def retrofit_model(model: nn.Module, config: LayerKConfig) -> nn.Module:
     return model
 
 
-def retrofit_summary(model: nn.Module) -> dict[str, int]:
+def retrofit_summary(model: nn.Module | ModuleTree) -> dict[str, int]:
     """Count retrofitted modules per (weight split, act split) for logging.
 
     Splits are logged rather than bare K because the sign split is the thing
@@ -605,10 +616,19 @@ def retrofit_summary(model: nn.Module) -> dict[str, int]:
     for module in model.modules():
         # `is_lcqat_layer`, not isinstance: a SparseProp-wrapped LC-QAT layer is
         # one without being a subclass, and it carries both quantizers.
-        if is_lcqat_layer(module):
-            w, a = module.weight_quantizer, module.act_quantizer
-            key = f"Kw={w.K}(m{w.m_neg},p{w.m_pos}),Ka={a.K}(m{a.m_neg},p{a.m_pos})"
-            summary[key] = summary.get(key, 0) + 1
+        if not is_lcqat_layer(module):
+            continue
+        # Bound to locals: a sparse member may lack these attributes
+        # entirely, so direct access would not check. Weight and act
+        # quantizers are mandatory on every real layer (the assert
+        # documents that); only `out_quantizer` is optional.
+        w = getattr(module, "weight_quantizer", None)
+        a = getattr(module, "act_quantizer", None)
+        assert w is not None and a is not None, (
+            "an LC-QAT layer without weight/act quantizers; the wrap is corrupt"
+        )
+        key = f"Kw={w.K}(m{w.m_neg},p{w.m_pos}),Ka={a.K}(m{a.m_neg},p{a.m_pos})"
+        summary[key] = summary.get(key, 0) + 1
     return summary
 
 
@@ -667,10 +687,18 @@ def prepare_exported_subtree_buffers(model: nn.Module, model_data: dict) -> None
             )
         # Freeze quantizers exactly like export does: raw step params are
         # deleted, only compiled_codebook buffers remain in the state.
-        module.weight_quantizer.compile_for_inference()
-        module.act_quantizer.compile_for_inference()
-        if module.out_quantizer is not None:
-            module.out_quantizer.compile_for_inference()
+        # Bound to locals (see `retrofit_summary`): direct access would
+        # not check on a sparse member missing the attribute.
+        weight_quantizer = getattr(module, "weight_quantizer", None)
+        act_quantizer = getattr(module, "act_quantizer", None)
+        assert weight_quantizer is not None and act_quantizer is not None, (
+            f"exported {name} has no weight/act quantizers to freeze"
+        )
+        weight_quantizer.compile_for_inference()
+        act_quantizer.compile_for_inference()
+        out_quantizer = getattr(module, "out_quantizer", None)
+        if out_quantizer is not None:
+            out_quantizer.compile_for_inference()
         del module.weight
         module.register_buffer("packed_weight_indices", model_data[idx_key])
         module.register_buffer(
@@ -725,7 +753,7 @@ def prepare_lcqat_before_load(
     from such a state is rejected by the caller (checkpoint_manager).
 
     The learned activation tables (D9) are attached on *both* retrofit paths
-    here, not just in `finish_lcqat_after_load`. This function runs *before*
+    here, not solely in `finish_lcqat_after_load`. This function runs *before*
     `load_state_dict`, and the training checkpoint now carries
     `learnable_activation_lut.*` parameters -- so a resume that retrofitted
     without attaching them would fail the caller's `strict=True` load with

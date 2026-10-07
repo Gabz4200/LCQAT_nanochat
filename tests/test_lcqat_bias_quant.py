@@ -93,7 +93,9 @@ class TestDefaultPathUnchanged:
 
     def test_when_flag_is_off_then_bias_reaches_the_shadow_unchanged(self) -> None:
         linear = quantized()
-        assert linear._dequantized_bias(torch.float32).equal(linear.bias.detach())
+        dequantized = linear._dequantized_bias(torch.float32)
+        assert dequantized is not None
+        assert dequantized.equal(linear.bias.detach())
 
     def test_when_flag_is_off_then_a_checkpoint_still_loads_strictly(self) -> None:
         """A flag-off model must not carry bias-codebook keys at all.
@@ -127,8 +129,11 @@ class TestEnabledPath:
         """
         linear = quantized(quantize_bias=True)
         x = torch.randn(4, IN_FEATURES)
-        codebook = linear.bias_quantizer.get_codebook()
+        bias_quantizer = linear.bias_quantizer
+        assert bias_quantizer is not None
+        codebook = bias_quantizer.get_codebook()
         bias = linear._dequantized_bias(x.dtype)
+        assert bias is not None
         distance = (bias.unsqueeze(-1) - codebook).abs().min(dim=-1).values
         assert bool((distance == 0).all())
 
@@ -148,7 +153,9 @@ class TestEnabledPath:
 
         assert linear.bias.grad is not None
         assert float(linear.bias.grad.abs().sum()) > 0.0
-        for name, param in linear.bias_quantizer.named_parameters():
+        bias_quantizer = linear.bias_quantizer
+        assert bias_quantizer is not None
+        for name, param in bias_quantizer.named_parameters():
             assert param.grad is not None, f"{name} received no gradient"
             assert float(param.grad.abs().sum()) > 0.0, f"{name} gradient is zero"
 
@@ -169,6 +176,7 @@ class TestEnabledPath:
         linear(x).sum().backward()
 
         addends = x.numel() // IN_FEATURES
+        assert linear.bias.grad is not None
         assert torch.equal(
             linear.bias.grad,
             torch.full((OUT_FEATURES,), float(addends)),
@@ -192,7 +200,10 @@ class TestEnabledPath:
     ) -> None:
         unscaled = quantized(quantize_bias=True, grad_scale=GRAD_SCALE_NONE)
         unscaled(torch.randn(8, IN_FEATURES)).square().mean().backward()
-        for name, param in unscaled.bias_quantizer.named_parameters():
+        bias_quantizer = unscaled.bias_quantizer
+        assert bias_quantizer is not None
+        for name, param in bias_quantizer.named_parameters():
+            assert param.grad is not None, f"{name} received no gradient"
             assert float(param.grad.abs().sum()) > 0.0, f"{name} gradient is zero"
 
     def test_when_enabled_with_per_channel_weights_then_both_tables_survive(
@@ -215,7 +226,11 @@ class TestEnabledPath:
 
         assert linear.per_channel_weight_quantizer is not None
         assert linear.bias_quantizer is not None
-        grads = [float(p.grad.abs().sum()) for p in linear.bias_quantizer.parameters()]
+        grads = [
+            float(p.grad.abs().sum())
+            for p in linear.bias_quantizer.parameters()
+            if p.grad is not None
+        ]
         assert all(g > 0.0 for g in grads), grads
 
 
@@ -234,7 +249,9 @@ class TestZeroAnchor:
         bias[0] = 0.0
         bias[5] = 0.0
 
-        dequantized = linear.bias_quantizer(bias).value
+        bias_quantizer = linear.bias_quantizer
+        assert bias_quantizer is not None
+        dequantized = bias_quantizer(bias).value
         assert dequantized[0].item() == 0.0
         assert dequantized[5].item() == 0.0
 
@@ -248,6 +265,7 @@ class TestZeroAnchor:
         bias = linear.bias.detach().clone()
         bias[7] = 0.0
         quantizer = linear.bias_quantizer
+        assert quantizer is not None
         assert int(quantizer.bucketize(bias)[7].item()) == quantizer.m_neg
 
     def test_when_the_whole_bias_is_zero_then_every_entry_dequantizes_to_zero(
@@ -256,7 +274,9 @@ class TestZeroAnchor:
         linear = quantized(quantize_bias=True)
         with torch.no_grad():
             linear.bias.zero_()
-        dequantized = linear.bias_quantizer(linear.bias.detach()).value
+        bias_quantizer = linear.bias_quantizer
+        assert bias_quantizer is not None
+        dequantized = bias_quantizer(linear.bias.detach()).value
         assert bool((dequantized == 0.0).all())
 
     def test_when_a_bias_entry_is_zero_then_it_is_absent_from_the_output(self) -> None:
@@ -280,16 +300,20 @@ class TestPersistence:
         assert any("bias_quantizer" in key for key in state)
 
         clone = copy.deepcopy(linear)
+        clone_quantizer = clone.bias_quantizer
+        assert clone_quantizer is not None
+        linear_quantizer = linear.bias_quantizer
+        assert linear_quantizer is not None
         with torch.no_grad():
-            for param in clone.bias_quantizer.parameters():
+            for param in clone_quantizer.parameters():
                 param.add_(torch.randn_like(param))
         assert not torch.equal(
-            clone.bias_quantizer.get_codebook(), linear.bias_quantizer.get_codebook()
+            clone_quantizer.get_codebook(), linear_quantizer.get_codebook()
         )
 
         clone.load_state_dict(state)
         assert torch.equal(
-            clone.bias_quantizer.get_codebook(), linear.bias_quantizer.get_codebook()
+            clone_quantizer.get_codebook(), linear_quantizer.get_codebook()
         )
 
     def test_when_reloaded_then_the_output_is_identical(self) -> None:
@@ -320,7 +344,9 @@ class TestPersistence:
             if group["role"] == "codebook"
             for param in group["params"]
         }
-        bias_ids = {id(p) for p in linear.bias_quantizer.parameters()}
+        bias_quantizer = linear.bias_quantizer
+        assert bias_quantizer is not None
+        bias_ids = {id(p) for p in bias_quantizer.parameters()}
         assert bias_ids <= codebook_ids
 
 
@@ -416,7 +442,9 @@ class TestMeasurement:
     def test_when_measured_then_every_number_is_finite(self) -> None:
         linear = quantized(quantize_bias=True)
         report = measure_bias_quantization(linear, torch.randn(4, IN_FEATURES), "asym")
-        for result in (report.bias, report.weight, report.activation):
+        activation = report.activation
+        assert activation is not None
+        for result in (report.bias, report.weight, activation):
             assert math.isfinite(result.nmse)
             assert math.isfinite(result.mse)
             assert math.isfinite(result.max_abs_error)
@@ -433,6 +461,7 @@ class TestMeasurement:
         report = measure_bias_quantization(linear, torch.randn(4, IN_FEATURES), "asym")
         assert report.bias.n_elements == OUT_FEATURES
         assert report.weight.n_elements == OUT_FEATURES * IN_FEATURES
+        assert report.activation is not None
         assert report.activation.n_elements == 4 * IN_FEATURES
         assert report.bias is not report.weight
         assert report.bias.preset == report.weight.preset == "asym"
@@ -462,6 +491,7 @@ class TestMeasurement:
         before = measure_bias_quantization(linear, x, "asym").bias.nmse
         with torch.no_grad():
             linear.bias.mul_(0.05)
+            assert linear.bias_quantizer is not None
             linear.bias_quantizer.init_from_tensor(linear.bias.detach())
         after = measure_bias_quantization(linear, x, "asym").bias.nmse
         assert before != after
@@ -551,6 +581,21 @@ class TestRetrofitPath:
         assert layers, "fixture retrofitted nothing; the name matching broke"
         return layers
 
+    @staticmethod
+    def _c_q(model: nn.Module) -> LCQATLinear:
+        """The first block's `c_q` layer, narrowed for the checker.
+
+        `nn.Module.__getattr__` is typed `-> Tensor` in the torch stubs, so
+        attribute navigation (`model["h"][0].attn.c_q`) does not type-check;
+        `getattr` + `isinstance` reaches the same object.
+        """
+        h = getattr(model, "h")
+        assert isinstance(h, nn.ModuleList)
+        attn = getattr(h[0], "attn")
+        c_q = getattr(attn, "c_q")
+        assert isinstance(c_q, LCQATLinear)
+        return c_q
+
     def test_when_the_flag_is_on_then_every_biased_layer_gets_a_quantizer(self) -> None:
         config = replace(PRESETS["asym"], quantize_bias=True)
         net = self._net(bias=True)
@@ -595,20 +640,24 @@ class TestRetrofitPath:
 
         clone = self._net(bias=True)
         retrofit_model(clone, config)
+        clone_quantizer = self._c_q(clone).bias_quantizer
+        assert clone_quantizer is not None
+        net_quantizer = self._c_q(net).bias_quantizer
+        assert net_quantizer is not None
         with torch.no_grad():
-            for param in clone["h"][0].attn.c_q.bias_quantizer.parameters():
+            for param in clone_quantizer.parameters():
                 param.add_(1.0)
         assert not torch.equal(
-            clone["h"][0].attn.c_q.bias_quantizer.get_codebook(),
-            net["h"][0].attn.c_q.bias_quantizer.get_codebook(),
+            clone_quantizer.get_codebook(),
+            net_quantizer.get_codebook(),
         )
 
         # strict=True: the flag has to be in the config, or the resume fails
         # with "unexpected keys" for every bias codebook in the checkpoint.
         clone.load_state_dict(state)
         assert torch.equal(
-            clone["h"][0].attn.c_q.bias_quantizer.get_codebook(),
-            net["h"][0].attn.c_q.bias_quantizer.get_codebook(),
+            clone_quantizer.get_codebook(),
+            net_quantizer.get_codebook(),
         )
 
     def test_when_the_config_is_serialized_then_the_flag_survives(self) -> None:

@@ -28,6 +28,7 @@ import argparse
 import torch
 import torch.nn as nn
 
+from nanochat.models.io import ModuleTree
 from nanochat.models.quant.activation import ACT_BODIES, ACT_BODY_PWL
 from nanochat.models.quant.learnable_lut import RELAXATION_LOGITS, RELAXATIONS
 
@@ -350,8 +351,13 @@ def build_float_twin(engine):
     return twin, stripped
 
 
-def build_denoiser_teacher(engine, kd_denoiser_alpha: float, db_objective: str):
-    """Build the float twin for `--kd-denoiser-alpha`, or None when disabled.
+def build_denoiser_teacher(
+    engine: ModuleTree, kd_denoiser_alpha: float, db_objective: str
+) -> tuple[ModuleTree, int]:
+    """Build the float twin for `--kd-denoiser-alpha`.
+
+    Callers gate on `kd_denoiser_alpha > 0` before calling; the
+    disabled case is their `(None, 0)` default, not a return here.
 
     Raises `SystemExit` if the flag is set under a non-EDM objective. The anchor
     is defined against the EDM denoising objective's own output space; there is
@@ -359,8 +365,6 @@ def build_denoiser_teacher(engine, kd_denoiser_alpha: float, db_objective: str):
     at all. Silently skipping would look like the anchor "not helping" rather
     than "never applied".
     """
-    if kd_denoiser_alpha <= 0.0:
-        return None
     if db_objective != "edm":
         raise SystemExit(
             "--kd-denoiser-alpha is the EDM-native KD anchor and needs the EDM "

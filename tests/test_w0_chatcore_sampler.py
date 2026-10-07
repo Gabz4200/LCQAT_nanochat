@@ -22,10 +22,12 @@ half is here too: it asserts the unwrap yields something the Engine can run.
 
 import ast
 import pathlib
+import typing
 
 import pytest
 import torch
 
+from nanochat.models.backbone import GPT
 from nanochat.training.diffusion_blocks import DiffusionBlockEngine
 
 CHAT_SFT = "scripts/chat_sft.py"
@@ -130,7 +132,7 @@ class TestTheTrapIsReal:
     def test_the_unwrap_is_what_makes_it_runnable(self):
         """`getattr(model, "model", model)` -- the base_eval workaround."""
         engine = DiffusionBlockEngine.__new__(DiffusionBlockEngine)
-        engine.model = torch.nn.Linear(2, 2)
+        engine.model = typing.cast(GPT, torch.nn.Linear(2, 2))
         base_model = getattr(engine, "model", engine)
         assert base_model is engine.model
         assert callable(base_model.forward)

@@ -77,13 +77,12 @@ def render_prompts_lm(item, continuation_delimiter, fewshot_examples=None):
     which in some datasets seems to have trailing whitespace (which we don't want).
     """
     context = _render_context(item, continuation_delimiter, fewshot_examples)
-    # Return two prompts: without and with the continuation
     prompt_without = _TEMPLATE_LM.render(include_continuation=False, **context)
     prompt_with = _TEMPLATE_LM.render(include_continuation=True, **context)
-    # Due to the way the data seems to be stored, I think I need to strip in the case of LM here.
-    # Otherwise we may get trailing whitespaces in prompt_without (which get absorbed into the next
-    # token in prompt_with), meaning we don't get a nice and clean prefix in the token space
-    # to detect the final continuation. Tokenizers...
+    # Strip trailing whitespace the datasets seem to carry in the
+    # context: it gets absorbed into the next token in prompt_with,
+    # so the prefix would not line up in token space and the
+    # continuation boundary would be undetectable.
     prompt_without = prompt_without.strip()
     return [prompt_without, prompt_with]
 
@@ -97,7 +96,6 @@ def find_common_length(token_sequences, direction="left"):
     # Built conditionally, not via a dict literal: the original constructed a
     # fresh `range` for both directions on every call and discarded one.
     indices = range(min_len) if direction == "left" else range(-1, -min_len - 1, -1)
-    # Find the first position where the token sequences differ
     base = token_sequences[0]
     others = token_sequences[1:]
     for i, idx in enumerate(indices):
@@ -109,8 +107,6 @@ def find_common_length(token_sequences, direction="left"):
 
 def stack_sequences(tokens, pad_token_id):
     """Stack up a list of token sequences, pad to longest on the right"""
-    # `pad_sequence` is exactly this: right-pad a ragged batch to the longest
-    # row, same dtype, same width, same pad value.
     return torch.nn.utils.rnn.pad_sequence(
         [torch.tensor(x, dtype=torch.long) for x in tokens],
         batch_first=True,
@@ -119,9 +115,7 @@ def stack_sequences(tokens, pad_token_id):
 
 
 def batch_sequences_mc(tokenizer, prompts):
-    # In multiple choice, contexts are the same but the continuation is different (common prefix)
     tokens = tokenizer(prompts, prepend=tokenizer.get_bos_token_id())
-    # figure out the start and end of each continuation
     answer_start_idx = find_common_length(tokens, direction="left")
     start_indices = [answer_start_idx] * len(prompts)
     end_indices = [len(x) for x in tokens]
@@ -129,9 +123,7 @@ def batch_sequences_mc(tokenizer, prompts):
 
 
 def batch_sequences_schema(tokenizer, prompts):
-    # In schema tasks, contexts vary but continuation is the same (common suffix)
     tokens = tokenizer(prompts, prepend=tokenizer.get_bos_token_id())
-    # figure out the start and end of each context
     suffix_length = find_common_length(tokens, direction="right")
     end_indices = [len(x) for x in tokens]
     start_indices = [ei - suffix_length for ei in end_indices]
@@ -139,7 +131,6 @@ def batch_sequences_schema(tokenizer, prompts):
 
 
 def batch_sequences_lm(tokenizer, prompts):
-    # In LM tasks, we have two prompts: without and with continuation
     tokens = tokenizer(prompts, prepend=tokenizer.get_bos_token_id())
     tokens_without, tokens_with = tokens
     start_idx, end_idx = len(tokens_without), len(tokens_with)
@@ -149,7 +140,6 @@ def batch_sequences_lm(tokenizer, prompts):
     assert tokens_without == tokens_with[:start_idx], (
         "prompt without is supposed to be a prefix of prompt with"
     )
-    # we only need the with continuation prompt in the LM task, i.e. batch size of 1
     return [tokens_with], [start_idx], [end_idx]
 
 
@@ -161,17 +151,13 @@ def forward_model(model, input_ids):
     """
     batch_size, seq_len = input_ids.size()
     outputs = model(input_ids)
-    # Roll the tensor to the left by one position to get the (autoregressive) target ids
     target_ids = torch.roll(input_ids, shifts=-1, dims=1)
-    # Calculate cross entropy at all positions
     losses = torch.nn.functional.cross_entropy(
         outputs.view(batch_size * seq_len, -1),
         target_ids.view(batch_size * seq_len),
         reduction="none",
     ).view(batch_size, seq_len)
-    # Set the last column to be nan because there is no autoregressive loss there
     losses[:, -1] = float("nan")
-    # Get the argmax predictions at each position
     predictions = outputs.argmax(dim=-1)
     return losses, predictions
 

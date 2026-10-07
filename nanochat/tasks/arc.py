@@ -52,7 +52,5 @@ class ARC(Task):
         }
         return conversation
 
-    def evaluate(self, conversation, assistant_response):
-        return categorical_match(
-            conversation, assistant_response, conversation["letters"], "ARC"
-        )
+    def evaluate(self, problem, completion):
+        return categorical_match(problem, completion, problem["letters"], "ARC")

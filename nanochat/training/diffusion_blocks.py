@@ -2,6 +2,7 @@
 
 import argparse
 import math
+import typing
 from dataclasses import dataclass
 
 import torch
@@ -52,13 +53,19 @@ class NoiseConditionedBlockAdapter(nn.Module):
         # emits "parameter group with duplicate parameters". The final linear is
         # reachable as self.mlp[-1]; nothing reads self.out.
         factory = {"device": device, "dtype": dtype}
-        self.mlp = nn.Sequential(
+        # `nn.Sequential` typed explicitly: without this annotation every
+        # `adapter.mlp[j]` / `for linear in adapter.mlp` site resolves through
+        # `Module.__getattr__` (typed `-> Tensor` in the torch stubs), which
+        # makes the sequence look non-iterable and non-indexable.
+        self.mlp: nn.Sequential = nn.Sequential(
             nn.Linear(cond_dim, 4 * cond_dim, **factory),
             nn.SiLU(),
             nn.Linear(4 * cond_dim, 2 * self.n_layers * n_embd, **factory),
         )
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
+        last = self.mlp[-1]
+        assert isinstance(last, nn.Linear)
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
 
     def forward(
         self, x: torch.Tensor, sigma: torch.Tensor
@@ -144,6 +151,22 @@ def add_db_args(parser: argparse.ArgumentParser) -> None:
             "gradients, which saves backward memory but no forward FLOPs and gives "
             "no noise-range specialization. Should match the pretraining "
             "objective -- switching mid-pipeline changes what is being optimized."
+        ),
+    )
+    parser.add_argument(
+        "--db-aux-lm-weight",
+        type=float,
+        default=0.1,
+        help=(
+            "weight of the auxiliary per-block next-token loss under the EDM "
+            "objective. The EDM term score-matches the block's hidden state "
+            "against the clean embedding, so on its own it never touches "
+            "`lm_head` and an EDM checkpoint cannot generate text. This term "
+            "projects the SAME block hidden state (no extra forward, so the "
+            "B-fold activation isolation is preserved) through the shared "
+            "`lm_head` and adds a cross-entropy against the next-token target. "
+            "0 disables it (restoring the old behaviour, where lm_head is "
+            "trained only by DARD's small penalty)."
         ),
     )
     parser.add_argument(
@@ -487,16 +510,18 @@ def _layer_groups(n_layer: int, num_blocks: int) -> list[list[int]]:
 
 @dataclass(frozen=True)
 class _DenoiserOutput:
-    """What `_run_block_denoiser` returns: the prediction, plus per-block logits.
+    """What `_run_block_denoiser` returns: the prediction, the block's hidden
+    state, plus per-block logits.
 
-    A dataclass rather than a tuple or an overloaded return, because the two
-    fields have very different lifetimes and confusing them is easy: `pred` is
-    always present, while `block_logits` is populated only when DARD asked for
-    it. Spelling that as `dict[int, Tensor] | None` on a tuple return made the
-    call sites slice-index into a union.
+    A dataclass rather than a tuple or an overloaded return, because the fields
+    have very different lifetimes. `pred` is the denoiser head's embedding-space
+    prediction (zero-init at start). `h` is the block's hidden state (nonzero),
+    needed for the auxiliary per-block next-token loss. `block_logits` is
+    populated only when DARD asks for it.
     """
 
     pred: torch.Tensor
+    h: torch.Tensor
     block_logits: dict[int, torch.Tensor] | None = None
 
 
@@ -570,6 +595,12 @@ class DiffusionBlockEngine:
             ]
         )
         for head in self.denoise_heads:
+            # ModuleList yields `nn.Module`; assert before reading `.weight`
+            # so the checker narrows it to a Linear rather than inferring
+            # `Module.__getattr__ -> Tensor`.
+            assert isinstance(head, nn.Linear), (
+                "denoise head is not an nn.Linear; cannot zero-init"
+            )
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
         self.freezer = None
@@ -602,9 +633,15 @@ class DiffusionBlockEngine:
         self.distiller = None
         # The KD term from the most recent `denoise_step`, or 0.0 when no
         # distiller is installed. Exposed because the *returned* loss is a
-        # convex mix of the data and anchor terms, so from it alone there is no
-        # way to tell a working anchor from one that never fired.
+        # convex mix of the data and anchor terms, so from it alone there is
+        # no way to tell a working anchor from one that never fired.
         self.last_kd_loss = 0.0
+        # The auxiliary per-block next-token loss from the most recent
+        # `denoise_step`, or 0.0 when `aux_lm_weight` is 0. Exposed for
+        # the same reason as `last_kd_loss`: the returned loss mixes the
+        # EDM term and (when enabled) this CE term, so the raw value is
+        # the only observable of whether the head is actually training.
+        self.last_aux_lm_loss = 0.0
 
     @property
     def _owned(self) -> tuple[nn.Module, ...]:
@@ -626,6 +663,18 @@ class DiffusionBlockEngine:
         for owned in self._owned:
             owned.train(mode)
         return self
+
+    @property
+    def training(self) -> bool:
+        """Engine-level train mode, mirroring `nn.Module.training`.
+
+        All mode flips flow through `train()`, which applies to every
+        owned subtree at once, so the trunk's flag is the engine's
+        flag. Consumers that snapshot/restore mode around a pass
+        (`export_lcqat_checkpoint`'s eval flip) need this attribute
+        to treat the engine like a module.
+        """
+        return bool(self.model.training)
 
     # aislop-ignore-next-line security/eval -- standard PyTorch nn.Module eval method
     def eval(self) -> "DiffusionBlockEngine":
@@ -748,6 +797,9 @@ class DiffusionBlockEngine:
             # not a subclass).
             if is_lcqat_layer(head):
                 continue
+            assert isinstance(head, nn.Linear), (
+                "denoise head is not an nn.Linear; retrofit cannot wrap it"
+            )
             self.denoise_heads[i] = _retrofit_plain_linear(
                 head,
                 layer_config,
@@ -758,6 +810,11 @@ class DiffusionBlockEngine:
             )
             created += 1
         for i, adapter in enumerate(self.adapters):
+            # ModuleList yields `nn.Module`; narrow so `adapter.mlp` reads
+            # as a typed sequence instead of through `Module.__getattr__`.
+            assert isinstance(adapter, NoiseConditionedBlockAdapter), (
+                "engine adapter is not a NoiseConditionedBlockAdapter"
+            )
             for j, linear in enumerate(adapter.mlp):
                 # `is_lcqat_layer` rather than `not isinstance(LCQATLinear)`:
                 # after a SparseProp wrap the layer is a
@@ -809,6 +866,11 @@ class DiffusionBlockEngine:
             with_lcqat=with_lcqat,
         )
         for head in self.denoise_heads:
+            # ModuleList yields `nn.Module`; assert before passing to a
+            # function that expects `Linear` (the checker narrows on it).
+            assert isinstance(head, nn.Linear), (
+                "denoise head is not an nn.Linear; sparseprop cannot wrap it"
+            )
             _wrap_sparseprop(head, sparsity, with_lcqat, in_place=True)
         # Engine-owned layers are converted IN PLACE (class swap + buffer
         # adoption), never by substituting a new module. `apply_lcqat` put an
@@ -817,6 +879,9 @@ class DiffusionBlockEngine:
         # codebook parameter twice -- which AdamW rejects and which silently
         # doubled the codebook count before `verify_partition` existed.
         for adapter in self.adapters:
+            assert isinstance(adapter, NoiseConditionedBlockAdapter), (
+                "engine adapter is not a NoiseConditionedBlockAdapter"
+            )
             for linear in adapter.mlp:
                 if isinstance(linear, SparsePropLinear):
                     continue
@@ -946,7 +1011,7 @@ class DiffusionBlockEngine:
         memo: set | None = None,
         prefix: str = "",
         remove_duplicate: bool = True,
-    ):
+    ) -> typing.Iterator[tuple[str, nn.Module]]:
         """Yield `(name, module)` for model + adapters + denoise heads.
 
         The name-addressable sibling of `modules()`, and the one export needs:
@@ -979,11 +1044,13 @@ class DiffusionBlockEngine:
         ):
             yield name, module
 
-    def get_submodule(self, target: str):
+    def get_submodule(self, target: str) -> "nn.Module | DiffusionBlockEngine":
         """Resolve a dotted name from `named_modules()` back to a module.
 
         `nn.Module` spelling, including `""` returning the engine itself and a
         bare `db_adapters` / `db_denoise_heads` returning the whole subtree.
+        The `""` arm is the one case whose result is the engine rather
+        than an `nn.Module`, which is why the return type is the union.
         Raises `AttributeError` for an unknown path rather than returning None,
         so a bad lookup is loud instead of looking like "this layer has no
         activation quantizer".
@@ -1267,7 +1334,7 @@ class DiffusionBlockEngine:
         # duck-typed helper keeps a plain `nn.Linear` head working unchanged.
         pred = maybe_sigma_call(self.denoise_heads[block_idx], h, sigma_b)
         return _DenoiserOutput(
-            pred=pred, block_logits=block_logits if collect_block_logits else None
+            pred=pred, h=h, block_logits=block_logits if collect_block_logits else None
         )
 
     @staticmethod
@@ -1298,6 +1365,8 @@ class DiffusionBlockEngine:
         attn_mask: torch.Tensor | None = None,
         clean: torch.Tensor | None = None,
         backend: str | None = None,
+        aux_lm_weight: float = 0.0,
+        targets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """EDM score-matching step for one block (the real DiffusionBlocks path).
 
@@ -1409,6 +1478,34 @@ class DiffusionBlockEngine:
             float(w),
             backend=self.denoise_backend if backend is None else backend,
         )
+        # Auxiliary per-block next-token loss (EDM only). The EDM term
+        # score-matches the block's hidden state against the clean
+        # embedding, so it never touches `lm_head`: left alone, the
+        # head is trained only by DARD's small penalty (when DARD is
+        # on) and otherwise stays at its random init, and an
+        # EDM-trained checkpoint cannot generate text. This term keeps
+        # the B-fold forward isolation DiffusionBlocks exists for --
+        # it reuses the block's already-computed hidden state, it does
+        # NOT run the full model -- and projects that state through the
+        # shared `lm_head` to predict the next token. `h` covers the
+        # `[clean | noisy]` 2T sequence; the suffix is the
+        # noisy half the block actually conditioned on, so the head
+        # predicts `targets` from it. Weighted by `aux_lm_weight`
+        # against the EDM term (0 disables it, restoring the old
+        # behaviour byte for byte).
+        if aux_lm_weight > 0.0 and targets is not None:
+            aux_logits = self.model.lm_head(denoiser_out.h[:, t:, :])
+            aux_logits = aux_logits[..., : self.model.config.vocab_size]
+            aux_logits = aux_logits.float()
+            aux_loss = F.cross_entropy(
+                aux_logits.reshape(-1, aux_logits.size(-1)),
+                targets.reshape(-1),
+                ignore_index=-1,
+            )
+            loss = loss + aux_lm_weight * aux_loss
+            self.last_aux_lm_loss = float(aux_loss.detach())
+        else:
+            self.last_aux_lm_loss = 0.0
         # Reset first: a stale value from a previous call must not survive into
         # a step that ran without a distiller.
         self.last_kd_loss = 0.0

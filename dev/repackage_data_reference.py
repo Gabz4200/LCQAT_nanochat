@@ -28,11 +28,12 @@ dependency - pip install it ad hoc if you actually want to run this.)
 
 import os
 import time
-
-import pyarrow as pa
-import pyarrow.parquet as pq
+from typing import Any, cast
 
 # reference script only: `datasets` is intentionally not a project dependency
+import datasets  # pyrefly: ignore[missing-import]
+import pyarrow as pa
+import pyarrow.parquet as pq
 from datasets import load_dataset  # pyrefly: ignore[missing-import]
 
 # You can change these:
@@ -41,11 +42,11 @@ upload_to_hf = True
 
 # Dataset configurations:
 if dataset_tag == "fineweb_edu":
-    dataset_kwargs = {
-        "path": "HuggingFaceFW/fineweb-edu",
-        "split": "train",
-        "name": "sample-100BT",  # ~100B GPT-2 tokens at ~3 chars/token => ~300B chars total
-    }
+    dataset_path = "HuggingFaceFW/fineweb-edu"
+    dataset_split = "train"
+    dataset_name = (
+        "sample-100BT"  # ~100B GPT-2 tokens at ~3 chars/token => ~300B chars total
+    )
     output_dirname = "fineweb_edu"
     data_column_name = "text"
     tokenizer = None
@@ -54,10 +55,9 @@ if dataset_tag == "fineweb_edu":
 elif dataset_tag == "climbmix":
     import tiktoken  # the ClimbMix data is stored tokenized with GPT-2 tokenizer
 
-    dataset_kwargs = {
-        "path": "nvidia/Nemotron-ClimbMix",
-        "split": "train",
-    }
+    dataset_path = "nvidia/Nemotron-ClimbMix"
+    dataset_split = "train"
+    dataset_name = None
     output_dirname = "climbmix"
     data_column_name = "tokens"
     tokenizer = tiktoken.encoding_for_model("gpt-2")
@@ -67,10 +67,12 @@ else:
     raise ValueError(f"Unknown dataset tag: {dataset_tag}")
 
 # Source dataset
-ds = load_dataset(**dataset_kwargs)
+# `split` is always given, so load_dataset returns a single Dataset (not a DatasetDict)
+ds = load_dataset(dataset_path, name=dataset_name, split=dataset_split)
 
 # Shuffle to scramble the order
 ds = ds.shuffle(seed=42)
+assert isinstance(ds, datasets.Dataset)
 ndocs = len(ds)  # total number of documents to process
 print(f"Total number of documents: {ndocs}")
 
@@ -88,7 +90,7 @@ total_docs_processed = 0
 total_time_spent = 0
 t0 = time.time()
 for doc in ds:
-    data = doc[data_column_name]
+    data = cast(dict[str, Any], doc)[data_column_name]
     text = tokenizer.decode(data) if tokenizer is not None else data
     shard_docs.append(text)
     shard_characters += len(text)

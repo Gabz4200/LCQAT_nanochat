@@ -76,7 +76,9 @@ def grad_retained_fraction(
         grad = grads.get(name)
         if grad is not None:
             retained += grad.detach().double().square().sum()
-        expected += reference[name].detach().double().square().sum()
+        ref = reference[name]
+        assert ref is not None  # `live` holds only names with a reference grad
+        expected += ref.detach().double().square().sum()
     if float(expected) <= 0.0:
         return 0.0
     return float((retained / expected).sqrt())

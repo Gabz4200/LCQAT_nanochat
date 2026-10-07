@@ -59,7 +59,7 @@ def nearest_depth(target: float = 7.5e9) -> int:
     return min(range(10, 61), key=lambda d: abs(param_count(d) - target))
 
 
-def weight_bytes(model: GPT) -> tuple[int, int]:
+def weight_bytes(model: GPT) -> tuple[float, int]:
     """(packed_matrix_bytes, bf16_embedding_and_scalar_bytes)."""
     packed = bf16 = 0
     for name, p in model.named_parameters():
@@ -130,7 +130,7 @@ def measure_kv_rss() -> tuple[int, int]:
     return predicted, max(rss() - before, 0)
 
 
-def gb(n: int) -> str:
+def gb(n: float) -> str:
     return f"{n / 1e9:.3f} GB"
 
 

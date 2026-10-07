@@ -136,9 +136,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     gpu_buffer = torch.empty(
         2 * B * T, dtype=torch.long, device=device
     )  # on-device buffer
-    cpu_inputs = cpu_buffer[: B * T].view(
-        B, T
-    )  # a few views into these buffers just for convenience
+    cpu_inputs = cpu_buffer[: B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T :].view(B, T)
     inputs = gpu_buffer[: B * T].view(B, T)
     targets = gpu_buffer[B * T :].view(B, T)

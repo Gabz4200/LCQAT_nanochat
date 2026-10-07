@@ -19,7 +19,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+import torch.nn as nn
 
+from nanochat.models.io import ModuleTree as _ModuleTree
 from nanochat.models.quant.sparseprop import (
     DEFAULT_DENSE_THRESHOLD,
     PRUNE_SCOPES,
@@ -128,7 +130,10 @@ class GradualPruningSchedule:
         return min(self.target_sparsity, initial + events * delta)
 
     def apply(
-        self, root: object, step: int, layers: list[SparsePropLinear] | None = None
+        self,
+        root: nn.Module | _ModuleTree,
+        step: int,
+        layers: list[SparsePropLinear] | None = None,
     ) -> float | None:
         """Prune `root`'s sparse layers to the `step` target. Returns achieved sparsity.
 
@@ -177,7 +182,9 @@ class GradualPruningSchedule:
             achieved = 1.0 - nnz / total if total else 0.0
         return achieved
 
-    def layers_above_threshold(self, root: object) -> list[SparsePropLinear]:
+    def layers_above_threshold(
+        self, root: nn.Module | _ModuleTree
+    ) -> list[SparsePropLinear]:
         """Sparse layers that have crossed into the sparse-kernel regime."""
         return [
             m
@@ -187,12 +194,12 @@ class GradualPruningSchedule:
         ]
 
 
-def collect(root: object) -> list[SparsePropLinear]:
+def collect(root: nn.Module | _ModuleTree) -> list[SparsePropLinear]:
     """Every SparsePropLinear under `root`, in module-tree order.
 
-    `root` may be an `nn.Module` or a `DiffusionBlockEngine`; the engine is not
-    an `nn.Module` (it owns three of them) but exposes the same `modules()`
-    view, so both walk identically here.
+    `root` may be an `nn.Module` or a `DiffusionBlockEngine`; the engine is
+    not an `nn.Module` (it owns three of them) but exposes the same
+    `modules()` view, so both walk identically here (see `_ModuleTree`).
     """
     return [m for m in root.modules() if isinstance(m, SparsePropLinear)]
 

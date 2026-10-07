@@ -253,7 +253,10 @@ class QuantizedLinear(nn.Module):
     def forward(self, x: torch.Tensor):
         quantized_weight = self._correct(self.weight, self.quantize_weight)
         quantized_bias = None
-        if self.bias is not None and self.quantize_bias_enabled:
+        # `quantize_bias` is built only when the module has a
+        # bias to quantize, so the two guards are the same
+        # condition; state it once and narrow the lookup.
+        if self.bias is not None and self.quantize_bias is not None:
             quantized_bias = self._correct(self.bias, self.quantize_bias)
         # Perform linear transformation with quantized weights and biases
         return F.linear(x, quantized_weight, quantized_bias)

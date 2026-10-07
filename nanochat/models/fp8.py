@@ -154,7 +154,10 @@ class _Float8Matmul(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, *grad_outputs):
+        # `Function.backward` is `*grad_outputs`; this op
+        # has a single output, so the grad arrives alone.
+        (grad_output,) = grad_outputs
         in_fp8, in_inv, w_fp8, w_inv = ctx.saved_tensors
 
         go_fp8, go_inv = _to_fp8(grad_output, torch.float8_e5m2)

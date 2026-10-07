@@ -138,8 +138,9 @@ It passes `--db-blocks=2` instead of the default 4. On a toy depth the per-block
 **CPU-specific code:**
 
 | Area | Where | Note |
-|---|---|---|
-| Fused AdamW | `nanochat/training/optim.py`, `cpu_adamw_for` | `fused=True`. Non-fused AdamW walks the parameter list in Python, a real cost at this size |
+||---|---|---|
+|| SGD_MinExpLstm_Optimizer | `nanochat/training/minexp_lstm.py` | Default optimizer (`--optimizer minexplstm`): elementwise SGDMinExpLSTMCellFiLM4D predicts FiLM gain/shift on top of SGD, lambda-coupled dual-EMA horizons, INT8 fast/slow/hidden states (3 bytes/param), joint online co-training via `meta_step` (AdamW over the cell). `--optimizer adamw` keeps the baseline |
+|| Fused AdamW | `nanochat/training/optim.py`, `cpu_adamw_for` | `fused=True`. Non-fused AdamW walks the parameter list in Python, a real cost at this size |
 | Thread pools | `configure_cpu_training(num_threads)` | Sets intra- and inter-op pools; the inter-op pool is the one people forget |
 | ISA dispatch | `ops/native/cpu/gemv.cpp` | AVX-512 / AVX2 / scalar chosen at runtime via cpuid, so the extension builds and runs without AVX-512 |
 | Storage-bound kernels | `ops/native/cpu/index_linear.cpp`, `quant_attn.cpp` | Deliberately `-O3` scalar. Both read packed indices in place with no materialized fp32 matrix, so LUT gathers and memory set the pace, not FMA throughput |

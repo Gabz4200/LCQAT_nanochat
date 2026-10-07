@@ -14,6 +14,7 @@ The whole thing is made as efficient as possible.
 import ast
 import operator
 import signal
+import typing
 import warnings
 from collections import deque
 from contextlib import contextmanager
@@ -27,14 +28,18 @@ from nanochat.utils.common import COMPUTE_DTYPE
 # Restricted expression evaluator for the calculator tool: parses the formula
 # as an AST and only executes whitelisted nodes, so model-generated formulas can
 # never reach arbitrary code execution (replaces a direct eval() call).
-_SAFE_BINOPS = {
+# Typed as `Callable[..., typing.Any]`: `operator.add`'s own stub is a
+# parameterised overload (`SupportsAdd`), which makes the dict's value type
+# too narrow to index by `type[node.op]`. The evaluator only needs a
+# callable; the whitelist itself is what provides the safety.
+_SAFE_BINOPS: dict[type[ast.operator], typing.Callable[..., typing.Any]] = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
     ast.Div: operator.truediv,
     ast.FloorDiv: operator.floordiv,
 }
-_SAFE_UNARYOPS = {
+_SAFE_UNARYOPS: dict[type[ast.unaryop], typing.Callable[..., typing.Any]] = {
     ast.USub: operator.neg,
     ast.UAdd: operator.pos,
 }
@@ -197,26 +202,27 @@ class KVCache:
         self.prev_embedding = None
 
     def reset(self):
-        """Reset cache to empty state."""
         self.cache_seqlens.zero_()
         self.prev_embedding = None
 
     def get_pos(self):
-        """Get current position (assumes all batch elements at same position)."""
         return self.cache_seqlens[0].item()
 
     def get_layer_cache(self, layer_idx):
-        """Return (k_cache, v_cache) views for a specific layer."""
         return self.k_cache[layer_idx], self.v_cache[layer_idx]
 
     def advance(self, num_tokens):
-        """Advance the cache position by num_tokens."""
         self.cache_seqlens += num_tokens
 
-    def prefill(self, other):
+    def prefill(self, other: "KVCache | QuantizedKVCache"):
         """
         Copy cached KV from another cache into this one.
         Used when we do batch=1 prefill and then want to generate multiple samples in parallel.
+
+        `other` may be either cache type: the engine builds the prefill cache
+        from `make_cache(quantized_kv=...)` and the decode cache from the same
+        call, so both are whatever the model was built with. The copy branches
+        on the storage layout rather than assuming dense k_cache/v_cache.
         """
         assert self.get_pos() == 0, "Cannot prefill a non-empty KV cache"
         assert (
@@ -225,9 +231,28 @@ class KVCache:
             and self.head_dim == other.head_dim
         )
         assert self.max_seq_len >= other.max_seq_len
+        # Branch on `self`'s layout: `self.k_idx` only exists on a
+        # `QuantizedKVCache`, and `other` is typed as the union so it
+        # cannot be indexed either way. The engine always pairs a prefill
+        # cache with a decode cache of the same type, so a mismatch is a
+        # programming error, not a runtime branch.
+        assert isinstance(other, type(self)), (
+            "prefill source and destination KV caches must be the same type"
+        )
         other_pos = other.get_pos()
-        self.k_cache[:, :, :other_pos, :, :] = other.k_cache[:, :, :other_pos, :, :]
-        self.v_cache[:, :, :other_pos, :, :] = other.v_cache[:, :, :other_pos, :, :]
+        # `other` is typed as the union, so neither branch can index it
+        # directly; read through `getattr` and write through `self`'s own
+        # buffers, which the subclass narrows.
+        if isinstance(self, QuantizedKVCache):
+            self.k_idx[:, :, :other_pos] = getattr(other, "k_idx")[:, :, :other_pos]
+            self.v_idx[:, :, :other_pos] = getattr(other, "v_idx")[:, :, :other_pos]
+        else:
+            self.k_cache[:, :, :other_pos, :, :] = getattr(other, "k_cache")[
+                :, :, :other_pos, :, :
+            ]
+            self.v_cache[:, :, :other_pos, :, :] = getattr(other, "v_cache")[
+                :, :, :other_pos, :, :
+            ]
         self.cache_seqlens.fill_(other_pos)
         # Copy smear state: expand batch=1 prev_embedding to num_samples
         if other.prev_embedding is not None:
@@ -315,16 +340,13 @@ class QuantizedKVCache:
         return indices
 
     def reset(self):
-        """Reset cache to empty state."""
         self.cache_seqlens.zero_()
         self.prev_embedding = None
 
     def get_pos(self):
-        """Get current position (assumes all batch elements at same position)."""
         return self.cache_seqlens[0].item()
 
     def advance(self, num_tokens):
-        """Advance the cache position by num_tokens."""
         self.cache_seqlens += num_tokens
 
     def write(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor):
@@ -381,7 +403,7 @@ class QuantizedKVCache:
             out.append(codebooks[layer_idx][heads, indices.long()])
         return out[0], out[1]
 
-    def prefill(self, other: "QuantizedKVCache"):
+    def prefill(self, other: "KVCache | QuantizedKVCache"):
         """Copy packed KV from another cache (batch=1 prefill -> N parallel rows)."""
         assert self.get_pos() == 0, "Cannot prefill a non-empty KV cache"
         assert (
@@ -390,9 +412,11 @@ class QuantizedKVCache:
             and self.head_dim == other.head_dim
         )
         assert self.max_seq_len >= other.max_seq_len
+        # `other` is typed as the union, so read its packed buffers through
+        # `getattr` rather than attribute access.
         other_pos = other.get_pos()
-        self.k_idx[:, :, :other_pos] = other.k_idx[:, :, :other_pos]
-        self.v_idx[:, :, :other_pos] = other.v_idx[:, :, :other_pos]
+        self.k_idx[:, :, :other_pos] = getattr(other, "k_idx")[:, :, :other_pos]
+        self.v_idx[:, :, :other_pos] = getattr(other, "v_idx")[:, :, :other_pos]
         self.cache_seqlens.fill_(other_pos)
         if other.prev_embedding is not None:
             self.prev_embedding = other.prev_embedding.expand(
@@ -408,13 +432,24 @@ def kv_codebooks_from_model(model) -> tuple[torch.Tensor, torch.Tensor]:
     PRD 7.1 storage layout is per (layer, head), so the module codebook is
     repeated across that layer's KV heads. Returns fp32 [n_layers, n_kv_head, K].
     """
-    k_list, v_list, n_kv_head = [], [], None
+    k_list: list[torch.Tensor] = []
+    v_list: list[torch.Tensor] = []
+    n_kv_head: int | None = None
     for block in model.transformer.h:
         n_kv_head = block.attn.n_kv_head
-        k_list.append(block.attn.c_k.out_quantizer.get_codebook())
-        v_list.append(block.attn.c_v.out_quantizer.get_codebook())
+        # `out_quantizer` is Optional on the layer: assert before reading
+        # rather than `getattr`, because a projection without one has no
+        # codebook to export and the artifact would silently be wrong.
+        k_quantizer = getattr(block.attn.c_k, "out_quantizer", None)
+        v_quantizer = getattr(block.attn.c_v, "out_quantizer", None)
+        assert k_quantizer is not None and v_quantizer is not None, (
+            "c_k/c_v must have out_quantizers to export KV codebooks"
+        )
+        k_list.append(k_quantizer.get_codebook())
+        v_list.append(v_quantizer.get_codebook())
+    assert n_kv_head is not None, "model has no transformer blocks"
 
-    def per_head(lst):
+    def per_head(lst: list[torch.Tensor]) -> torch.Tensor:
         return (
             torch.stack(lst, dim=0)[:, None, :].expand(-1, n_kv_head, -1).contiguous()
         )
@@ -442,7 +477,6 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
 
 
 class RowState:
-    # Per-row state tracking during generation
     def __init__(self, current_tokens=None):
         self.current_tokens = (
             current_tokens or []

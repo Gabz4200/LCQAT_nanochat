@@ -76,7 +76,7 @@ def test_the_channel_center_flag_decides_per_channel_tables(
 ) -> None:
     args = _args(**{k: v for k, v in kwargs.items() if k != "__delete__"})
     if "__delete__" in kwargs:
-        del args.lcqat_channel_center
+        delattr(args, "lcqat_channel_center")
     assert lcqat_config_from_args(args).per_channel_weight is expected
 
 
@@ -97,6 +97,9 @@ def test_when_flag_set_then_retrofitted_model_really_gets_per_channel_tables() -
         "one config"
     )
     for module in per_channel:
+        assert isinstance(
+            module.per_channel_weight_quantizer, PerChannelValueCenteredQuantizer
+        )
         assert module.per_channel_weight_quantizer.num_channels == module.out_features
         # The shared table is retained on purpose (K_weight, the optimizer
         # partition and the export planner all still read it), so its presence
@@ -151,6 +154,7 @@ def test_when_per_channel_layer_forwards_then_uses_the_per_channel_table() -> No
     cfg = lcqat_config_from_args(_args(lcqat_channel_center=True))
     model = retrofit_model(build_active_tiny_gpt(), cfg)
     module = _lcqat_linears(model)[0]
+    assert module.per_channel_weight_quantizer is not None
     module.per_channel_weight_quantizer.init_from_tensor(module.weight)
     module.per_channel_weight_quantizer.train()
 
@@ -184,6 +188,7 @@ def test_when_per_channel_layer_backprops_then_per_channel_table_gets_grads() ->
     # value buckets to the anchor, the anchor is the only gathered level, and
     # the table receives exactly zero gradient (handoff §9.8: silent and
     # permanent).
+    assert module.per_channel_weight_quantizer is not None
     module.per_channel_weight_quantizer.init_from_tensor(module.weight)
     module.per_channel_weight_quantizer.train()
 

@@ -32,12 +32,16 @@ have two different output spaces:
 
 from __future__ import annotations
 
+import collections.abc
+
 import torch
 import torch.nn.functional as F
 
 
 @torch.no_grad()
-def _frozen_teacher_forward(teacher, forward_fn: "callable"):
+def _frozen_teacher_forward(
+    teacher, forward_fn: collections.abc.Callable[[], torch.Tensor]
+):
     """Run `forward_fn` against a frozen teacher and return an FP32 detached result.
 
     Single arbiter for "how the teacher is run": under `no_grad`, in eval mode,
@@ -206,7 +210,7 @@ class DenoiserDistiller:
     def __call__(
         self,
         student_pred: torch.Tensor,
-        teacher_pred_fn: "callable",
+        teacher_pred_fn: collections.abc.Callable[[], torch.Tensor],
         weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute the denoiser KD term for one micro-step.

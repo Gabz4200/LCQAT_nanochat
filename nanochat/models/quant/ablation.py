@@ -1,5 +1,3 @@
-# todo: Split into many different files because this file is too big.
-
 """
 Quantization-range ablation primitives: symmetric falloff windows and learnable
 grid positions.
@@ -541,7 +539,7 @@ def _piecewise_linear_lookup(
         return torch.empty(x.shape, dtype=ys.dtype, device=ys.device)
 
     if xs32.numel() == 1:
-        return torch.full_like(x, ys32[0], dtype=ys32.dtype).to(ys.dtype)
+        return torch.full_like(x, ys32[0].item(), dtype=ys32.dtype).to(ys.dtype)
 
     # First index with xs[idx] >= x.
     idx = torch.searchsorted(xs32, x_flat)

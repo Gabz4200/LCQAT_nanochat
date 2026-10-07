@@ -34,7 +34,6 @@ def sparse_setup():
 
     weight = torch.randn(M, K, dtype=torch.float32, requires_grad=True)
     mask = torch.rand(M, K) < 0.5
-    # Ensure at least 1 nnz per row
     for i in range(M):
         if not mask[i].any():
             mask[i, 0] = True
@@ -44,7 +43,6 @@ def sparse_setup():
 
     w_ptr, w_col, w_ptr_csc, w_row = build_csr_csc_from_mask(mask)
 
-    # Gather nnz values from dense weight in CSR and CSC order
     w_val = gather_values_from_dense(weight, w_col, w_ptr, M)
     w_val_csc = _gather_csc_values(weight, w_row, w_ptr_csc)
     x_t = x.t().contiguous()  # [K, B]

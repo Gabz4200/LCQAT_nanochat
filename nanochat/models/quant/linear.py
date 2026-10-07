@@ -8,6 +8,10 @@ path: quantized input activations x quantized weights, optionally quantizing
 the output as well (Q/K/V projections and MLP c_fc, per PRD training spec).
 """
 
+from __future__ import annotations
+
+import typing
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,7 +67,8 @@ class _CodebookSTE(torch.autograd.Function):
         return codebook[indices].reshape(x.shape), indices
 
     @staticmethod
-    def backward(ctx, grad_out, grad_indices):
+    def backward(ctx, *grad_outputs: typing.Any) -> typing.Any:
+        grad_out = grad_outputs[0]
         codebook, indices = ctx.saved_tensors
         # STE identity: the forward value is C[Q], a step function, so the
         # gradient w.r.t. the continuous input passes through unattenuated.
@@ -83,7 +88,7 @@ class _CodebookSTE(torch.autograd.Function):
 
 
 def quantize_with_ste(
-    quantizer: MemoryEfficientLearnedCodebook,
+    quantizer: MemoryEfficientLearnedCodebook | SigmaModulatedCodebook,
     x: torch.Tensor,
     numel: int,
     grad_scale: str,
@@ -101,6 +106,13 @@ def quantize_with_ste(
     """
     if grad_scale != GRAD_SCALE_INV_SQRT_N:
         return quantizer(x)
+    # `get_codebook` is only on the plain codebook: a sigma-modulated
+    # wrapper exposes `get_codebooks` (per-sigma) and `bucketize`, not a
+    # single table. The inv_sqrt_n path needs the single table for the
+    # STE, so a conditioned codebook here is a caller error.
+    assert isinstance(quantizer, MemoryEfficientLearnedCodebook), (
+        "inv_sqrt_n grad_scale needs a plain (non-sigma) codebook"
+    )
     codebook = quantizer.get_codebook()
     value, indices = _CodebookSTE.apply(x.to(torch.float32), codebook, numel)
     return QuantizedOutput(
@@ -131,12 +143,26 @@ def lcqat_layer_types() -> tuple[type, ...]:
     return (LCQATLinear, SparsePropLinearLCQAT)
 
 
-def is_lcqat_layer(module: nn.Module) -> bool:
+if typing.TYPE_CHECKING:
+    from nanochat.models.quant.sigma_codebook import SigmaModulatedCodebook
+    from nanochat.models.quant.sparseprop import SparsePropLinearLCQAT
+
+
+def is_lcqat_layer(
+    module: nn.Module,
+) -> typing.TypeGuard["LCQATLinear | SparsePropLinearLCQAT"]:
     """Whether `module` is an LC-QAT layer. See `lcqat_layer_types` for why.
 
     Used by `retrofit_summary`, `prepare_lcqat_before_load`, `strip_lcqat` and
     the export walk, all of which previously asked `isinstance` and so skipped
     every sparse LC-QAT layer.
+
+    A TypeGuard (not bool) so the checker narrows a walked module to a
+    layer with real quantizer attributes instead of `Module.__getattr__`
+    (typed `-> Tensor` in the torch stubs, which blinds every
+    `module.weight_quantizer...` consumer). The sparse member is named
+    under TYPE_CHECKING only: sparseprop imports this module at runtime,
+    so a runtime import here would be circular.
     """
     return isinstance(module, lcqat_layer_types())
 
@@ -207,6 +233,28 @@ class LCQATLinear(Linear):
     Q/K/V final projections; the MLP c_fc output quantizer is the input side of
     the fused activation LUT, PRD 6).
     """
+
+    # Buffers installed by export (`export_lcqat_checkpoint`) and the
+    # activation-LUT wiring, read by the fused inference path. Declared so
+    # the checker sees tensors instead of `Module.__getattr__`; they hold
+    # no value until export registers them, and every reader guards on
+    # `named_buffers()` first.
+    packed_weight_indices: torch.Tensor
+    weight_index_format: torch.Tensor
+    activation_lut: torch.Tensor
+    # Active only once the packed buffers exist; the Literal matches the
+    # dispatcher's `backend` contract exactly.
+    matmul_backend: typing.Literal["cpu", "gpu", "naive"]
+    # Quantizers are assigned in `__init__` from `_make_codebook`, which
+    # returns a `MemoryEfficientLearnedCodebook` or (when sigma-conditioned)
+    # a `SigmaModulatedCodebook`. Typed as the union: a layer that never
+    # takes the sigma path has the plain type, and assigning a
+    # `SigmaModulatedCodebook` to a `MemoryEfficientLearnedCodebook`
+    # attribute would otherwise be a bad-assignment error in every wiring
+    # test that swaps the codebook in place.
+    act_quantizer: MemoryEfficientLearnedCodebook | SigmaModulatedCodebook
+    weight_quantizer: MemoryEfficientLearnedCodebook
+    out_quantizer: MemoryEfficientLearnedCodebook | None
 
     def __init__(
         self,
@@ -354,11 +402,21 @@ class LCQATLinear(Linear):
         # export/load has installed packed_weight_indices buffers).
         self.matmul_backend = "cpu"
 
-    def _quantize(self, quantizer: MemoryEfficientLearnedCodebook, x, numel: int):
+    def _quantize(
+        self,
+        quantizer: MemoryEfficientLearnedCodebook | SigmaModulatedCodebook,
+        x,
+        numel: int,
+    ):
         """Quantize `x` through `quantizer`, honoring the PRD 2.4 gradient scale."""
         return quantize_with_ste(quantizer, x, numel, self.grad_scale)
 
-    def _quantize_conditioned(self, quantizer, x, sigma):
+    def _quantize_conditioned(
+        self,
+        quantizer: MemoryEfficientLearnedCodebook | SigmaModulatedCodebook,
+        x,
+        sigma,
+    ):
         """Quantize through a sigma-conditioned codebook, with PRD 2.4 scaling.
 
         `numel` is the activation count, matching the static path, so switching
@@ -393,7 +451,7 @@ class LCQATLinear(Linear):
         return self.bias_quantizer(self.bias).value.to(dtype=dtype)
 
     def forward(
-        self, x: torch.Tensor, sigma: torch.Tensor | None = None
+        self, input: torch.Tensor, sigma: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Quantize and matmul.
 
@@ -403,8 +461,8 @@ class LCQATLinear(Linear):
         codebook: a caller that believes it is training a conditioned model and
         is not would get numbers that silently mean something else.
 
-        The batch dimension of `x` is what the conditioning is resolved against,
-        so `sigma.numel() == x.shape[0]` is the contract. The weight
+        The batch dimension of `input` is what the conditioning is resolved against,
+        so `sigma.numel() == input.shape[0]` is the contract. The weight
         quantizer is never conditioned -- one weight matrix feeds every noise
         level, so conditioning it would need a separate matrix per sigma.
         """
@@ -415,9 +473,9 @@ class LCQATLinear(Linear):
                     "forward() requires the per-batch noise level. Pass "
                     "sigma=(B, 1, 1) or disable --db-sigma-codebook."
                 )
-            x_q = self._quantize_conditioned(self.act_quantizer, x, sigma)
+            x_q = self._quantize_conditioned(self.act_quantizer, input, sigma)
         else:
-            x_q = self._quantize(self.act_quantizer, x, x.numel())
+            x_q = self._quantize(self.act_quantizer, input, input.numel())
         if "packed_weight_indices" in dict(self.named_buffers()):
             if self.bias_quantizer is not None:
                 raise ValueError(
@@ -436,7 +494,7 @@ class LCQATLinear(Linear):
                     "be expressed as packed indices. Re-export without "
                     "per_channel_weight, or drop the packed buffers."
                 )
-            return self._forward_quantized(x, x_q)
+            return self._forward_quantized(input, x_q)
         if self.per_channel_weight_quantizer is not None:
             # Per-channel weights: one `[C, K]` table, gathered row-wise. No
             # `1/sqrt(N)` codebook scale here -- the per-channel table has
@@ -445,16 +503,16 @@ class LCQATLinear(Linear):
             # scale derived from the shared path would silently change how this
             # variant trains relative to the one it is being compared against.
             w_q = self.per_channel_weight_quantizer(self.weight).value
-            bias = self._dequantized_bias(x.dtype)
-            y = F.linear(x_q.value, w_q.to(dtype=x.dtype), bias)
+            bias = self._dequantized_bias(input.dtype)
+            y = F.linear(x_q.value, w_q.to(dtype=input.dtype), bias)
             if self.out_quantizer is not None:
                 y = self._quantize(self.out_quantizer, y, y.numel()).value
             return y
         # Fixed N: one weight matrix feeds one codebook, so the scale is constant
         # across steps (unlike the activation path, whose N varies per batch).
         w_q = self._quantize(self.weight_quantizer, self.weight, self.weight.numel())
-        bias = self._dequantized_bias(x.dtype)
-        y = F.linear(x_q.value, w_q.value.to(dtype=x.dtype), bias)
+        bias = self._dequantized_bias(input.dtype)
+        y = F.linear(x_q.value, w_q.value.to(dtype=input.dtype), bias)
         if self.out_quantizer is not None:
             y = self._quantize(self.out_quantizer, y, y.numel()).value
         return y
@@ -527,10 +585,23 @@ class LCQATLinear(Linear):
                 )
 
         leading = x.shape[:-1]
-        if getattr(getattr(self, "act_quantizer", None), "needs_sigma", False):
-            x_q = self.act_quantizer(x, sigma=sigma)  # type: ignore[call-arg]
-        else:
-            x_q = self.act_quantizer(x)
+        # Narrow the quantizers to the plain codebook type: the attributes are
+        # typed as the union (plain or sigma-modulated), and the fused chain
+        # reads their codebooks directly. A sigma-conditioned layer would
+        # need a per-sigma table the chain cannot express, so the guard
+        # above (needs_sigma) already rejects it; the isinstance checks
+        # here narrow the locals so the checker sees the plain type.
+        self_act_cb = self.act_quantizer
+        assert isinstance(self_act_cb, MemoryEfficientLearnedCodebook), (
+            "quantized_mlp_chain cannot run a sigma-conditioned activation "
+            "codebook: the fused table is a single static LUT"
+        )
+        next_act_cb = next_linear.act_quantizer
+        assert isinstance(next_act_cb, MemoryEfficientLearnedCodebook), (
+            "quantized_mlp_chain cannot run a sigma-conditioned activation "
+            "codebook: the fused table is a single static LUT"
+        )
+        x_q = self_act_cb(x)
         y = dispatch_index_linear(
             x_q.indices.reshape(-1, self.in_features),
             x_q.codebook,
@@ -544,7 +615,7 @@ class LCQATLinear(Linear):
         z_ids = self._apply_activation_lut(y_ids)
         out = dispatch_index_linear(
             z_ids.reshape(-1, next_linear.in_features),
-            next_linear.act_quantizer.get_codebook(),
+            next_act_cb.get_codebook(),
             next_linear.packed_weight_indices,
             next_linear.weight_quantizer.get_codebook(),
             next_linear.in_features,

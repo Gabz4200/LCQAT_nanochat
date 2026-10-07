@@ -122,7 +122,7 @@ def compute_grad_accum_steps(ctx):
     if args.db_block_sampling == "micro" and grad_accum_steps > 1:
         print0(
             "WARNING: --db-block-sampling micro with gradient accumulation is LOSSY, "
-            "not just a different sampling strategy. `_apply_requires_grad` clears "
+            "not a different sampling strategy. `_apply_requires_grad` clears "
             "p.grad for parameters the active block does not own, so each micro-step "
             "erases the previous one's gradients and only the last block sampled "
             "contributes to the optimizer step. Use the default 'step' unless you "
@@ -263,10 +263,14 @@ def train_loop(ctx):
 
     grad_accum_steps = compute_grad_accum_steps(ctx)
 
+    # Assigned inside the grad-accumulation loop, which runs every
+    # iteration; initialized so the read after it is not unbound.
+    train_loss = torch.tensor(float("nan"))
+
     # Loop state (variables updated by the training loop)
     if not ctx.resuming:
         step = 0
-        val_bpb = None  # will be set if eval_every > 0
+        val_bpb = float("nan")  # real value once eval_every > 0
         min_val_bpb = float("inf")
         smooth_train_loss = 0  # EMA of training loss
         total_training_time = 0  # total wall-clock time of training
@@ -419,6 +423,11 @@ def train_loop(ctx):
         # doing anything. A run that silently mined zero rules logs 0.0 here
         # forever and its balanced loss looks perfectly healthy.
         step_dard_logged = 0.0
+        # Auxiliary per-block next-token loss (EDM): the only observable of
+        # whether `lm_head` is actually training under the EDM objective, since
+        # the EDM term itself never touches the head. 0.0 when
+        # --db-aux-lm-weight is 0.
+        step_aux_lm_logged = 0.0
 
         for micro_step in range(grad_accum_steps):
             # DARD needs a vocabulary distribution. The CE and KD branches
@@ -452,9 +461,15 @@ def train_loop(ctx):
                     attn_mask=train_attn_mask,
                     clean=clean,
                     backend=args.db_denoise_backend,
+                    aux_lm_weight=args.db_aux_lm_weight,
+                    targets=y,
                 )
                 if ctx.engine.distiller is not None:
                     step_kd_logged = step_kd_logged + float(ctx.engine.last_kd_loss)
+                if args.db_aux_lm_weight > 0:
+                    step_aux_lm_logged = step_aux_lm_logged + float(
+                        ctx.engine.last_aux_lm_loss
+                    )
                 if ctx.dard_loss_fn is not None:
                     # The denoiser's own logits, from the same lm_head
                     # projection the Euler sampler uses. Read out of the engine
@@ -544,6 +559,75 @@ def train_loop(ctx):
             ctx.scaler.update()
         else:
             ctx.optimizer.step()
+        # MinExpLSTM joint online co-training: every K optimizer
+        # steps, re-evaluate the loss on the *updated* parameters
+        # (rebuilt differentiably through the cell), backprop to the
+        # cell, and step its AdamW meta-optimizer. The closure
+        # rebuilds the loss from the updated params via
+        # functional_call, so the graph runs cell -> (gamma, delta)
+        # -> theta_new -> loss. Only the MinExpLSTM optimizer
+        # implements meta_step; AdamW baselines skip it.
+        meta_every = getattr(args, "minexp_meta_every", 50)
+        meta_lr = getattr(args, "minexp_meta_lr", 1e-3)
+        if (
+            meta_every > 0
+            and hasattr(ctx.optimizer, "meta_step")
+            and step % meta_every == 0
+            and step > 0
+        ):
+            trainable = ctx.trainable_root
+
+            import gc
+
+            gc.collect()
+
+            def _meta_closure(params):
+                # Rebuild the same objective the primary step
+                # optimized, on the updated parameters, and
+                # return a differentiable loss. functional_call
+                # reparametrizes an nn.Module tree. The DiffusionBlocks
+                # engine is NOT an nn.Module (it owns three: model,
+                # adapters, denoise_heads), so the engine is reparametrized
+                # by swapping the *model* subtree's parameters in place
+                # for this closure -- the model is where the learned
+                # optimizer's residual applies and where the meta-gradient
+                # belongs. Adapters and denoise heads (small conditioning
+                # modules) keep their current values.
+                if ctx.use_diffusion_blocks:
+                    engine = trainable
+                    model_params = {
+                        n: p for n, p in params.items() if not n.startswith("db_")
+                    }
+                    # functional_call(engine.model, model_params) returns
+                    # a stateless view; the engine's train_step reads the
+                    # real model, so we swap the model's parameters in
+                    # place, run the block objective, and restore. The
+                    # updated tensors carry the cell's graph, so the loss
+                    # backprops to the cell.
+                    saved = {n: p.data for n, p in engine.model.named_parameters()}
+                    try:
+                        for n, p in engine.model.named_parameters():
+                            if n in model_params:
+                                p.data = model_params[n]
+                        return engine.train_step(x, y)
+                    finally:
+                        for n, p in engine.model.named_parameters():
+                            if n in saved:
+                                p.data = saved[n]
+                return torch.func.functional_call(trainable, params, (x, y))
+
+            try:
+                meta_loss = ctx.optimizer.meta_step(
+                    trainable, _meta_closure, meta_lr=meta_lr
+                )
+                if step % 100 == 0:
+                    print0(f"  [minexp] meta_loss: {float(meta_loss.detach()):.6f}")
+            except (RuntimeError, TypeError) as exc:
+                # A meta step that cannot close its graph (e.g. an
+                # engine whose forward does not accept functional_call
+                # args) degrades to skipping the co-training step
+                # rather than crashing the run.
+                print0(f"  [minexp] meta_step skipped: {exc}")
         # `trainable_root`, not `model`: in DiffusionBlocks mode the optimizer
         # owns the engine, and its `db_adapters.*` / `db_denoise_heads.*` are
         # separate subtrees that `ctx.model` cannot reach. Zeroing the bare GPT
@@ -559,7 +643,7 @@ def train_loop(ctx):
         # ---------------------------------------------------------------------
 
         # logging (CPU action only)
-        ema_beta = 0.9  # EMA decay factor for some smoothing just for nicer logging
+        ema_beta = 0.9  # EMA decay factor for smoothing, for nicer logging
         smooth_train_loss = (
             ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
         )  # EMA the training loss
@@ -586,8 +670,12 @@ def train_loop(ctx):
         kd_str = f" | kd: {kd_mean:.6f}" if ctx.kd_denoiser else ""
         dard_mean = step_dard_logged / max(grad_accum_steps, 1)
         dard_str = f" | dard: {dard_mean:.6f}" if ctx.dard_loss_fn is not None else ""
+        aux_lm_mean = step_aux_lm_logged / max(grad_accum_steps, 1)
+        aux_lm_str = (
+            f" | aux_lm: {aux_lm_mean:.6f}" if args.db_aux_lm_weight > 0 else ""
+        )
         print0(
-            f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{kd_str}{dard_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time / 60:.2f}m{eta_str}"
+            f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{kd_str}{dard_str}{aux_lm_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time / 60:.2f}m{eta_str}"
         )
         if step % 100 == 0:
             log_data = {

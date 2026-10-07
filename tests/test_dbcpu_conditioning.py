@@ -121,7 +121,9 @@ def test_when_adapter_trained_then_each_layer_gets_its_own_modulation():
     torch.manual_seed(1)
     adapter = NoiseConditionedBlockAdapter(n_embd=256, cond_dim=8, n_layers=4)
     with torch.no_grad():
-        adapter.mlp[-1].weight.normal_(std=0.05)
+        last = adapter.mlp[-1]
+        assert isinstance(last, torch.nn.Linear)
+        last.weight.normal_(std=0.05)
     conds = adapter(torch.randn(2, 8, 256), torch.tensor([1.0, 1.0]))
     gammas = [g.reshape(-1) for g, _ in conds]
     for i in range(len(gammas) - 1):

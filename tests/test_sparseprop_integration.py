@@ -5,6 +5,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nanochat.models.quant.codebook import MemoryEfficientLearnedCodebook
 from nanochat.models.quant.linear import LCQATLinear
 from nanochat.models.quant.sparseprop import (
     SparsePropLinear,
@@ -122,22 +123,30 @@ class TestSparsePropLinearAutograd:
         loss_ref.backward()
 
         # grad_x should match
-        assert torch.allclose(x_sparse.grad, x_ref.grad, atol=1e-3), (
-            f"grad_x mismatch: max diff = {(x_sparse.grad - x_ref.grad).abs().max()}"
+        sparse_gx = x_sparse.grad
+        ref_gx = x_ref.grad
+        assert sparse_gx is not None
+        assert ref_gx is not None
+        assert torch.allclose(sparse_gx, ref_gx, atol=1e-3), (
+            f"grad_x mismatch: max diff = {(sparse_gx - ref_gx).abs().max()}"
         )
         # grad_w at nnz positions should match
-        assert torch.allclose(
-            sparse.weight.grad[mask], lin_ref.weight.grad[mask], atol=1e-3
-        ), (
-            f"grad_w (nnz) mismatch: max diff = {(sparse.weight.grad[mask] - lin_ref.weight.grad[mask]).abs().max()}"
+        sparse_gw = sparse.weight.grad
+        ref_gw = lin_ref.weight.grad
+        assert sparse_gw is not None
+        assert ref_gw is not None
+        assert torch.allclose(sparse_gw[mask], ref_gw[mask], atol=1e-3), (
+            f"grad_w (nnz) mismatch: max diff = {(sparse_gw[mask] - ref_gw[mask]).abs().max()}"
         )
         # grad_w at masked positions should be zero
-        assert (sparse.weight.grad[~mask] == 0).all(), (
-            "Non-zero grad at masked positions!"
-        )
+        assert (sparse_gw[~mask] == 0).all(), "Non-zero grad at masked positions!"
         # grad_bias should match
-        assert torch.allclose(sparse.bias.grad, lin_ref.bias.grad, atol=1e-5), (
-            f"grad_b mismatch: max diff = {(sparse.bias.grad - lin_ref.bias.grad).abs().max()}"
+        sparse_gb = sparse.bias.grad
+        ref_gb = lin_ref.bias.grad
+        assert sparse_gb is not None
+        assert ref_gb is not None
+        assert torch.allclose(sparse_gb, ref_gb, atol=1e-5), (
+            f"grad_b mismatch: max diff = {(sparse_gb - ref_gb).abs().max()}"
         )
 
     def test_masked_weights_stay_zero_after_step(self):
@@ -253,7 +262,6 @@ class TestDBCPUIntegration:
         loss = engine.train_step(idx, targets)
         loss.backward()
 
-        # Check gradients exist on sparse weights
         has_grad = False
         for name, p in engine.named_parameters():
             if "sparsity" not in name and p.grad is not None and p.grad.abs().sum() > 0:
@@ -330,7 +338,6 @@ class TestDBCPUIntegration:
         )
         n = engine.apply_sparseprop(sparsity=0.5)
         assert n > 1, f"Expected multiple SparsePropLinear modules, got {n}"
-        # Verify engine still functional: train_step after sparseprop
         idx = torch.randint(0, 64, (2, 8))
         targets = torch.randint(0, 64, (2, 8))
         engine.zero_grad()
@@ -367,7 +374,9 @@ class TestSparsePropLCQAT:
         if module.bias is not None:
             assert module.bias.grad is not None, "bias grads missing"
         # Codebook params (from weight_quantizer)
-        for name, p in module.weight_quantizer.named_parameters():
+        weight_quantizer = getattr(module, "weight_quantizer")
+        assert isinstance(weight_quantizer, MemoryEfficientLearnedCodebook)
+        for name, p in weight_quantizer.named_parameters():
             assert p.grad is not None, f"Codebook param {name} has no gradient"
 
     def test_lcqat_sparsity_mask_stays_fixed(self, tiny_model):
@@ -499,6 +508,8 @@ class TestSparsePropDenseGEMMPath:
         sparse_layer(x).sum().backward()
         dense_layer(x.clone()).sum().backward()
 
+        assert sparse_layer.weight.grad is not None
+        assert dense_layer.weight.grad is not None
         sparse_norm = sparse_layer.weight.grad.norm().item()
         dense_norm = dense_layer.weight.grad.norm().item()
         assert dense_norm > 0, "dense twin produced no gradient; test is vacuous"
@@ -560,7 +571,9 @@ class TestSparsePropDenseGEMMPath:
             and getattr(m, "out_quantizer", None) is not None
         )
         out = layer(torch.randn(4, 8, layer.in_features))
-        levels = layer.out_quantizer.get_codebook().reshape(-1)
+        levels = layer.out_quantizer
+        assert levels is not None
+        levels = levels.get_codebook().reshape(-1)
         # Every output value must equal some codebook level exactly.
         distances = (out.reshape(-1, 1) - levels.reshape(1, -1)).abs().min(dim=1).values
         assert torch.equal(distances, torch.zeros_like(distances)), (
@@ -715,6 +728,7 @@ class TestSparsePropLearnedActivationLUT:
         y = torch.randn(4, 8, layer.out_features)
         layer.apply_trained_activation(y).sum().backward()
         lut = layer.learnable_activation_lut
+        assert isinstance(lut, nn.Module)
         trained = [
             p
             for p in lut.parameters()

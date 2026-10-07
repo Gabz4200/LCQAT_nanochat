@@ -83,10 +83,10 @@ class HumanEval(Task):
         }
         return conversation
 
-    def evaluate(self, conversation, completion):
-        """Given (conversation, completion), return boolean success of the completion."""
+    def evaluate(self, problem, completion):
+        """Given (problem, completion), return boolean success of the completion."""
         # the prompt will contain the imports and the function signature
-        imports = extract_imports(conversation["messages"][0]["content"])
+        imports = extract_imports(problem["messages"][0]["content"])
         # the completion will usually contain the whole function
         # but not always with the needed imports, so we manually append them
         completion_code = extract_program(completion)
@@ -95,9 +95,9 @@ class HumanEval(Task):
             + "\n\n"
             + completion_code
             + "\n\n"
-            + conversation["test"]
+            + problem["test"]
             + "\n"
-            + f"check({conversation['entry_point']})"
+            + f"check({problem['entry_point']})"
         )
         result = execute_code(program)
         success = result.success

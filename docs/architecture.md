@@ -67,7 +67,14 @@ Repo-specific guardrails (always-on flags, the export contract, the CPU index po
 │   ├── training/                        # training-time machinery
 │   │   ├── diffusion_blocks.py          # DiffusionBlockEngine, EquiProbabilityPartitioner,
 │   │   │                                #   configure_cpu_training, cpu_adamw_for
-│   │   └── optim.py                     # fused AdamW (Muon removed for DiffusionBlocks)
+│   │   ├── minexp_lstm.py               # SGD_MinExpLstm_Optimizer + cell re-export
+│   │   │                                #   (joint online learned optimizer, AdamW replacement)
+│   │   ├── cell.py                      # SGDMinExpLSTMCellFiLM4D: 4D-latent FiLM cell,
+│   │   │                                #   lambda-coupled beta predictor
+│   │   ├── batched_step.py              # shape-grouped dual-EMA batched cell forward
+│   │   ├── lightning_module.py          # MinExpLSTMLightningModule + LR tuning (Tuner),
+│   │   │                                #   JointTrainableModule (PRD 5.3 manual-opt path)
+│   │   └── optim.py                     # fused AdamW (Muon removed) + MinExpLSTM re-exports
 │   ├── data/                            # ingestion boundary
 │   │   ├── dataloader.py                # tokenizing distributed data loader
 │   │   ├── dataset.py                   # download/read utils for pretraining data

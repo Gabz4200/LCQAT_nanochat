@@ -113,7 +113,7 @@ def run_generative_eval(
 # -----------------------------------------------------------------------------
 # Categorical evaluation loop
 # A lot easier because we don't have to sample. Therefore, we can actually go
-# batches at a time and just check the logits for correct answer choices.
+# batches at a time and check the logits for correct answer choices.
 
 
 def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=None):
@@ -157,10 +157,12 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
         with torch.no_grad():
             logits = model(prompt_ids)  # (B, T, V)
 
-        # Focus on the available answer on just the letters corresponding to choices
-        # Note that this helps the evaluation a lot because it specifically narrows the focus to only the available letters
-        # The much harder alternative would be to just generate from the Assistant and check if it responded with the correct
-        # letter (e.g. A, B, C, D), but evaluations typically make the task easier in this way.
+        # Focus on the available letters corresponding to choices.
+        # This helps the evaluation a lot because it specifically narrows the
+        # focus to only the available letters. The much harder alternative would
+        # be to generate from the Assistant and check if it responded with the
+        # correct letter (e.g. A, B, C, D), but evaluations typically make the
+        # task easier in this way.
         for idx, conversation in enumerate(conversations):
             # get the token ids of all the available letters of this problem
             letters = conversation["letters"]

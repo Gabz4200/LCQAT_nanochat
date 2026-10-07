@@ -10,7 +10,7 @@ cannot exploit:
 
 1. **Storage.** `keep_indices` (int32 `[nnz]`) plus a CSR `row_ptr` describe
    the layer in `nnz` values instead of `m*n`. Packing those values with the
-   K-selected format gives a physically smaller buffer, not just a different
+   K-selected format gives a physically smaller buffer, not a different
    one.
 
 2. **Alphabet compaction.** Magnitude pruning keeps the *large* weights, so a

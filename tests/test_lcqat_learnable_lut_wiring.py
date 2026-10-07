@@ -16,11 +16,38 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nanochat.models.quant.codebook import MemoryEfficientLearnedCodebook
 from nanochat.models.quant.learnable_lut import LearnableIndexLut, bake_learnable_table
 from nanochat.models.quant.linear import LCQATLinear
 
 
-def build_mlp(k_weight: int = 3, k_act: int = 15, quantize_out: bool = True):
+def _out_cb(layer: LCQATLinear) -> MemoryEfficientLearnedCodebook:
+    """Narrow `layer.out_quantizer` to the plain codebook type.
+
+    The attribute is typed as the union (plain or sigma-modulated), and the
+    bake only accepts the plain type. A sigma-conditioned layer would need a
+    per-sigma table, which the bake cannot produce -- the assert documents
+    that rather than silently baking the wrong thing.
+    """
+    cb = layer.out_quantizer
+    assert cb is not None and isinstance(cb, MemoryEfficientLearnedCodebook), (
+        "build_mlp needs a plain (non-sigma) out_quantizer"
+    )
+    return cb
+
+
+def _act_cb(layer: LCQATLinear) -> MemoryEfficientLearnedCodebook:
+    """Narrow `layer.act_quantizer` to the plain codebook type."""
+    cb = layer.act_quantizer
+    assert isinstance(cb, MemoryEfficientLearnedCodebook), (
+        "build_mlp needs a plain (non-sigma) act_quantizer"
+    )
+    return cb
+
+
+def build_mlp(
+    k_weight: int = 3, k_act: int = 15, quantize_out: bool = True
+) -> tuple[LCQATLinear, LCQATLinear]:
     """A retrofitted c_fc -> c_proj pair with the export buffers installed."""
     torch.manual_seed(11)
     c_fc = LCQATLinear.from_float(
@@ -33,10 +60,11 @@ def build_mlp(k_weight: int = 3, k_act: int = 15, quantize_out: bool = True):
     c_proj = LCQATLinear.from_float(
         nn.Linear(16, 16), K_weight=k_weight, K_act=k_act, quantize_out=False
     )
+    assert c_fc.out_quantizer is not None
     c_fc.register_buffer(
         "activation_lut",
         bake_learnable_table(
-            c_fc.out_quantizer.get_codebook(), c_proj.act_quantizer.get_codebook()
+            _out_cb(c_fc).get_codebook(), _act_cb(c_proj).get_codebook()
         ).to(torch.uint8),
     )
     # The fused chain dispatches on packed buffers, so install a trivial packed
@@ -56,13 +84,15 @@ class TestFusedChainLutParity:
     ) -> None:
         """At initialisation the fused chain must be bit-identical."""
         c_fc, c_proj = build_mlp()
+        out_cb = _out_cb(c_fc)
+        act_cb = _act_cb(c_proj)
         x = torch.randn(4, 16)
         with torch.no_grad():
             frozen = c_fc.quantized_mlp_chain(x, c_proj)
 
             learnable = LearnableIndexLut(
-                c_fc.out_quantizer.get_codebook(),
-                c_proj.act_quantizer.get_codebook(),
+                out_cb.get_codebook(),
+                act_cb.get_codebook(),
                 "relu2",
             )
             c_fc.learnable_activation_lut = learnable
@@ -73,9 +103,11 @@ class TestFusedChainLutParity:
     def test_when_the_table_is_trained_then_the_chain_changes(self) -> None:
         """The converse: if the chain ignored the table, training would be a no-op."""
         c_fc, c_proj = build_mlp()
+        out_cb = _out_cb(c_fc)
+        act_cb = _act_cb(c_proj)
         learnable = LearnableIndexLut(
-            c_fc.out_quantizer.get_codebook(),
-            c_proj.act_quantizer.get_codebook(),
+            out_cb.get_codebook(),
+            act_cb.get_codebook(),
             "relu2",
         )
         c_fc.learnable_activation_lut = learnable
@@ -109,9 +141,10 @@ class TestFusedChainLutParity:
     ) -> None:
         """Precedence, because silently preferring the buffer is the exact bug."""
         c_fc, _ = build_mlp()
+        out_cb = _out_cb(c_fc)
         learnable = LearnableIndexLut(
-            c_fc.out_quantizer.get_codebook(),
-            c_fc.out_quantizer.get_codebook(),
+            out_cb.get_codebook(),
+            out_cb.get_codebook(),
             "relu2",
         )
         c_fc.learnable_activation_lut = learnable
@@ -125,13 +158,15 @@ class TestFusedChainLutParity:
     ) -> None:
         """Out-of-range indices would silently corrupt the following matmul."""
         c_fc, c_proj = build_mlp(k_act=k_act)
+        out_cb = _out_cb(c_fc)
+        act_cb = _act_cb(c_proj)
         learnable = LearnableIndexLut(
-            c_fc.out_quantizer.get_codebook(),
-            c_proj.act_quantizer.get_codebook(),
+            out_cb.get_codebook(),
+            act_cb.get_codebook(),
             "relu2",
         )
         c_fc.learnable_activation_lut = learnable
         ids = torch.randint(0, learnable.k_in, (6, 9))
         out = c_fc._apply_activation_lut(ids)
         assert int(out.min()) >= 0
-        assert int(out.max()) < c_proj.act_quantizer.get_codebook().numel()
+        assert int(out.max()) < act_cb.get_codebook().numel()

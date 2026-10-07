@@ -17,11 +17,13 @@ uv run python -m scripts.gemv_bench
 import argparse
 import statistics
 import time
+from collections.abc import Callable
 
 import torch
 
 from nanochat.models.quant.packing import pack_weight_indices
 from nanochat.ops import dispatch_gemv, dispatch_index_linear
+from nanochat.ops.dispatch import Backend
 from nanochat.ops.kernels.gpu_loader import vulkan_available
 
 
@@ -33,7 +35,7 @@ def dequantize(act_indices, act_lut, weight_indices, scale_neg, scale_pos):
     return x, w
 
 
-def time_fn(fn, iters: int, warmup: int = 5) -> float:
+def time_fn(fn: Callable[[], object], iters: int, warmup: int = 5) -> float:
     """Median wall time per call, in milliseconds."""
     for _ in range(warmup):
         fn()
@@ -46,7 +48,9 @@ def time_fn(fn, iters: int, warmup: int = 5) -> float:
 
 
 def bench_gemv(args) -> None:
-    backends = ["naive", "cpu"] + (["gpu"] if vulkan_available() else [])
+    backends: list[Backend] = ["naive", "cpu"]
+    if vulkan_available():
+        backends.append("gpu")
     print(
         f"\n== lcqat_gemv_k3 (K=3 storage)  backends: {backends}  "
         f"iters: {args.iters} (median) =="
@@ -70,10 +74,11 @@ def bench_gemv(args) -> None:
                 "naive backend disagrees with F.linear dequant baseline"
             )
             for backend in backends:
+                # `time_fn` calls the closure synchronously within
+                # this iteration, so capturing `backend` directly is
+                # exact; a default arg would widen it to `str`.
                 ms = time_fn(
-                    lambda b=backend: dispatch_gemv(
-                        act, lut, w, s_neg, s_pos, backend=b
-                    ),
+                    lambda: dispatch_gemv(act, lut, w, s_neg, s_pos, backend=backend),
                     args.iters,
                 )
                 print(f"{m:>5} {n:>5} {backend:>8} {ms:>10.3f} {base / ms:>11.2f}x")
@@ -81,7 +86,9 @@ def bench_gemv(args) -> None:
 
 
 def bench_index_linear(args) -> None:
-    backends = ["naive", "cpu"] + (["gpu"] if vulkan_available() else [])
+    backends: list[Backend] = ["naive", "cpu"]
+    if vulkan_available():
+        backends.append("gpu")
     print(
         f"\n== lcqat_index_linear (K-selected storage, T=1 decode)  "
         f"backends: {backends}  iters: {args.iters} (median) =="
@@ -115,8 +122,9 @@ def bench_index_linear(args) -> None:
                     out, torch.nn.functional.linear(x, wd), atol=1e-5
                 ), "naive index backend disagrees with F.linear dequant baseline"
                 for backend in backends:
+                    # Same synchronous-capture note as the gemv loop above.
                     ms = time_fn(
-                        lambda b=backend, c=case: dispatch_index_linear(**c, backend=b),
+                        lambda: dispatch_index_linear(**case, backend=backend),
                         args.iters,
                     )
                     print(

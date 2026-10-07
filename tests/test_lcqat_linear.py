@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from nanochat.models.quant import LCQATLinear
+from nanochat.models.quant.codebook import MemoryEfficientLearnedCodebook
 
 
 def from_float(
@@ -98,6 +99,7 @@ def test_the_quantize_out_flag_decides_the_output_quantizer(
     if quantize_out:
         # An out-quantizer that exists but holds the wrong K would still pass an
         # existence check.
+        assert linear.out_quantizer is not None
         assert linear.out_quantizer.K == 15
 
 
@@ -107,7 +109,15 @@ def test_when_backward_then_gradients_reach_weights_inputs_and_all_codebooks() -
     linear(x).sum().backward()
     assert x.grad is not None and torch.isfinite(x.grad).all()
     assert linear.weight.grad is not None and linear.weight.grad.abs().sum() > 0
-    assert linear.act_quantizer.raw_pos_deltas.grad.abs().sum() > 0
+    # `act_quantizer` is typed as the union; narrow to the plain codebook
+    # before reading `raw_pos_deltas`, which only the unconditioned type has.
+    act_cb = linear.act_quantizer
+    assert isinstance(act_cb, MemoryEfficientLearnedCodebook)
+    assert act_cb.raw_pos_deltas.grad is not None
+    assert linear.weight_quantizer.raw_pos_deltas.grad is not None
+    assert linear.out_quantizer is not None
+    assert linear.out_quantizer.raw_pos_deltas.grad is not None
+    assert act_cb.raw_pos_deltas.grad.abs().sum() > 0
     assert linear.weight_quantizer.raw_pos_deltas.grad.abs().sum() > 0
     assert linear.out_quantizer.raw_pos_deltas.grad.abs().sum() > 0
 
@@ -138,7 +148,9 @@ def _codebook_grad_sum(grad_scale: str, seed: int = 1) -> float:
     torch.manual_seed(seed)
     x = torch.randn(8, 384)
     linear(x).pow(2).mean().backward()
-    return linear.weight_quantizer.raw_pos_deltas.grad.abs().sum().item()
+    grad = linear.weight_quantizer.raw_pos_deltas.grad
+    assert grad is not None
+    return grad.abs().sum().item()
 
 
 def test_when_grad_scale_inv_sqrt_n_then_codebook_gradient_is_scaled_by_inv_sqrt_numel() -> (
@@ -177,6 +189,8 @@ def test_when_grad_scale_inv_sqrt_n_then_input_and_weight_grads_are_untouched() 
         torch.manual_seed(2)
         x = torch.randn(8, 64, requires_grad=True)
         linear(x).sum().backward()
+        assert x.grad is not None
+        assert linear.weight.grad is not None
         grads[tag] = (x.grad.clone(), linear.weight.grad.clone())
     assert torch.equal(grads["none"][0], grads["inv_sqrt_n"][0]), (
         "input gradient should be identical: the STE identity is not scaled"
@@ -192,12 +206,18 @@ def test_when_act_batch_size_changes_then_activation_codebook_scale_changes() ->
     linear.grad_scale = "inv_sqrt_n"
     torch.manual_seed(3)
     linear(torch.randn(64, 64)).sum().backward()
-    small = linear.act_quantizer.raw_pos_deltas.grad.abs().sum().item()
+    act_cb = linear.act_quantizer
+    assert isinstance(act_cb, MemoryEfficientLearnedCodebook)
+    assert act_cb.raw_pos_deltas.grad is not None
+    small = act_cb.raw_pos_deltas.grad.abs().sum().item()
 
     linear.zero_grad(set_to_none=True)
     torch.manual_seed(3)
     linear(torch.randn(256, 64)).sum().backward()
-    large = linear.act_quantizer.raw_pos_deltas.grad.abs().sum().item()
+    act_cb = linear.act_quantizer
+    assert isinstance(act_cb, MemoryEfficientLearnedCodebook)
+    assert act_cb.raw_pos_deltas.grad is not None
+    large = act_cb.raw_pos_deltas.grad.abs().sum().item()
 
     # 4x the elements => 1/sqrt(4) = 1/2 the gradient for the same per-element
     # signal. Note the sum also grows with N, so the comparison is only

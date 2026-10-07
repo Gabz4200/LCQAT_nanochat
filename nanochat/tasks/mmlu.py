@@ -112,5 +112,5 @@ class MMLU(Task):
         }
         return conversation
 
-    def evaluate(self, conversation, assistant_response):
-        return categorical_match(conversation, assistant_response, self.letters, "MMLU")
+    def evaluate(self, problem, completion):
+        return categorical_match(problem, completion, self.letters, "MMLU")

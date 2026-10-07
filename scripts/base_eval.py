@@ -30,7 +30,7 @@ import zipfile
 import yaml
 
 from nanochat.data.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.data.tokenizer import get_token_bytes
+from nanochat.data.tokenizer import RustBPETokenizer, get_token_bytes
 from nanochat.modules.checkpoint_manager import load_model
 from nanochat.modules.core_eval import evaluate_task
 from nanochat.modules.engine import Engine
@@ -200,6 +200,9 @@ def main():
     model, tokenizer, meta = load_model(
         "base", device, phase="eval", model_tag=args.model_tag, step=args.step
     )
+    # `load_model` is duck-typed through `build_model`; the
+    # checkpoint always round-trips a `RustBPETokenizer`.
+    assert isinstance(tokenizer, RustBPETokenizer)
     # `load_model` returns the DiffusionBlocks engine itself when the checkpoint
     # declares meta["db"], but the autoregressive `Engine` below needs the bare
     # GPT that engine wraps -- `base_train` does the same thing by passing

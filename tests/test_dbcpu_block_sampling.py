@@ -128,4 +128,7 @@ def test_when_step_mode_then_no_gradient_is_discarded_mid_step():
     assert blocks == {str(block_idx)}, "one block's gradients, summed over micro-steps"
     # And the sum is genuinely larger than any single micro-step contributed.
     head = engine.denoise_heads[block_idx].weight
-    assert head.grad.abs().sum() > 0
+    assert isinstance(head, torch.Tensor)
+    head_grad = head.grad
+    assert head_grad is not None
+    assert head_grad.abs().sum() > 0

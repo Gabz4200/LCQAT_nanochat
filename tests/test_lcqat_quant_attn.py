@@ -40,7 +40,17 @@ _BACKEND_IDS = [
 ]
 
 
-def make_case(tq: int, window_left: int, seqlen: int, seed: int = 0):
+def make_case(
+    tq: int, window_left: int, seqlen: int, seed: int = 0
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+]:
     torch.manual_seed(seed)
     k_idx = pack_nibbles(torch.randint(0, K, (B, T, H_KV, D), dtype=torch.uint8))
     v_idx = pack_nibbles(torch.randint(0, K, (B, T, H_KV, D), dtype=torch.uint8))
@@ -114,7 +124,8 @@ def test_when_naive_backend_then_matches_independent_loop(
 def test_when_dispatch_unknown_backend_then_value_error() -> None:
     case = make_case(1, -1, 16)
     with pytest.raises(ValueError, match="Unknown backend"):
-        dispatch_quant_attn(*case, backend="cuda9")
+        dispatch_quant_attn(*case, backend="cuda9")  # type: ignore[bad-argument-type]
+        # ^ intentionally invalid: pins the unknown-backend rejection.
 
 
 @pytest.mark.parametrize(
@@ -197,7 +208,7 @@ def test_when_backward_through_cpu_op_then_actionable_error() -> None:
 
 
 def test_when_cache_seqlen_before_tq_then_value_error() -> None:
-    case = list(make_case(3, -1, 16, seed=15))
+    case: list = list(make_case(3, -1, 16, seed=15))
     case[5] = torch.full((B,), 2, dtype=torch.int32)  # 2 < Tq=3
     with pytest.raises(ValueError, match=r"\[Tq, T\]"):
         dispatch_quant_attn(*case, backend="naive")
@@ -207,34 +218,34 @@ def test_when_lut_k_invalid_then_value_error() -> None:
     # K=31 is out of range because the cache is nibble-packed (K <= 15), not
     # because it is odd. Even K is legal: the asymmetric split makes one-sided
     # codebooks, and therefore K=4, 8, 14, possible.
-    case = list(make_case(1, -1, 16, seed=16))
+    case: list = list(make_case(1, -1, 16, seed=16))
     case[3] = torch.sort(torch.randn(H_KV, 31), dim=-1).values
     case[4] = torch.sort(torch.randn(H_KV, 31), dim=-1).values
-    with pytest.raises(ValueError, match=r"in \[3, 15\]"):
+    with pytest.raises(ValueError, match=r"in \[3, 16\]"):
         dispatch_quant_attn(*case, backend="naive")
     # K=2 is below the floor and still rejected.
     case[3] = torch.sort(torch.randn(H_KV, 2), dim=-1).values
     case[4] = torch.sort(torch.randn(H_KV, 2), dim=-1).values
-    with pytest.raises(ValueError, match=r"in \[3, 15\]"):
+    with pytest.raises(ValueError, match=r"in \[3, 16\]"):
         dispatch_quant_attn(*case, backend="naive")
 
 
 def test_when_lut_k_even_then_accepted() -> None:
     # K=8 is a legitimate one-sided-friendly cardinality and must pass.
-    case = list(make_case(1, -1, 8, seed=18))
+    case: list = list(make_case(1, -1, 8, seed=18))
     out = dispatch_quant_attn(*case, backend="naive")
     assert torch.isfinite(out).all()
 
 
 def test_when_q_not_float32_then_value_error() -> None:
-    case = list(make_case(1, -1, 16, seed=17))
+    case: list = list(make_case(1, -1, 16, seed=17))
     case[0] = case[0].to(torch.float64)
     with pytest.raises(ValueError, match="float32"):
         dispatch_quant_attn(*case, backend="naive")
 
 
 def test_when_n_head_not_divisible_by_h_kv_then_value_error() -> None:
-    case = list(make_case(1, -1, 16, seed=18))
+    case: list = list(make_case(1, -1, 16, seed=18))
     case[0] = torch.randn(B, 1, H + 1, D)  # 5 heads vs 2 KV heads
     with pytest.raises(ValueError, match="divisible"):
         dispatch_quant_attn(*case, backend="naive")

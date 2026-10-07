@@ -61,6 +61,8 @@ def test_when_asym_preset_then_attention_tensors_keep_both_sides():
     ):
         spec = get_layer_config(name, cfg)
         assert spec is not None
+        assert isinstance(spec.weight, tuple)
+        assert isinstance(spec.activation, tuple)
         assert spec.weight[0] > 0, f"{name} weight codebook should have negative levels"
         assert spec.activation[0] > 0, (
             f"{name} activation codebook should have negative levels"
@@ -127,6 +129,11 @@ def test_when_asym_applied_to_a_model_then_mlp_codebooks_are_one_sided():
     c_proj = model.get_submodule("transformer.h.0.mlp.c_proj")
     assert isinstance(c_fc, LCQATLinear) and isinstance(c_proj, LCQATLinear)
     for quantizer in (c_fc.out_quantizer, c_proj.act_quantizer):
+        assert quantizer is not None and callable(quantizer)
+        # The asym preset installs plain codebooks; the union type
+        # (`MemoryEfficientLearnedCodebook | SigmaModulatedCodebook`)
+        # otherwise widens `get_codebook` to `Module.__getattr__`.
+        assert isinstance(quantizer, MemoryEfficientLearnedCodebook)
         assert quantizer.m_neg == 0 and quantizer.m_pos == 7
         assert (quantizer.get_codebook() >= 0).all()
 
@@ -136,6 +143,7 @@ def test_when_asym_model_forward_then_activation_never_goes_negative():
     torch.manual_seed(0)
     model = retrofit_model(build_active_tiny_gpt(), PRESETS[DEFAULT_PRESET])
     c_proj = model.get_submodule("transformer.h.0.mlp.c_proj")
+    assert isinstance(c_proj, LCQATLinear)
     x = torch.rand(2, 16, c_proj.in_features) * 4.0  # relu^2-like
     with torch.no_grad():
         quantized = c_proj.act_quantizer(x)
@@ -154,5 +162,6 @@ def test_when_asym_config_round_trips_through_prepare_before_load():
     assert active == PRESETS[DEFAULT_PRESET]
     fresh.load_state_dict(state, strict=True)
     c_proj = fresh.get_submodule("transformer.h.0.mlp.c_proj")
+    assert isinstance(c_proj, LCQATLinear)
     assert c_proj.act_quantizer.m_neg == 0
     assert c_proj.act_quantizer.m_pos == 7

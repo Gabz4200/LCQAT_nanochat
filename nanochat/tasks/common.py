@@ -8,8 +8,8 @@ Example tasks: MMLU, ARC-Easy, ARC-Challenge, GSM8K, HumanEval, SmolTalk.
 import json
 import os
 import random
+import typing
 import urllib.request
-from typing import Literal
 
 import numpy as np
 import pyarrow as pa
@@ -93,9 +93,9 @@ def load_hub_dataset(repo_id, subset="default", split="train"):
 #: are constants rather than bare strings because `scripts/chat_eval.py`
 #: dispatches on this value: a typo in a subclass otherwise surfaces only at
 #: eval time, as an "Unsupported task evaluation type".
-EVAL_TYPE_GENERATIVE = "generative"
-EVAL_TYPE_CATEGORICAL = "categorical"
-EvalType = Literal[EVAL_TYPE_GENERATIVE, EVAL_TYPE_CATEGORICAL]
+EVAL_TYPE_GENERATIVE: typing.Literal["generative"] = "generative"
+EVAL_TYPE_CATEGORICAL: typing.Literal["categorical"] = "categorical"
+EvalType = typing.Literal["generative", "categorical"]
 
 
 def categorical_match(

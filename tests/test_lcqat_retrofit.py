@@ -22,6 +22,7 @@ from nanochat.models.quant import (
     retrofit_model,
     retrofit_summary,
 )
+from nanochat.models.quant.codebook import MemoryEfficientLearnedCodebook
 from nanochat.models.quant.optimizer import build_qat_param_groups, verify_partition
 from nanochat.models.quant.retrofit import (
     DEFAULT_PRESET,
@@ -148,6 +149,11 @@ def test_when_asym_preset_then_non_negative_tensors_get_one_sided_codebooks() ->
     for name in ("transformer.h.0.attn.c_q", "transformer.h.0.attn.c_proj"):
         spec = get_layer_config(name, config)
         assert spec is not None
+        # `CodebookSpec = int | tuple[int, int]`; a signed layer uses the
+        # tuple form, so narrow before indexing.
+        assert isinstance(spec.activation, tuple), (
+            f"{name} input is RMSNorm'd and signed, expected a (m_neg, m_pos) split"
+        )
         assert spec.activation[0] > 0, f"{name} input is RMSNorm'd and signed"
 
 
@@ -156,19 +162,26 @@ def test_when_asym_preset_then_applied_to_a_model() -> None:
     c_fc = model.get_submodule("transformer.h.0.mlp.c_fc")
     c_proj = model.get_submodule("transformer.h.0.mlp.c_proj")
     assert isinstance(c_fc, LCQATLinear) and isinstance(c_proj, LCQATLinear)
-    assert c_fc.out_quantizer.m_neg == 0
-    assert c_fc.out_quantizer.m_pos == 7
-    assert c_proj.act_quantizer.m_neg == 0
-    assert c_proj.act_quantizer.m_pos == 7
+    # Narrow the quantizers to the plain codebook type: the attributes are
+    # typed as the union, and the plain type is the one that exposes
+    # `m_neg` / `m_pos` / `get_codebook`.
+    out_cb = c_fc.out_quantizer
+    assert isinstance(out_cb, MemoryEfficientLearnedCodebook)
+    act_cb = c_proj.act_quantizer
+    assert isinstance(act_cb, MemoryEfficientLearnedCodebook)
+    assert out_cb.m_neg == 0
+    assert out_cb.m_pos == 7
+    assert act_cb.m_neg == 0
+    assert act_cb.m_pos == 7
     # The one-sided codebook's levels are all >= 0, which is the point: a
     # symmetric 15 would place 7 levels below the minimum the tensor can reach.
-    assert (c_proj.act_quantizer.get_codebook() >= 0).all()
-    assert c_proj.act_quantizer.get_codebook()[0].item() == 0.0
+    assert (act_cb.get_codebook() >= 0).all()
+    assert act_cb.get_codebook()[0].item() == 0.0
     # The forward agrees: a non-negative activation never produces a negative
     # dequantized value.
     with torch.no_grad():
         pos = torch.rand(2, 16, c_proj.in_features)
-        assert (c_proj.act_quantizer(pos).value >= 0).all()
+        assert (act_cb(pos).value >= 0).all()
 
 
 def test_when_spec_helpers_then_k_and_split_are_consistent() -> None:

@@ -24,7 +24,9 @@ def _codebook_grad_sum(grad_scale, in_features=384, out_features=1536, seed=1):
     linear.grad_scale = grad_scale
     torch.manual_seed(seed)
     linear(torch.randn(8, in_features)).pow(2).mean().backward()
-    return linear.weight_quantizer.raw_pos_deltas.grad.abs().sum().item()
+    grad = linear.weight_quantizer.raw_pos_deltas.grad
+    assert grad is not None
+    return grad.abs().sum().item()
 
 
 def test_when_inv_sqrt_n_then_gradient_is_scaled_by_inverse_sqrt_numel():
@@ -52,6 +54,8 @@ def test_when_grad_scale_set_then_input_and_weight_grads_are_untouched():
         torch.manual_seed(2)
         x = torch.randn(8, 64, requires_grad=True)
         linear(x).sum().backward()
+        assert x.grad is not None
+        assert linear.weight.grad is not None
         grads[tag] = (x.grad.clone(), linear.weight.grad.clone())
     assert torch.equal(grads[GRAD_SCALE_NONE][0], grads[GRAD_SCALE_INV_SQRT_N][0])
     assert torch.equal(grads[GRAD_SCALE_NONE][1], grads[GRAD_SCALE_INV_SQRT_N][1])
@@ -64,11 +68,19 @@ def test_when_activation_batch_grows_then_act_codebook_gradient_changes():
     linear.grad_scale = GRAD_SCALE_INV_SQRT_N
     torch.manual_seed(3)
     linear(torch.randn(64, 64)).sum().backward()
-    small = linear.act_quantizer.raw_pos_deltas.grad.abs().sum().item()
+    raw_pos = linear.act_quantizer.raw_pos_deltas
+    assert isinstance(raw_pos, torch.Tensor)
+    raw_grad = raw_pos.grad
+    assert raw_grad is not None
+    small = raw_grad.abs().sum().item()
     linear.zero_grad(set_to_none=True)
     torch.manual_seed(3)
     linear(torch.randn(256, 64)).sum().backward()
-    large = linear.act_quantizer.raw_pos_deltas.grad.abs().sum().item()
+    raw_pos2 = linear.act_quantizer.raw_pos_deltas
+    assert isinstance(raw_pos2, torch.Tensor)
+    raw_grad2 = raw_pos2.grad
+    assert raw_grad2 is not None
+    large = raw_grad2.abs().sum().item()
     assert small > 0 and large > 0 and small != large
 
 

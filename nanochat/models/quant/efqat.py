@@ -29,9 +29,12 @@ re-enable a latched parameter.
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from nanochat.models.backbone import GPT
 
 # Module-name substrings that are always kept trainable (PRD 3.2 "critical
 # outlier layers"). Everything not matching these patterns is a candidate for
@@ -60,19 +63,19 @@ class SelectiveFreezer:
     effect at all.
 
     Args:
-        model: the (retrofitted) model tree.
+        model: the (retrofitted) model tree (a GPT).
         warmup_steps: training steps to keep everything trainable before
             freezing middle layers.
         freeze_middle_frac: fraction of middle transformer layers to freeze.
-            0.0 = freeze none (EfQAT disabled), 1.0 = freeze everything that is
-            not critical. The frozen layers are the contiguous middle band
+            0.0 = freeze none (EfQAT disabled), 1.0 = freeze everything that
+            is not critical. The frozen layers are the contiguous middle band
             (bottom + top kept unfrozen, matching the PRD's "critical outlier
             layers at the boundaries").
     """
 
     def __init__(
         self,
-        model: nn.Module,
+        model: GPT,
         warmup_steps: int = 1000,
         freeze_middle_frac: float = 0.5,
     ):

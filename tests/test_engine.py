@@ -82,7 +82,6 @@ class ByteTokenizer:
         return tokens
 
     def decode(self, tokens):
-        # Filter out special tokens before decoding
         byte_tokens = [t for t in tokens if t < 256]
         return bytes(byte_tokens).decode("utf-8", errors="replace")
 
@@ -105,7 +104,6 @@ def test_kv_cache_basic():
         dtype=torch.float32,
     )
 
-    # Check initial state
     assert kv_cache.get_pos() == 0
     assert kv_cache.k_cache.shape == (
         num_layers,
@@ -122,18 +120,15 @@ def test_kv_cache_basic():
         head_dim,
     )
 
-    # Test advance
     kv_cache.advance(10)
     assert kv_cache.get_pos() == 10
 
     kv_cache.advance(5)
     assert kv_cache.get_pos() == 15
 
-    # Test reset
     kv_cache.reset()
     assert kv_cache.get_pos() == 0
 
-    # Test get_layer_cache returns correct views
     k_layer0, v_layer0 = kv_cache.get_layer_cache(0)
     assert k_layer0.shape == (batch_size, seq_len, num_heads, head_dim)
     assert v_layer0.shape == (batch_size, seq_len, num_heads, head_dim)
@@ -156,12 +151,10 @@ def test_kv_cache_prefill():
         device="cpu",
         dtype=torch.float32,
     )
-    # Write some data to source cache
     src_cache.k_cache[0, 0, :16, :, :] = 1.0
     src_cache.v_cache[0, 0, :16, :, :] = 2.0
     src_cache.advance(16)
 
-    # Create destination cache with larger seq_len
     dst_cache = KVCache(
         batch_size=batch_size,
         num_heads=num_heads,
@@ -172,13 +165,10 @@ def test_kv_cache_prefill():
         dtype=torch.float32,
     )
 
-    # Prefill
     dst_cache.prefill(src_cache)
 
-    # Check position was copied
     assert dst_cache.get_pos() == 16
 
-    # Check data was copied
     assert (dst_cache.k_cache[0, 0, :16, :, :] == 1.0).all()
     assert (dst_cache.v_cache[0, 0, :16, :, :] == 2.0).all()
 
@@ -200,11 +190,9 @@ def test_multi_sample_first_token_diversity():
     tokenizer = ByteTokenizer()
     engine = Engine(model, tokenizer)
 
-    # Generate 16 samples with temperature=1.0 (stochastic sampling)
     prompt_tokens = [261, 72, 101, 108, 108, 111]  # <bos> + "Hello"
     num_samples = 16
 
-    # Collect the first generated token from each sample
     first_tokens = []
     gen = engine.generate(
         prompt_tokens,

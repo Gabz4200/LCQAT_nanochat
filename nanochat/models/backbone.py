@@ -12,6 +12,7 @@ Notable features:
 - Flash Attention 3 integration
 """
 
+import typing
 import warnings
 from dataclasses import dataclass
 
@@ -40,7 +41,7 @@ class GPTConfig:
 
 
 def norm(x: torch.Tensor) -> torch.Tensor:
-    return F.rms_norm(x, (x.size(-1),))  # note that this will run in bf16, seems ok
+    return F.rms_norm(x, (x.size(-1),))  # runs in bf16, seems ok
 
 
 class Linear(nn.Linear):
@@ -48,9 +49,9 @@ class Linear(nn.Linear):
     Replaces autocast: master weights stay fp32 for optimizer precision,
     but matmuls run in the activation dtype (typically bf16 from embeddings)."""
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(dtype=x.dtype), bias)
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        bias = self.bias.to(dtype=input.dtype) if self.bias is not None else None
+        return F.linear(input, self.weight.to(dtype=input.dtype), bias)
 
 
 def _is_codebook_param(name: str) -> bool:
@@ -92,7 +93,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
-        self.ve_gate = (
+        self.ve_gate: Linear | None = (
             Linear(self.ve_gate_channels, self.n_kv_head, bias=False)
             if has_ve(layer_idx, config.n_layer)
             else None
@@ -109,6 +110,10 @@ class CausalSelfAttention(nn.Module):
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
+            assert self.ve_gate is not None, (
+                "a value embedding was passed to a layer without a gate; "
+                "the caller must only pass ve where has_ve(layer) holds"
+            )
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 3 * torch.sigmoid(
                 self.ve_gate(x[..., : self.ve_gate_channels])
@@ -121,7 +126,7 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k)  # QK norm
         q = (
             q * 1.2
-        )  # sharper attention (split scale between Q and K), TODO think through better
+        )  # sharper attention (split scale between Q and K); open question: derive the split rather than hard-code 1.2
         k = k * 1.2
 
         # Flash Attention (FA3 or SDPA fallback)
@@ -192,8 +197,14 @@ def maybe_sigma_call(layer, x, sigma):
 class MLP(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
-        self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+        # Typed `nn.Linear`, not `Linear`: the MLP forward duck-types on the
+        # quantizer (`getattr(..., "act_quantizer", ...)`) and on the
+        # `learnable_activation_lut` buffer, so a *plain* `nn.Linear` is a
+        # valid member -- and wiring tests construct exactly that to exercise
+        # the non-quantized path. `Linear` is a subclass, so the runtime
+        # behavior is unchanged wherever one is installed.
+        self.c_fc: nn.Linear = Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj: nn.Linear = Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x, sigma=None):
         # Quantized-inference runtime (LC-QAT PRD 6): once export has installed
@@ -219,7 +230,15 @@ class MLP(nn.Module):
                     "level. Export with a static codebook, or keep this layer in "
                     "the float path."
                 )
-            return c_fc.quantized_mlp_chain(x, self.c_proj)
+            # Duck-typed like everything else on this path: only an exported
+            # LCQATLinear carries `quantized_mlp_chain`, and `getattr` keeps
+            # this file free of the import cycle (quant imports backbone).
+            quantized_chain = getattr(c_fc, "quantized_mlp_chain", None)
+            assert quantized_chain is not None, (
+                "activation_lut + packed_weight_indices are present but "
+                "quantized_mlp_chain is missing; export did not finish"
+            )
+            return quantized_chain(x, self.c_proj)
         # `sigma` is forwarded only to sigma-conditioned layers. A plain
         # `nn.Linear` does not accept the keyword, and duck-typing on the
         # quantizer -- not on the class -- is what keeps the float path working
@@ -237,7 +256,12 @@ class MLP(nn.Module):
         # changes the gradient, not the forward number. A layer without a table
         # (every layer by default) takes the float path unchanged.
         if getattr(c_fc, "learnable_activation_lut", None) is not None:
-            x = c_fc.apply_trained_activation(x)
+            apply_trained = getattr(c_fc, "apply_trained_activation", None)
+            assert apply_trained is not None, (
+                "learnable_activation_lut is present but "
+                "apply_trained_activation is missing"
+            )
+            x = apply_trained(x)
         else:
             x = F.relu(x).square()
         x = maybe_sigma_call(self.c_proj, x, sigma)
@@ -247,8 +271,8 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: GPTConfig, layer_idx: int):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.attn: CausalSelfAttention = CausalSelfAttention(config, layer_idx)
+        self.mlp: MLP = MLP(config)
 
     def forward(
         self,
@@ -293,6 +317,53 @@ class Block(nn.Module):
         return x
 
 
+class BlockList(nn.ModuleList):
+    """A ModuleList that yields `Block`, for the type checker.
+
+    Plain `nn.ModuleList` iteration yields `nn.Module`, which hides
+    every block member behind `Module.__getattr__` (typed `-> Tensor`
+    in the torch stubs) and blinds all `h[i].attn...` consumers.
+    Registration, ordering, and state_dict keys are exactly
+    `ModuleList`'s -- only the yielded type is narrower.
+    """
+
+    def __init__(self, blocks: list[Block]) -> None:
+        super().__init__(blocks)
+
+    @typing.overload
+    def __getitem__(self, idx: int) -> Block: ...
+    @typing.overload
+    def __getitem__(self, idx: slice) -> "BlockList": ...
+    def __getitem__(self, idx):
+        result = super().__getitem__(idx)
+        if isinstance(idx, slice):
+            return BlockList(list(result))
+        return result
+
+    def __iter__(self) -> typing.Iterator[Block]:
+        return super().__iter__()  # type: ignore[return-value]
+
+
+class TransformerTrunk(nn.Module):
+    """The embedding + block stack, with the same keys a ModuleDict had.
+
+    `GPT.transformer` used to be an `nn.ModuleDict({"wte", "h"})`, which
+    types every attribute access as `Module | Tensor` (and every unknown
+    one as `Tensor` via `Module.__getattr__`), blinding every consumer
+    that reads `transformer.h[i].attn...`. A tiny typed trunk keeps the
+    identical state_dict keys (`transformer.wte.weight`,
+    `transformer.h.0.attn.c_q.weight`, ...) while giving each member a
+    real type. Structural only: no math, no key, no behavior changes.
+    """
+
+    def __init__(self, config: GPTConfig, padded_vocab_size: int) -> None:
+        super().__init__()
+        self.wte = nn.Embedding(padded_vocab_size, config.n_embd)
+        self.h: BlockList = BlockList(
+            [Block(config, layer_idx) for layer_idx in range(config.n_layer)]
+        )
+
+
 class GPT(nn.Module):
     def __init__(self, config: GPTConfig, pad_vocab_size_to: int = 64):
         """
@@ -318,14 +389,7 @@ class GPT(nn.Module):
                 f"{padded_vocab_size} for efficiency",
                 stacklevel=2,
             )
-        self.transformer = nn.ModuleDict(
-            {
-                "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-                "h": nn.ModuleList(
-                    [Block(config, layer_idx) for layer_idx in range(config.n_layer)]
-                ),
-            }
-        )
+        self.transformer = TransformerTrunk(config, padded_vocab_size)
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
@@ -354,11 +418,11 @@ class GPT(nn.Module):
         )
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
-        # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
+        # so let's over-compute them by 10X, but assert fail if we ever reach that amount.
         # In the future we can dynamically grow the cache, for now it's fine.
         self.rotary_seq_len = (
             config.sequence_len * 10
-        )  # 10X over-compute should be enough, TODO make nicer?
+        )  # 10X over-compute should be enough; growth path is a dynamic cache (see above)
         head_dim = config.n_embd // config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer(
@@ -419,6 +483,7 @@ class GPT(nn.Module):
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
+            assert isinstance(ve, nn.Embedding)
             torch.nn.init.uniform_(ve.weight, -s, s)
 
         # Gate weights init with small positive values so gates start slightly above neutral
@@ -437,12 +502,13 @@ class GPT(nn.Module):
         if COMPUTE_DTYPE != torch.float16:
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
+                assert isinstance(ve, nn.Embedding)
                 ve.to(dtype=COMPUTE_DTYPE)
 
     def _precompute_rotary_embeddings(
         self, seq_len, head_dim, base=100000, device=None
     ):
-        # TODO: bump base theta more? e.g. 100K is more common more recently
+        # open question: bump base theta more? e.g. 100K is more common more recently
         # autodetect the device from model embeddings
         if device is None:
             device = self.transformer.wte.weight.device
@@ -737,7 +803,7 @@ class GPT(nn.Module):
 
         if targets is not None:
             # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
+            # open question: experiment with chunked cross-entropy?
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
@@ -746,7 +812,7 @@ class GPT(nn.Module):
             )
             return loss
         else:
-            # inference: just return the logits directly
+            # inference: return the logits directly
             return logits
 
     @torch.inference_mode()

@@ -14,10 +14,14 @@ kernel -- the same split the SparseProp training path uses, where the layer's
 backward routes through the kernels from inside its own Function.
 """
 
+import typing
+
 import torch
 
 from nanochat.ops.kernels.registration import register_inference_only_op
 from nanochat.ops.references.db_denoise_reference import validate_db_denoise_inputs
+
+_DBDenoiseBackend = typing.Literal["cpu", "gpu", "naive"]
 
 _fake_registered = False
 
@@ -75,7 +79,7 @@ class DbDenoiseLossFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, pred, clean, weight: float, backend: str):
+    def forward(ctx, pred, clean, weight: float, backend: _DBDenoiseBackend):
         from nanochat.ops.dispatch import dispatch_db_denoise
 
         ctx.weight = float(weight)
@@ -87,14 +91,20 @@ class DbDenoiseLossFunction(torch.autograd.Function):
             )
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, *grad_outputs: typing.Any) -> typing.Any:
         weight = ctx.weight
         n = ctx.numel
         pred, clean = ctx.saved_tensors
         diff = pred - clean
+        # `grad_outputs` is the variadic tuple `Function.backward` expects;
+        # the EDM loss is a scalar, so there is exactly one.
+        grad_output = grad_outputs[0]
         scale = grad_output * (2.0 * weight / n)
-        # `clean` is the detached target: it takes no gradient.
-        return scale * diff, None, None, None
+        # Both inputs differentiate: dL/dp = +scale*diff,
+        # dL/dc = -scale*diff. (`forward` detaches only its SAVED
+        # copies for the kernel; the graph inputs keep their grads.
+        # The engine passes a detached clean, where this is a no-op.)
+        return scale * diff, -scale * diff, None, None
 
 
 def db_denoise_loss(

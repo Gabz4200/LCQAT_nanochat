@@ -257,6 +257,10 @@ class TestFA3VsSDPA:
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
             loss = y.sum()
             loss.backward()
+            # `.grad` is typed `Tensor | None`; assert before `.detach()`.
+            assert q.grad is not None and k.grad is not None and v.grad is not None, (
+                "flash_attn backward produced no gradient on an input"
+            )
             return y.detach(), q.grad.detach(), k.grad.detach(), v.grad.detach()
 
         set_impl("fa3")
@@ -369,7 +373,6 @@ class TestSDPAOnly:
         assert y.shape == (B, T_prefill, H, D)
         assert cache.get_pos() == T_prefill
 
-        # Generate single token
         q_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
         k_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
         v_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)

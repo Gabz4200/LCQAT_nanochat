@@ -56,7 +56,7 @@ class ReconstructionResult:
             tensors differ; `nmse` is.
         used_levels: how many codebook levels are actually hit, out of
             `k_total`. Levels that no element selects are wasted capacity, and
-            this is the quantity the `asym` split is really claiming to improve.
+            this is the quantity the `asym` split claims to improve.
     """
 
     preset: str
@@ -425,7 +425,9 @@ def render_leaderboard(rows: list[AblationRow], title: str) -> str:
     return f"### {title}\n\n{header}{body}\n**Notes**\n\n{notes}\n"
 
 
-def row_to_dict(row: AblationRow) -> dict[str, object]:
+def row_to_dict(
+    row: AblationRow,
+) -> dict[str, str | float | int | list[int]]:
     """Flatten a row for JSON serialisation (the leaderboard's on-disk form)."""
     return asdict(row)
 

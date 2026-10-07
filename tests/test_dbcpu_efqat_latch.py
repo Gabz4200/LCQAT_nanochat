@@ -139,6 +139,7 @@ def test_when_latch_state_then_readable_and_round_trips_through_metadata() -> No
 
     freezer.latch_blocks([0, 2])
     meta = engine.freezer_metadata()
+    assert meta is not None
     assert meta["latched_blocks"] == [0, 2]
     assert meta["n_blocks"] == 3
     assert freezer.is_latched(2) and not freezer.is_latched(1)

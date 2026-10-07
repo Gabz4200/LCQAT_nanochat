@@ -219,7 +219,60 @@ parser.add_argument(
     "--matrix-lr",
     type=float,
     default=0.02,
-    help="learning rate for matrix parameters (AdamW)",
+    help="learning rate for matrix parameters (MinExpLSTM / AdamW)",
+)
+parser.add_argument(
+    "--optimizer",
+    type=str,
+    default="minexplstm",
+    choices=["minexplstm", "adamw"],
+    help="optimizer: MinExpLSTM joint online learned optimizer (default) or AdamW baseline",
+)
+parser.add_argument(
+    "--minexp-alpha",
+    type=float,
+    default=0.1,
+    help="Deprecated: non-zero values are accepted and ignored (the FiLM gain "
+    "replaces the residual coefficient); 0 freezes the FiLM head (pure SGD)",
+)
+parser.add_argument(
+    "--minexp-beta",
+    type=float,
+    default=0.9,
+    help="MinExpLSTM: fixed EMA decay target (used when --minexp-learnable-beta "
+    "is off; the lambda-coupled predictor is frozen to emit it at g_norm=0)",
+)
+parser.add_argument(
+    "--minexp-lam",
+    type=float,
+    default=0.10,
+    help="MinExpLSTM: fast/slow EMA horizon spacing in (0, 0.4] "
+    "(beta_slow - beta_fast == lam)",
+)
+parser.add_argument(
+    "--minexp-clamp",
+    type=float,
+    default=1.0,
+    help="MinExpLSTM: clamp bound on the FiLM directional shift delta",
+)
+parser.add_argument(
+    "--minexp-learnable-beta",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="MinExpLSTM: lambda-coupled betas learned via the cell's predictor "
+    "(default: on); off freezes the predictor at --minexp-beta",
+)
+parser.add_argument(
+    "--minexp-meta-every",
+    type=int,
+    default=50,
+    help="MinExpLSTM: joint online co-training interval (meta_step every K optimizer steps; 0 disables)",
+)
+parser.add_argument(
+    "--minexp-meta-lr",
+    type=float,
+    default=1e-3,
+    help="MinExpLSTM: meta-gradient LR for the cell co-training step (AdamW)",
 )
 parser.add_argument(
     "--scalar-lr",
@@ -458,9 +511,13 @@ scaler = build_grad_scaler()
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
-dataloader_resume_state_dict = (
-    None if not resuming else meta_data["dataloader_state_dict"]
-)
+# `meta_data` is only loaded when resuming, so the subscript is
+# guarded by the same branch that makes it non-None.
+if not resuming:
+    dataloader_resume_state_dict = None
+else:
+    assert meta_data is not None
+    dataloader_resume_state_dict = meta_data["dataloader_state_dict"]
 train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer,
     args.device_batch_size,

@@ -19,6 +19,7 @@ import math
 
 import pytest
 import torch
+import torch.nn as nn
 
 from nanochat.models.quant.codebook import MemoryEfficientLearnedCodebook
 from nanochat.models.quant.sigma_codebook import (
@@ -26,6 +27,38 @@ from nanochat.models.quant.sigma_codebook import (
     SigmaModulatedCodebook,
     log_sigma_anchor_index,
 )
+
+
+def _gain_layer(mod: SigmaModulatedCodebook, index: int) -> nn.Linear:
+    """Narrow `gain_net[index]` from `Module` to the `Linear` it holds.
+
+    `nn.Module.__getattr__` is typed `-> Tensor` in the torch stubs, so
+    `mod.gain_net[i].weight` does not type-check without narrowing.
+    """
+    layer = mod.gain_net[index]
+    assert isinstance(layer, nn.Linear)
+    return layer
+
+
+def _gain_weight(mod: SigmaModulatedCodebook, index: int) -> torch.Tensor:
+    weight = _gain_layer(mod, index).weight
+    assert weight is not None
+    return weight
+
+
+def _gain_bias(mod: SigmaModulatedCodebook, index: int) -> torch.Tensor:
+    bias = _gain_layer(mod, index).bias
+    assert bias is not None
+    return bias
+
+
+def _anchor(
+    mod: SigmaConditionedCodebook, index: int
+) -> MemoryEfficientLearnedCodebook:
+    """Narrow `codebooks[index]` from `Module` to the codebook it holds."""
+    codebook = mod.codebooks[index]
+    assert isinstance(codebook, MemoryEfficientLearnedCodebook)
+    return codebook
 
 
 def relu2(rows: int, cols: int, seed: int = 0) -> torch.Tensor:
@@ -103,6 +136,8 @@ class TestSigmaConditionedCodebook:
         # Force the anchors to differ so the test is about the mechanism.
         with torch.no_grad():
             for i, cb in enumerate(q.codebooks):
+                assert isinstance(cb, MemoryEfficientLearnedCodebook)
+                assert cb.raw_pos_deltas is not None
                 cb.raw_pos_deltas.mul_(1.0 + 2.0 * i)
         x = relu2(2, 64)
         sigma = torch.tensor([[0.01], [100.0]])
@@ -218,10 +253,10 @@ class TestSigmaModulatedCodebook:
             # The last layer is zero-initialised (that is what makes init
             # equivalence hold), so it must be perturbed explicitly -- setting
             # only the first layer would leave the gain identically 1.0.
-            mod.gain_net[0].weight.fill_(1.0)
-            mod.gain_net[0].bias.fill_(0.0)
-            mod.gain_net[-1].weight.fill_(0.25)
-            mod.gain_net[-1].bias.zero_()
+            _gain_weight(mod, 0).fill_(1.0)
+            _gain_bias(mod, 0).fill_(0.0)
+            _gain_weight(mod, -1).fill_(0.25)
+            _gain_bias(mod, -1).zero_()
         low = mod.effective_codebook(torch.tensor(0.01)).reshape(-1)
         high = mod.effective_codebook(torch.tensor(100.0)).reshape(-1)
         # A gain scales the *span* of the levels, so compare the outermost
@@ -237,8 +272,8 @@ class TestSigmaModulatedCodebook:
         """The conditioning has to separate noise levels, not blur them together."""
         mod = SigmaModulatedCodebook(m_neg=7, m_pos=7)
         with torch.no_grad():
-            mod.gain_net[0].weight.fill_(1.0)
-            mod.gain_net[-1].weight.fill_(0.25)
+            _gain_weight(mod, 0).fill_(1.0)
+            _gain_weight(mod, -1).fill_(0.25)
         sigmas = torch.tensor([0.01, 0.5, 10.0])
         gains = mod.gain_for(sigmas).detach()
         # At least one pair must differ meaningfully, else the gain is constant
@@ -264,8 +299,8 @@ class TestSigmaModulatedCodebook:
         """
         mod = SigmaModulatedCodebook(m_neg=7, m_pos=7)
         with torch.no_grad():
-            mod.gain_net[-1].bias.fill_(3.0)
-            mod.gain_net[-1].weight.fill_(1.0)
+            _gain_bias(mod, -1).fill_(3.0)
+            _gain_weight(mod, -1).fill_(1.0)
         grid = torch.logspace(-3, 2, 40)
         bad = [
             float(s)
@@ -297,15 +332,15 @@ class TestSigmaModulatedCodebook:
         # failure mode this guards is a positive-but-shrinking gain, which needs
         # the raw output to actually move.
         with torch.no_grad():
-            mod.gain_net[0].weight.fill_(1.0)
-            mod.gain_net[-1].weight.fill_(1.0)
+            _gain_weight(mod, 0).fill_(1.0)
+            _gain_weight(mod, -1).fill_(1.0)
         gains = mod.gain_for(grid)
         assert bool(torch.all(gains > 0.0)), (
             f"non-positive gain at sigma: {grid[gains <= 0].tolist()[:5]}"
         )
         # And the clamp bounds it, so a runaway codebook cannot reach inf or 0.
         with torch.no_grad():
-            mod.gain_net[-1].bias.fill_(1e4)
+            _gain_bias(mod, -1).fill_(1e4)
         extreme = mod.gain_for(torch.tensor([1e-30, 1.0, 1e30])).detach()
         assert bool(torch.all(torch.isfinite(extreme)))
         assert float(extreme.max()) <= math.exp(4.0) + 1e-3
@@ -345,8 +380,8 @@ class TestSigmaModulatedCodebook:
         """
         mod = SigmaModulatedCodebook(m_neg=7, m_pos=7)
         with torch.no_grad():
-            mod.gain_net[0].weight.fill_(1.0)
-            mod.gain_net[-1].weight.fill_(0.25)
+            _gain_weight(mod, 0).fill_(1.0)
+            _gain_weight(mod, -1).fill_(0.25)
         out = mod(torch.zeros(3, 8), sigmas_for(3, 0.01, 100.0))
         assert torch.equal(out.value, torch.zeros(3, 8))
         # And the anchor is what the gather returns, so the index is m_neg.
@@ -362,8 +397,8 @@ class TestSigmaModulatedCodebook:
         """
         mod = SigmaModulatedCodebook(m_neg=7, m_pos=7)
         with torch.no_grad():
-            mod.gain_net[0].weight.fill_(3.0)
-            mod.gain_net[-1].weight.fill_(1.0)
+            _gain_weight(mod, 0).fill_(3.0)
+            _gain_weight(mod, -1).fill_(1.0)
         for sigma in torch.logspace(-3, 2, 20):
             book = mod.effective_codebook(sigma).detach().reshape(-1)
             assert float(book[7]) == 0.0, f"anchor moved to {float(book[7])} at {sigma}"
@@ -503,9 +538,15 @@ class TestFidelityComparison:
             num_anchors=2, m_neg=3, m_pos=3, init_min=0.0, init_max=8.0
         )
         with torch.no_grad():
+            first = _anchor(tied, 0)
+            assert first.raw_pos_deltas is not None
+            assert first.raw_neg_deltas is not None
             for cb in tied.codebooks[1:]:
-                cb.raw_pos_deltas.copy_(tied.codebooks[0].raw_pos_deltas)
-                cb.raw_neg_deltas.copy_(tied.codebooks[0].raw_neg_deltas)
+                assert isinstance(cb, MemoryEfficientLearnedCodebook)
+                assert cb.raw_pos_deltas is not None
+                assert cb.raw_neg_deltas is not None
+                cb.raw_pos_deltas.copy_(first.raw_pos_deltas)
+                cb.raw_neg_deltas.copy_(first.raw_neg_deltas)
         self._train(tied, x, sigmas)
 
         shared = MemoryEfficientLearnedCodebook(
@@ -549,7 +590,9 @@ class TestFidelityComparison:
         """
         cond = SigmaConditionedCodebook(num_anchors=4, m_neg=7, m_pos=7)
         assert cond.get_codebooks().numel() == 4 * cond.K
+        first = _anchor(cond, 0)
+        assert first.raw_pos_deltas is not None
+        assert first.raw_neg_deltas is not None
         assert sum(p.numel() for p in cond.parameters()) == 4 * (
-            cond.codebooks[0].raw_pos_deltas.numel()
-            + cond.codebooks[0].raw_neg_deltas.numel()
+            first.raw_pos_deltas.numel() + first.raw_neg_deltas.numel()
         )

@@ -9,9 +9,13 @@ instead of O(M*K)).
 from __future__ import annotations
 
 import time
+import typing
 
 import torch
 import torch.nn as nn
+
+if typing.TYPE_CHECKING:
+    from nanochat.models.quant.codebook import MemoryEfficientLearnedCodebook
 
 from nanochat.models.backbone import Linear
 from nanochat.models.quant.linear import (
@@ -146,7 +150,8 @@ class SparsePropLinearFunction(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, grad_y):
+    def backward(ctx, *grad_outputs: typing.Any) -> typing.Any:
+        grad_y = grad_outputs[0]
         # Flatten to 2D to match forward's flattened layout.
         x_flat, weight = ctx.saved_tensors
         B = ctx.B
@@ -464,11 +469,12 @@ class SparsePropLinear(Linear):
 
             timings["gpu"] = _time(_gpu)
 
-        best = min(timings, key=timings.get)
+        best = min(timings, key=lambda k: timings[k])
         return best
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Forward: y = SpMM(W * mask, x) + bias, through the selected kernel."""
+        x = input
         kernel = self._resolve_kernel(self.weight, x)
         return SparsePropLinearFunction.apply(
             x,
@@ -532,6 +538,20 @@ class SparsePropLinearLCQAT(SparsePropLinear):
     attribute (that would re-register it as a submodule); it is left to be
     garbage-collected after its weight/bias/quantizers are re-parented.
     """
+
+    # Re-parented from the wrapped LCQATLinear in `__init__` (only the
+    # quantizers that are not None are present -- a sparse-wrapped layer
+    # whose out_quantizer was None has no such attribute, so readers
+    # must still `getattr` for it). Declared so the checker sees the
+    # real types instead of `Module.__getattr__`; assignments below do
+    # not change (setattr of the same values).
+    weight_quantizer: MemoryEfficientLearnedCodebook | None
+    act_quantizer: MemoryEfficientLearnedCodebook | None
+    out_quantizer: MemoryEfficientLearnedCodebook | None
+    K_weight: int
+    K_act: int
+    matmul_backend: typing.Literal["cpu", "gpu", "naive"]
+    grad_scale: str
 
     def __init__(self, lcqat_linear, sparsity: float = 0.75):
         from nanochat.models.quant.linear import is_lcqat_layer
@@ -650,13 +670,14 @@ class SparsePropLinearLCQAT(SparsePropLinear):
         """
         return quantize_with_ste(quantizer, x, numel, self.grad_scale)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         """Forward: quantize through codebooks (STE), then sparse matmul.
 
         The quantized weight flows through the standard autograd graph,
         so the STE in the quantizer routes gW back to codebook params.
         The sparse matmul uses SparsePropLinearFunction for the kernel.
         """
+        x = input
         orig_shape = x.shape
         in_f = x.size(-1)
         x_flat = x.reshape(-1, in_f) if x.dim() > 2 else x

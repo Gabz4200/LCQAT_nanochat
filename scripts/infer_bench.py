@@ -43,6 +43,7 @@ import torch
 
 from nanochat.modules.checkpoint_manager import load_model
 from nanochat.modules.engine import Engine
+from nanochat.training.diffusion_blocks import DiffusionBlockEngine
 from nanochat.utils.common import (
     autodetect_device_type,
     compute_cleanup,
@@ -155,7 +156,12 @@ def main():
     model, tokenizer, meta = load_model(
         args.source, device, phase="eval", model_tag=args.model_tag, step=args.step
     )
-    config = model.config
+    # `load_model` returns the `DiffusionBlockEngine` when the checkpoint
+    # carries db state, else the bare `GPT`. The FLOPs / KV-byte accounting
+    # below lives on `GPT`, so unwrap the engine here; `Engine` itself keeps
+    # whatever `load_model` returned.
+    gpt = model.model if isinstance(model, DiffusionBlockEngine) else model
+    config = gpt.config
     engine = Engine(model, tokenizer)
 
     # Clamp the prompt so prompt + decode fits in the training context
@@ -175,9 +181,9 @@ def main():
     total_vram = torch.cuda.get_device_properties(device).total_memory
     w_bytes = weight_bytes(model)
     num_params = sum(p.numel() for p in model.parameters())
-    kv_store = model.kv_bytes_per_token()
+    kv_store = gpt.kv_bytes_per_token()
     context_mid = prompt_len + args.decode_tokens // 2  # representative decode context
-    kv_read = model.kv_read_bytes(context_mid)
+    kv_read = gpt.kv_read_bytes(context_mid)
     # tokens/sec ceiling at batch 1: every step must at least re-read weights + KV
     ceiling_bs1 = peak_bw / (w_bytes + kv_read)
     # how many rows of full-context KV fit next to the weights
@@ -228,7 +234,7 @@ def main():
         "kv_read_bytes_per_step": kv_read,
         "context_mid": context_mid,
         "peak_flops_per_sec": peak_flops if peak_flops != float("inf") else None,
-        "decode_flops_per_token": model.estimate_decode_flops(context_mid),
+        "decode_flops_per_token": gpt.estimate_decode_flops(context_mid),
         "ceiling_bs1_tok_per_sec": round(ceiling_bs1, 1)
         if ceiling_bs1 != float("inf")
         else None,
@@ -246,7 +252,7 @@ def main():
     prefill_result = bench_generate(engine, prompt_tokens, 1, 2, args.temperature)
     prefill_time = prefill_result["ttft"]
     prefill_mfu = (
-        100 * model.estimate_prefill_flops(prompt_len) / prefill_time / peak_flops
+        100 * gpt.estimate_prefill_flops(prompt_len) / prefill_time / peak_flops
     )
     prefill_tok_per_sec = prompt_len / prefill_time
     print(
@@ -284,7 +290,7 @@ def main():
         bytes_per_step = w_bytes + batch_size * kv_read
         mbu = 100 * (bytes_per_step / tpot) / peak_bw
         # MFU: FLOPs each decode step must do, over what the GPU can do
-        flops_per_step = batch_size * model.estimate_decode_flops(context_mid)
+        flops_per_step = batch_size * gpt.estimate_decode_flops(context_mid)
         mfu = 100 * (flops_per_step / tpot) / peak_flops
         vram_gib = result["peak_vram"] / 2**30
         note = (

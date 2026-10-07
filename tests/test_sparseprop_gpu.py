@@ -13,6 +13,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from nanochat.models.quant.codebook import MemoryEfficientLearnedCodebook
 from nanochat.models.quant.sparseprop import (
     SparsePropLinear,
     SparsePropLinearLCQAT,
@@ -455,7 +456,8 @@ def test_when_dispatch_unknown_backend_then_value_error() -> None:
             case["w_ptr"],
             case["bias"],
             case["M"],
-            backend="cuda9",
+            backend="cuda9",  # type: ignore[bad-argument-type]
+            # ^ intentionally invalid: pins the unknown-backend rejection.
         )
     with pytest.raises(ValueError, match="Unknown backend"):
         dispatch_sparseprop_backward(
@@ -471,7 +473,8 @@ def test_when_dispatch_unknown_backend_then_value_error() -> None:
             case["w_cptr"],
             case["M"],
             case["K"],
-            backend="cuda9",
+            backend="cuda9",  # type: ignore[bad-argument-type]
+            # ^ intentionally invalid: pins the unknown-backend rejection.
         )
 
 
@@ -747,6 +750,13 @@ class TestMeasuredCrossover:
         loss_ref = y_ref.square().mean()
         loss_ref.backward()
 
+        # `.grad` is typed `Tensor | None`; assert before comparing.
+        assert x_sparse.grad is not None and x_ref.grad is not None, (
+            "input gradient is None after backward"
+        )
+        assert layer.weight.grad is not None and lin_ref.weight.grad is not None, (
+            "weight gradient is None after backward"
+        )
         assert torch.allclose(y, y_ref, atol=1e-5)
         assert torch.allclose(x_sparse.grad, x_ref.grad, atol=1e-5)
         assert torch.allclose(
@@ -781,6 +791,12 @@ class TestMeasuredCrossover:
         loss_ref = y_ref.square().mean()
         loss_ref.backward()
 
+        assert x_sparse.grad is not None and x_ref.grad is not None, (
+            "input gradient is None after backward"
+        )
+        assert layer.weight.grad is not None and lin_ref.weight.grad is not None, (
+            "weight gradient is None after backward"
+        )
         assert torch.allclose(y, y_ref, atol=1e-5)
         assert torch.allclose(x_sparse.grad, x_ref.grad, atol=1e-5)
         assert torch.allclose(
@@ -811,7 +827,12 @@ class TestSparsePathLCQAT:
         y.sum().backward()
 
         assert module.weight.grad is not None
-        for name, p in module.weight_quantizer.named_parameters():
+        # `weight_quantizer` is typed as the union; the plain type is the
+        # one that exposes `named_parameters` (the sigma-modulated wrapper
+        # wraps it rather than extending it).
+        wq = module.weight_quantizer
+        assert isinstance(wq, MemoryEfficientLearnedCodebook)
+        for name, p in wq.named_parameters():
             assert p.grad is not None, f"codebook param {name} has no gradient"
         assert bool((module.weight.grad[~module.sparsity_mask] == 0).all()), (
             "pruned weight slots must hold exactly zero gradient"

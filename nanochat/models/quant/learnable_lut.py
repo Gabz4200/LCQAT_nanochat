@@ -304,9 +304,12 @@ class LearnableIndexLut(nn.Module):
 
     def pinned_levels(self) -> torch.Tensor:
         """`levels` with the zero anchor forced to exactly 0.0."""
+        pin_mask, pin_value = self.pin_mask, self.pin_value
+        assert isinstance(pin_mask, torch.Tensor)
+        assert isinstance(pin_value, torch.Tensor)
         return torch.where(
-            self.pin_mask.to(self.levels.device),
-            self.pin_value.to(self.levels.dtype),
+            pin_mask.to(self.levels.device),
+            pin_value.to(self.levels.dtype),
             self.levels,
         )
 

@@ -18,26 +18,20 @@ def test_block_diagonal_mask_structure():
     assert mask.shape == (1, 1, 9, 9)
     m = mask[0, 0]
 
-    # Check causal property: no future attention
     for i in range(seq_len):
         for j in range(i + 1, seq_len):
             assert not m[i, j].item(), (
                 f"Future position ({i}, {j}) must not be attended to"
             )
 
-    # Doc 0 is positions 0, 1, 2
-    # Position 2 should attend to 0, 1, 2
+    # Doc 0 is positions 0, 1, 2; doc 1 is 3, 4; doc 2 is 5, 6, 7, 8.
     assert m[2, 0].item() and m[2, 1].item() and m[2, 2].item()
 
-    # Doc 1 is positions 3, 4
-    # Position 3 should attend to 3, but NOT 0, 1, 2
     assert m[3, 3].item()
     assert not m[3, 0].item()
     assert not m[3, 1].item()
     assert not m[3, 2].item()
 
-    # Doc 2 is positions 5, 6, 7, 8
-    # Position 5 should attend to 5, but NOT 4
     assert m[5, 5].item()
     assert not m[5, 4].item()
 

@@ -169,7 +169,11 @@ class SigmaConditionedCodebook(nn.Module):
 
     def get_codebooks(self) -> torch.Tensor:
         """All codebooks stacked, shape `[num_anchors, K]`."""
-        return torch.stack([cb.get_codebook() for cb in self.codebooks], dim=0)
+        codes = []
+        for cb in self.codebooks:
+            assert isinstance(cb, MemoryEfficientLearnedCodebook)
+            codes.append(cb.get_codebook())
+        return torch.stack(codes, dim=0)
 
     #: Read by `LCQATLinear.forward` to decide whether sigma is required.
     needs_sigma = True
@@ -220,11 +224,14 @@ class SigmaConditionedCodebook(nn.Module):
         out = torch.empty(x.shape[:-1], dtype=torch.int64, device=x.device)
         # x is (B, ...) with one sigma row per batch element.
         for b, i in enumerate(idx.tolist()):
-            out[b] = self.codebooks[int(i)].bucketize(x[b])
+            codebook = self.codebooks[int(i)]
+            assert isinstance(codebook, MemoryEfficientLearnedCodebook)
+            out[b] = codebook.bucketize(x[b])
         return out
 
     def compile_for_inference(self) -> None:
         for cb in self.codebooks:
+            assert isinstance(cb, MemoryEfficientLearnedCodebook)
             cb.compile_for_inference()
 
 
@@ -279,8 +286,10 @@ class SigmaModulatedCodebook(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden, 1, device=device),
         )
-        nn.init.zeros_(self.gain_net[-1].weight)
-        nn.init.zeros_(self.gain_net[-1].bias)
+        last = self.gain_net[-1]
+        assert isinstance(last, nn.Linear)
+        nn.init.zeros_(last.weight)
+        nn.init.zeros_(last.bias)
 
     def effective_codebook(self, sigma: torch.Tensor) -> torch.Tensor:
         """`C * gain(sigma)`, shape `[..., K]`.

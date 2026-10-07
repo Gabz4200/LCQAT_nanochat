@@ -74,7 +74,7 @@ def test_when_gpu_backend_then_matches_naive() -> None:
 def test_when_unknown_backend_then_raises() -> None:
     pred, clean, weight = make_case()
     with pytest.raises(ValueError, match="Unknown backend"):
-        dispatch_db_denoise(pred, clean, weight, backend="tpu")
+        dispatch_db_denoise(pred, clean, weight, backend="tpu")  # type: ignore[bad-argument-type] -- intentionally invalid backend; the test provokes the no-silent-fallback error
 
 
 def test_when_shapes_mismatch_then_raises() -> None:
@@ -145,6 +145,8 @@ def test_when_loss_function_backward_then_matches_autograd() -> None:
             diff = pred.detach() - clean.detach()
             n = diff.numel()
             expect_p = 2.0 * weight * diff / n
+        assert pred.grad is not None
+        assert clean.grad is not None
         assert torch.allclose(pred.grad, expect_p, atol=1e-5)
         assert torch.allclose(clean.grad, -expect_p, atol=1e-5)
 
@@ -157,5 +159,7 @@ def test_when_weight_zero_then_loss_and_grads_are_zero() -> None:
     loss = db_denoise_loss(pred, clean, 0.0, backend="cpu")
     assert float(loss) == 0.0
     loss.backward()
+    assert pred.grad is not None
+    assert clean.grad is not None
     assert torch.equal(pred.grad, torch.zeros_like(pred.grad))
     assert torch.equal(clean.grad, torch.zeros_like(clean.grad))

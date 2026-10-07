@@ -175,6 +175,7 @@ class TestProximityZeroAnchor:
     def test_when_proximity_then_exactly_one_level_is_pinned(self) -> None:
         c_in, c_out = make_codebooks()
         lut = LearnableIndexLut(c_in, c_out, "relu2", relaxation="proximity")
+        assert isinstance(lut.pin_mask, torch.Tensor)
         assert int(lut.pin_mask.sum()) == 1
 
 
@@ -190,6 +191,7 @@ class TestProximityGradients:
         c_in, c_out = make_codebooks()
         lut = LearnableIndexLut(c_in, c_out, "relu2", relaxation="proximity")
         _nonconstant_loss(lut).backward()
+        assert lut.knots.grad is not None
         assert float(lut.knots.grad.abs().max()) > 0.0
 
     def test_when_constructed_then_the_selector_is_not_exactly_one_hot(self) -> None:
@@ -205,6 +207,7 @@ class TestProximityGradients:
         c_in, c_out = make_codebooks()
         lut = LearnableIndexLut(c_in, c_out, "relu2", relaxation="proximity")
         _nonconstant_loss(lut).backward()
+        assert lut.levels.grad is not None
         assert float(lut.levels.grad.abs().max()) > 0.0
 
     def test_when_proximity_then_the_gradient_beats_the_saturated_logit_one(
@@ -217,6 +220,9 @@ class TestProximityGradients:
         logits = LearnableIndexLut(c_in, c_out, "relu2", relaxation="logits")
         _nonconstant_loss(prox).backward()
         _nonconstant_loss(logits).backward()
+        assert prox.knots.grad is not None
+        assert prox.levels.grad is not None
+        assert logits.logits.grad is not None
         prox_grad = max(
             float(prox.knots.grad.abs().max()),
             float(prox.levels.grad.abs().max()),

@@ -26,11 +26,13 @@ import copy
 import pytest
 import torch
 
+from nanochat.models.backbone import GPT
 from nanochat.models.quant.kd import DenoiserDistiller, denoiser_kd_loss
 from nanochat.models.quant.retrofit import DEFAULT_PRESET, PRESETS, retrofit_model
 from nanochat.training.diffusion_blocks import (
     DiffusionBlockEngine,
     EquiProbabilityPartitioner,
+    NoiseConditionedBlockAdapter,
 )
 from tests.conftest import build_active_tiny_gpt
 
@@ -51,27 +53,39 @@ def _make_engine(num_blocks: int = 2) -> DiffusionBlockEngine:
     )
     with torch.no_grad():
         for head in engine.denoise_heads:
+            assert isinstance(head, torch.nn.Linear)
+            assert head.bias is not None
             head.weight.normal_(std=0.05)
             head.bias.normal_(std=0.05)
         for adapter in engine.adapters:
-            adapter.mlp[-1].weight.normal_(std=0.05)
+            assert isinstance(adapter, NoiseConditionedBlockAdapter)
+            last = adapter.mlp[-1]
+            assert isinstance(last, torch.nn.Linear)
+            last.weight.normal_(std=0.05)
     return engine
 
 
 def _retrofitted_engine() -> DiffusionBlockEngine:
     """LC-QAT engine, so the KD gradient can be asserted on codebook deltas."""
     torch.manual_seed(0)
+    model = retrofit_model(build_active_tiny_gpt(), PRESETS[DEFAULT_PRESET])
+    assert isinstance(model, GPT)
     engine = DiffusionBlockEngine(
-        retrofit_model(build_active_tiny_gpt(), PRESETS[DEFAULT_PRESET]),
+        model,
         EquiProbabilityPartitioner(num_blocks=2),
         dtype=torch.float32,
     )
     with torch.no_grad():
         for head in engine.denoise_heads:
+            assert isinstance(head, torch.nn.Linear)
+            assert head.bias is not None
             head.weight.normal_(std=0.05)
             head.bias.normal_(std=0.05)
         for adapter in engine.adapters:
-            adapter.mlp[-1].weight.normal_(std=0.05)
+            assert isinstance(adapter, NoiseConditionedBlockAdapter)
+            last = adapter.mlp[-1]
+            assert isinstance(last, torch.nn.Linear)
+            last.weight.normal_(std=0.05)
     return engine
 
 

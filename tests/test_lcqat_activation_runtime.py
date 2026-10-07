@@ -56,8 +56,16 @@ def test_when_exporting_then_lut_matches_value_path_quantizer_ids(
         if not name.endswith("mlp.c_fc") or not isinstance(fc, LCQATLinear):
             continue
         parent = runtime.get_submodule(name[: -len(".c_fc")])
+        # `parent` is `nn.Module`; `.c_proj` resolves through
+        # `Module.__getattr__` (typed `-> Tensor` in the torch stubs), so
+        # narrow it before reading `act_quantizer`.
         proj = parent.c_proj
-        cb_in = fc.out_quantizer.get_codebook()
+        assert isinstance(proj, LCQATLinear), (
+            f"{name} sibling is not an LCQATLinear; the LUT cannot be checked"
+        )
+        out_quantizer = fc.out_quantizer
+        assert out_quantizer is not None
+        cb_in = out_quantizer.get_codebook()
         table = dict(runtime.named_buffers())[f"{name}.activation_lut"]
         y_value = F.relu(cb_in).square()
         expected = proj.act_quantizer(y_value.unsqueeze(0)).indices.squeeze(0)

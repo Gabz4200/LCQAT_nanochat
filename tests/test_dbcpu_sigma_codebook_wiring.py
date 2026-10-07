@@ -16,6 +16,7 @@ silently trains unconditioned while the flag reports itself enabled.
 
 import pytest
 import torch
+import torch.nn as nn
 
 from nanochat.models.quant.retrofit import PRESETS
 from nanochat.models.quant.sigma_codebook import (
@@ -190,6 +191,9 @@ class TestBaseTransformerLayers:
         mlp.c_proj = LCQATLinear(32, 16, bias=False, K_act=7)
         for layer in (mlp.c_fc, mlp.c_proj):
             layer.act_quantizer = modulated(layer.act_quantizer)
+            assert isinstance(layer.act_quantizer, SigmaModulatedCodebook), (
+                "modulated() must produce a SigmaModulatedCodebook"
+            )
 
         # Without sigma this raises, which is the point: the base MLPs are only
         # reachable with sigma threaded, and the flag would otherwise report
@@ -197,9 +201,15 @@ class TestBaseTransformerLayers:
         out = mlp(torch.randn(3, 16), sigma=torch.full((3, 1, 1), 4.0))
         assert out.shape == (3, 16)
         out.sum().backward()
+        # `act_quantizer` is typed as the union; the test has just swapped in
+        # a `SigmaModulatedCodebook`, so narrow before reading `gain_net`.
+        codebook = mlp.c_fc.act_quantizer
+        assert isinstance(codebook, SigmaModulatedCodebook), (
+            "test expected a sigma-conditioned codebook with gain_net"
+        )
         gains = [
             p.grad
-            for _, p in mlp.c_fc.act_quantizer.gain_net.named_parameters()
+            for _, p in codebook.gain_net.named_parameters()
             if p.grad is not None
         ]
         assert gains and any(float(g.abs().sum()) > 0.0 for g in gains)
@@ -245,7 +255,13 @@ class TestBaseTransformerLayers:
                     # every input lands in the middle bucket, the zero anchor,
                     # and the whole layer returns 0.0 -- a "different output"
                     # that is really two tensors of zeros.
-                    layer.act_quantizer.gain_net[-1].weight.fill_(0.05)
+                    # `nn.Sequential.__getitem__` yields `nn.Module`; assert
+                    # so the checker narrows to `Linear` before `.weight`.
+                    codebook = layer.act_quantizer
+                    assert isinstance(codebook, SigmaModulatedCodebook)
+                    last = codebook.gain_net[-1]
+                    assert isinstance(last, nn.Linear)
+                    last.weight.fill_(0.05)
             return mlp
 
         x = torch.randn(2, 16)
@@ -342,9 +358,13 @@ class TestGradientScaling:
         codebook(x2, torch.full((4, 1, 1), 1.0), scale=0.125).value.sum().backward()
 
         g_scaled = codebook.base.raw_pos_deltas.grad
+        assert g_scaled is not None, "codebook delta gradient is None"
         assert float(g_scaled.abs().sum()) > 0.0
         # The input gradient is the STE identity in both cases, so its magnitude
         # must be unchanged by the codebook scale.
+        assert x.grad is not None and x2.grad is not None, (
+            "input gradient is None after backward"
+        )
         assert torch.allclose(x.grad, x2.grad, rtol=1e-5), (
             "the codebook scale also attenuated the input gradient"
         )

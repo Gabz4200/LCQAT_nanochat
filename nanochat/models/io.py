@@ -12,13 +12,29 @@ type, instead of in a docstring each unpack site has to remember.
 
 from __future__ import annotations
 
+import typing
 from dataclasses import dataclass
+
+import torch.nn as nn
 
 #: A codebook cardinality: a total level count `K`, or an explicit
 #: ``(m_neg, m_pos)`` split around the zero anchor. Defined here rather than in
 #: `lcqat.retrofit` so that both the contract and its consumer can import it
 #: without a cycle.
 CodebookSpec = int | tuple[int, int]
+
+
+class ModuleTree(typing.Protocol):
+    """Anything that exposes `nn.Module.modules()` over its tree.
+
+    `DiffusionBlockEngine` is not an `nn.Module` (it owns three),
+    but implements the same `modules()` view, so tree-walking
+    helpers in the core accept either. The engine class itself
+    cannot be imported here: `nanochat/models/` must not depend
+    on `nanochat/training/` (see `tests/test_architecture_boundary.py`).
+    """
+
+    def modules(self) -> typing.Iterator[nn.Module]: ...
 
 
 @dataclass(frozen=True)

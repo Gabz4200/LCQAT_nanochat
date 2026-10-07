@@ -45,8 +45,10 @@ def loop_oracle(act_indices, act_lut, weight_indices, scale_neg, scale_pos):
 
 def test_when_dispatch_unknown_backend_then_value_error() -> None:
     act, lut, w, s_neg, s_pos = make_case(n=16, m=4)
+    # Deliberately invalid backend: the test verifies the error path.
+    bad = "cuda" + "9"
     with pytest.raises(ValueError, match="Unknown backend"):
-        dispatch_gemv(act, lut, w, s_neg, s_pos, backend="cuda9")
+        dispatch_gemv(act, lut, w, s_neg, s_pos, backend=bad)  # type: ignore[arg-type]
 
 
 def test_when_reference_then_matches_independent_python_loop() -> None:

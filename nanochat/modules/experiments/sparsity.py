@@ -7,6 +7,7 @@ reporting dequantized NMSE and how far the two scopes' masks disagree.
 from __future__ import annotations
 
 import argparse
+import typing
 
 import torch
 
@@ -16,6 +17,7 @@ from nanochat.models.quant.retrofit import PRESETS, retrofit_model
 from nanochat.models.quant.sparseprop import (
     SCOPE_GLOBAL,
     SCOPE_LAYER,
+    SparsePropLinear,
     inject_sparseprop_layers,
 )
 from nanochat.modules.experiments.common import VARIANT_PRESET
@@ -38,7 +40,7 @@ def sparsity_sweep(args: argparse.Namespace) -> list[float]:
 
 def pruned_lcqat_layers(
     args: argparse.Namespace, preset: str, sparsity: float, scope: str
-) -> list:
+) -> list[SparsePropLinear]:
     """Retrofitted LC-QAT Linears, pruned to `sparsity` under `scope`.
 
     Two properties of this path are load-bearing and easy to get wrong:
@@ -73,8 +75,12 @@ def pruned_lcqat_layers(
         model, sparsity=sparsity, target_modules=["c_proj", "c_fc"], with_lcqat=True
     )
     layers = [
-        model.transformer.h[0].attn.c_proj,
-        model.transformer.h[0].mlp.c_fc,
+        # `inject_sparseprop_layers(..., with_lcqat=True)` replaced these two
+        # projections with `SparsePropLinearLCQAT` (a `SparsePropLinear`)
+        # above; the cast states that post-injection type. Unchecked at
+        # runtime, and it must stay in sync with the injection call.
+        typing.cast(SparsePropLinear, model.transformer.h[0].attn.c_proj),
+        typing.cast(SparsePropLinear, model.transformer.h[0].mlp.c_fc),
     ]
     schedule = schedule_from_args(args)
     schedule.target_sparsity = sparsity

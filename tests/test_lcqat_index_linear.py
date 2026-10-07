@@ -88,8 +88,10 @@ def test_when_naive_backend_then_matches_independent_loop(
 
 def test_when_dispatch_unknown_backend_then_value_error() -> None:
     case, _ = make_case(15, 4, 16, 2)
+    # Deliberately invalid backend: the test verifies the error path.
+    bad = "cuda" + "9"
     with pytest.raises(ValueError, match="Unknown backend"):
-        dispatch_index_linear(**case, backend="cuda9")
+        dispatch_index_linear(**case, backend=bad)  # type: ignore[arg-type]
 
 
 def test_when_format_mismatch_with_k_then_value_error() -> None:

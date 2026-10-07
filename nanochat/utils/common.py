@@ -73,14 +73,18 @@ setup_default_logging()
 logger = logging.getLogger(__name__)
 
 
-def get_base_dir():
-    # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
-    if os.environ.get("NANOCHAT_BASE_DIR"):
-        nanochat_dir = os.environ.get("NANOCHAT_BASE_DIR")
-    else:
-        home_dir = os.path.expanduser("~")
-        cache_dir = os.path.join(home_dir, ".cache")
-        nanochat_dir = os.path.join(cache_dir, "nanochat")
+def get_base_dir() -> str:
+    """The nanochat cache root, always a concrete path.
+
+    Typed `str` (not `str | None`) so callers can feed it straight into
+    `os.path.join` / `os.makedirs` without a narrowing check. The env var
+    is read once and asserted: a missing `NANOCHAT_BASE_DIR` falls back
+    to `~/.cache/nanochat`, and an empty string is treated the same way
+    rather than silently producing a relative path.
+    """
+    nanochat_dir = os.environ.get("NANOCHAT_BASE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".cache", "nanochat"
+    )
     os.makedirs(nanochat_dir, exist_ok=True)
     return nanochat_dir
 

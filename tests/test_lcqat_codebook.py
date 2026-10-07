@@ -142,6 +142,7 @@ def test_when_backward_then_input_gradient_is_identity() -> None:
     cb = make_codebook()
     x = torch.randn(64, requires_grad=True)
     cb(x).value.sum().backward()
+    assert x.grad is not None
     assert torch.equal(x.grad, torch.ones_like(x))
 
 

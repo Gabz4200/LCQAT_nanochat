@@ -380,6 +380,11 @@ at::Tensor lcqat_sparse_index_linear(
   const int64_t K_act = act_lut.size(0);
   TORCH_CHECK(alphabet.size(0) == nnz,
               "alphabet length must equal nnz (col_indices length)");
+  auto act_i = act_indices.contiguous();
+  auto lut = act_lut.contiguous();
+  auto cols = col_indices.contiguous();
+  auto ptr = row_ptr.contiguous();
+  auto alpha = alphabet.contiguous();
   // Validate listing on entry: row_ptr monotone, in range, endpoints exact.
   {
     auto ptr_acc = ptr.accessor<int32_t, 1>();
@@ -399,12 +404,6 @@ at::Tensor lcqat_sparse_index_linear(
     TORCH_CHECK(int64_t(act_i.max().item<int64_t>()) < K_act,
                 "act_indices value exceeds act_lut size");
   }
-
-  auto act_i = act_indices.contiguous();
-  auto lut = act_lut.contiguous();
-  auto cols = col_indices.contiguous();
-  auto ptr = row_ptr.contiguous();
-  auto alpha = alphabet.contiguous();
 
   const uint8_t* act_ptr = act_i.data_ptr<uint8_t>();
   const float* lut_ptr = lut.data_ptr<float>();

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import typing
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 
@@ -44,6 +45,7 @@ from nanochat.training.diffusion_blocks import (
     DiffusionBlockEngine,
     EquiProbabilityPartitioner,
 )
+from nanochat.training.minexp_lstm import SGD_MinExpLstm_Optimizer
 from nanochat.utils.common import COMPUTE_DTYPE, get_base_dir, print0
 
 
@@ -72,7 +74,9 @@ class EngineSetup:
     use_diffusion_blocks: bool
     num_db_blocks: int
     engine: DiffusionBlockEngine | None
-    float_twin: GPT | None
+    # The KD teacher is a float copy of the engine (the
+    # denoiser's own model tree), not the bare GPT.
+    float_twin: DiffusionBlockEngine | None
     n_twin_stripped: int
 
 
@@ -139,6 +143,9 @@ def build_base_model(args, vocab_size, device, ddp_rank, sparse_schedule):
     resumed_sparse = False
     meta_data = None
     optimizer_data = None
+    # Only the resume branch below reads the partition out of the
+    # checkpoint; a fresh run has none to read.
+    resumed_db_blocks: int | None = None
     if resuming:
         print0(f"Resuming optimization from step {args.resume_from_step}")
         model_data, optimizer_data, meta_data = load_checkpoint(
@@ -219,7 +226,6 @@ def build_base_model(args, vocab_size, device, ddp_rank, sparse_schedule):
                 with_lcqat=True,
             )
         resumed_sparse = False
-    resumed_db_blocks = resumed_db_blocks if resuming else None
     if resuming and args.sparseprop:
         # A checkpoint trained without sparsity has no mask buffers to load, so the
         # freshly-injected mask is what will be used. State that rather than
@@ -492,6 +498,11 @@ def build_engine(
             float_twin, n_twin_stripped = build_denoiser_teacher(
                 engine, args.kd_denoiser_alpha, args.db_objective
             )
+            # w6 annotates the twin as _ModuleTree (a Protocol) because
+            # nanochat/models/ cannot import nanochat/training/; at
+            # runtime it is a deepcopy of the engine, i.e. a real
+            # DiffusionBlockEngine, which is what EngineSetup stores.
+            float_twin = typing.cast(DiffusionBlockEngine, float_twin)
             print0(
                 f"KD denoiser twin: float copy of the engine "
                 f"({n_twin_stripped} LC-QAT layers stripped)"
@@ -526,7 +537,7 @@ def assemble_run_config(args, model, model_config, vocab_size):
 
     # 1) Use scaling laws to determine the optimal training horizon in tokens
     # The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
-    # We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
+    # We've already initialized the model so we have Params. Optimal Tokens is now target-param-data-ratio * Params
     num_scaling_params = get_scaling_params(model)
     target_tokens = int(
         args.target_param_data_ratio * num_scaling_params
@@ -573,7 +584,7 @@ def assemble_run_config(args, model, model_config, vocab_size):
     # Central idea of the paper is that T_epoch = B/(η·λ·D) should remain constant.
     # Above, we used learning rate scaling η ∝ √(B/B_ref). So it's a matter of ~10 lines of math to derive that to keep T_epoch constant, we need:
     # λ = λ_ref · √(B/B_ref) · (D_ref/D)
-    # Note that these papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
+    # These papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
     weight_decay_scaled = (
         args.weight_decay
         * math.sqrt(total_batch_size / B_REF)
@@ -632,7 +643,7 @@ def build_optimizer(
     # (which is what happened to --embedding-lr/--unembedding-lr/--scalar-lr while
     # the group builder emitted only matrix + codebook).
     verify_partition(trainable_root, param_groups)
-    optimizer = make_adamw(param_groups, device_type)
+    optimizer = make_optimizer(param_groups, device_type, args)
 
     if resuming:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
@@ -644,13 +655,61 @@ def build_optimizer(
     return optimizer, trainable_root
 
 
-def make_adamw(param_groups, device_type: str):
-    """AdamW over `param_groups`, fused on CPU, with each group's LR recorded.
+def make_optimizer(param_groups, device_type: str, args):
+    """Build the default optimizer over `param_groups`.
+
+    The default is the SGD-MinExpLSTM joint online learned optimizer
+    (elementwise minimal exponential-gated LSTM cell with a FiLM
+    head on top of SGD, lambda-coupled dual-EMA horizons, INT8
+    optimizer states at 3 bytes/param). `--optimizer adamw`
+    restores the historical AdamW baseline so the ablation arms in
+    `runs/stackcompare.sh` and `runs/speedrun.sh` still reproduce.
 
     `initial_lr` is what a resume restores: `load_state_dict` overwrites
     param_group LRs with the saved values, and a stage that wants its own
     schedule (SFT, or a warm start at a different horizon) has to put them back
     afterwards. Recording them at construction is the only place the fresh value
+    is still known.
+    """
+    print0(
+        "Optimizer groups: "
+        + ", ".join(f"{g['role']}={len(g['params'])}" for g in param_groups)
+    )
+    optimizer_kind = getattr(args, "optimizer", "minexplstm")
+    if optimizer_kind == "adamw":
+        print0("Optimizer: torch.optim.AdamW (baseline, --optimizer adamw)")
+        optimizer = torch.optim.AdamW(param_groups, fused=(device_type == "cpu"))
+    else:
+        print0(
+            "Optimizer: SGD_MinExpLstm_Optimizer "
+            f"(learnable_beta={getattr(args, 'minexp_learnable_beta', True)}, "
+            f"lam={getattr(args, 'minexp_lam', 0.10)})"
+        )
+        optimizer = SGD_MinExpLstm_Optimizer(
+            param_groups,
+            lr=param_groups[0]["lr"],
+            weight_decay=param_groups[0].get("weight_decay", 0.0),
+            lam=getattr(args, "minexp_lam", 0.10),
+            clamp_val=getattr(args, "minexp_clamp", 1.0),
+            meta_lr=getattr(args, "minexp_meta_lr", 1e-3),
+            alpha_residual=getattr(args, "minexp_alpha", None),
+            beta=getattr(args, "minexp_beta", 0.9),
+            learnable_beta=getattr(args, "minexp_learnable_beta", True),
+        )
+    for group in optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
+    return optimizer
+
+
+def make_adamw(param_groups, device_type: str):
+    """AdamW over `param_groups`, fused on CPU, with each group's LR recorded.
+
+    Kept for the explicit baseline path (`--optimizer adamw`) and for the
+    chat stages that construct their own optimizer. `initial_lr` is what a
+    resume restores: `load_state_dict` overwrites param_group LRs with the
+    saved values, and a stage that wants its own schedule (SFT, or a warm
+    start at a different horizon) has to put them back afterwards.
+    Recording them at construction is the only place the fresh value
     is still known.
     """
     print0(

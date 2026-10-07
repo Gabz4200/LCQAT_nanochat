@@ -155,6 +155,7 @@ class TestQuantizedLinearFrontStage:
         torch.manual_seed(0)
         layer = QuantizedLinear(8, 4, lut_front="classic", quantize_bias=True)
         layer(torch.randn(2, 8)).sum().backward()
+        assert layer.quantize_bias is not None
         assert layer.quantize_bias.outputs.grad is not None
 
     def test_when_there_is_no_bias_then_no_lookup_is_built(self) -> None:

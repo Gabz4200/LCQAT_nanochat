@@ -25,7 +25,7 @@ from nanochat.callbacks.training import (
     manage_gc,
     print_run_summary,
 )
-from nanochat.data.tokenizer import get_token_bytes
+from nanochat.data.tokenizer import RustBPETokenizer, get_token_bytes
 from nanochat.models.flash_attention import HAS_FA3
 from nanochat.models.quant import lcqat_config_from_args, retrofit_summary
 from nanochat.models.quant.retrofit import LayerKConfig, add_lcqat_args
@@ -60,7 +60,7 @@ from nanochat.utils.common import (
 from scripts._cli import add_common_cli_args
 from scripts._train.build import (
     build_grad_scaler,
-    make_adamw,
+    make_optimizer,
     restore_optimizer_momentum,
 )
 from scripts.chat_eval import run_chat_eval
@@ -122,7 +122,60 @@ parser.add_argument(
     "--matrix-lr",
     type=float,
     default=None,
-    help="learning rate for matrix parameters (AdamW) (default: inherit from pretrain)",
+    help="learning rate for matrix parameters (MinExpLSTM / AdamW) (default: inherit from pretrain)",
+)
+parser.add_argument(
+    "--optimizer",
+    type=str,
+    default="minexplstm",
+    choices=["minexplstm", "adamw"],
+    help="optimizer: MinExpLSTM joint online learned optimizer (default) or AdamW baseline",
+)
+parser.add_argument(
+    "--minexp-alpha",
+    type=float,
+    default=0.1,
+    help="Deprecated: non-zero values are accepted and ignored (the FiLM gain "
+    "replaces the residual coefficient); 0 freezes the FiLM head (pure SGD)",
+)
+parser.add_argument(
+    "--minexp-beta",
+    type=float,
+    default=0.9,
+    help="MinExpLSTM: fixed EMA decay target (used when --minexp-learnable-beta "
+    "is off; the lambda-coupled predictor is frozen to emit it at g_norm=0)",
+)
+parser.add_argument(
+    "--minexp-lam",
+    type=float,
+    default=0.10,
+    help="MinExpLSTM: fast/slow EMA horizon spacing in (0, 0.4] "
+    "(beta_slow - beta_fast == lam)",
+)
+parser.add_argument(
+    "--minexp-clamp",
+    type=float,
+    default=1.0,
+    help="MinExpLSTM: clamp bound on the FiLM directional shift delta",
+)
+parser.add_argument(
+    "--minexp-learnable-beta",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="MinExpLSTM: lambda-coupled betas learned via the cell's predictor "
+    "(default: on); off freezes the predictor at --minexp-beta",
+)
+parser.add_argument(
+    "--minexp-meta-every",
+    type=int,
+    default=50,
+    help="MinExpLSTM: joint online co-training interval (meta_step every K optimizer steps; 0 disables)",
+)
+parser.add_argument(
+    "--minexp-meta-lr",
+    type=float,
+    default=1e-3,
+    help="MinExpLSTM: meta-gradient LR for the cell co-training step (AdamW)",
 )
 parser.add_argument(
     "--init-lr-frac", type=float, default=0.8, help="initial LR as fraction of base LR"
@@ -258,11 +311,16 @@ model, tokenizer, meta = load_model(
     step=args.model_step,
     lcqat=lcqat_requested,
 )
+# `load_model` is duck-typed through `build_model`; the checkpoint
+# always round-trips a `RustBPETokenizer` (written by `save_checkpoint`).
+assert isinstance(tokenizer, RustBPETokenizer)
 lcqat_started_from_float = lcqat_requested is not None and meta.get("lcqat") is None
 lcqat_meta = meta.get("lcqat")
 if lcqat_meta is None and lcqat_requested is not None:
     lcqat_meta = lcqat_requested.as_dict()
 if lcqat_requested is not None:
+    # `model` may be the engine (not an `nn.Module`), but
+    # `retrofit_summary` walks `modules()`, which both expose.
     print0(f"LC-QAT SFT: {retrofit_summary(model)}")
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
@@ -354,6 +412,10 @@ if args.sparseprop:
 # engine load but before the training loop, so the twin inherits the checkpoint's
 # trained weights and `build_float_twin` strips the LC-QAT layers the retrofits
 # above installed. On a fresh run the base model was never retrofitted either.
+# `build_denoiser_teacher` returns `(None, 0)` when the flag is off,
+# so the pair starts there rather than as an unbound name.
+float_twin: object | None
+n_twin_stripped: int
 float_twin, n_twin_stripped = (None, 0)
 if args.kd_denoiser_alpha > 0.0:
     float_twin, n_twin_stripped = build_denoiser_teacher(
@@ -438,7 +500,7 @@ param_groups = build_qat_param_groups(
 )
 # Fail here rather than shipping a run where a whole role silently never trains.
 verify_partition(engine, param_groups)
-optimizer = make_adamw(param_groups, device_type)
+optimizer = make_optimizer(param_groups, device_type, args)
 
 # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
 # Note: `restore_optimizer_momentum` overwrites param_group metadata (LRs, betas,
@@ -558,7 +620,9 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         for _ in range(args.device_batch_size):
             row = []
             mask_row = []
-            padded = False
+            # Set only on the padding branch; the full-row branch
+            # fills `row` to capacity, which is the length anyway.
+            content_len = row_capacity
             while len(row) < row_capacity:
                 # Ensure buffer has conversations
                 while len(conv_buffer) < buffer_size:
@@ -587,14 +651,10 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     content_len = len(row)
                     row.extend([bos_token] * remaining)  # Pad with BOS tokens
                     mask_row.extend([0] * remaining)
-                    padded = True
                     break  # Row is now full (with padding)
 
             # Track content length: full row if no padding, otherwise the length before padding
-            if padded:
-                row_lengths.append(content_len)
-            else:
-                row_lengths.append(row_capacity)
+            row_lengths.append(content_len)
             rows.append(row[:row_capacity])
             mask_rows.append(mask_row[:row_capacity])
 
@@ -694,6 +754,11 @@ if args.dard:
     engine.set_dard(dard_loss_fn)
 
 min_val_bpb = float("inf")
+# Written by the eval branch below; the checkpoint header and the
+# final summary read it even on a run that never hit `eval_every`
+# (last_step fires on the terminal step, so it is always set once
+# the loop runs, but the checker cannot see that).
+val_bpb = float("nan")
 smooth_train_loss = 0  # EMA of training loss
 ema_beta = 0.9  # EMA decay factor
 total_training_time = 0  # total wall-clock time of training
@@ -813,10 +878,12 @@ while True:
                     "sequence_len": args.max_seq_len,
                     "vocab_size": tokenizer.get_vocab_size(),
                     "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
+                    # `base_model` is the bare GPT; the engine has
+                    # no `config`.
+                    "n_head": base_model.config.n_head,
+                    "n_kv_head": base_model.config.n_kv_head,
+                    "n_embd": base_model.config.n_embd,
+                    "window_pattern": base_model.config.window_pattern,
                 },
                 "user_config": user_config,  # inputs to the training script
                 "lcqat": lcqat_meta,
@@ -841,6 +908,10 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
+    # `train_loss` is set inside the grad-accumulation loop below;
+    # the EMA after it reads it, so it starts as NaN rather than
+    # unbound (the loop always runs at least once before the EMA).
+    train_loss = torch.tensor(float("nan"))
     synchronize()
     t0 = time.time()
     # EfQAT per-block latch (PRD 3.2). Fires before the forward, so the retired

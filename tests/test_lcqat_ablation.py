@@ -5,6 +5,7 @@ grid.
 python -m pytest tests/test_lcqat_ablation.py -v
 """
 
+import typing
 from collections.abc import Callable
 
 import pytest
@@ -347,7 +348,10 @@ def test_when_a_kind_is_requested_then_the_dispatcher_calls_its_kernel(
     (
         (lambda: falloff(torch.zeros(2, 2), 0.0, 1.0), "must be 1-D"),
         (lambda: falloff(torch.arange(4), 0.0, 1.0), "floating point"),
-        (lambda: falloff([0.0, 1.0], 0.0, 1.0), "must be a torch.Tensor"),
+        (
+            lambda: falloff(typing.cast("torch.Tensor", [0.0, 1.0]), 0.0, 1.0),
+            "must be a torch.Tensor",
+        ),
         (lambda: falloff(torch.zeros(4), 0.0, 0.0), "strictly positive"),
         (lambda: falloff(torch.zeros(4), 0.0, -1.0), "strictly positive"),
         (lambda: falloff(torch.zeros(4), 0.0, float("nan")), "finite number"),

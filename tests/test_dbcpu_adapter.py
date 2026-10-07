@@ -9,6 +9,7 @@ freshly-built model byte-identical to the unconditioned one.
 
 import pytest
 import torch
+import torch.nn as nn
 
 from nanochat.training.diffusion_blocks import (
     NoiseConditionedBlockAdapter,
@@ -43,7 +44,11 @@ def test_when_adapter_conditioned_then_sigma_changes_each_layer_and_gets_grad() 
     # The final linear is mlp[-1] (no self.out alias -- that would share the
     # Parameter object under two paths and trip the optimizer's dup-param check).
     with torch.no_grad():
-        adapter.mlp[-1].weight.normal_(std=0.05)
+        # `nn.Sequential.__getitem__` yields `nn.Module`; assert so the
+        # checker narrows to `Linear` before reading `.weight`.
+        last = adapter.mlp[-1]
+        assert isinstance(last, nn.Linear)
+        last.weight.normal_(std=0.05)
     x = torch.randn(2, 8, 16)
     low = adapter(x, torch.tensor([0.5, 0.5]))
     high = adapter(x, torch.tensor([4.0, 4.0]))
@@ -53,8 +58,11 @@ def test_when_adapter_conditioned_then_sigma_changes_each_layer_and_gets_grad() 
         assert not torch.equal(g_lo, g_hi)
         assert not torch.equal(b_lo, b_hi)
     low[0][0].sum().backward()
-    assert adapter.mlp[-1].weight.grad is not None
-    assert adapter.mlp[-1].weight.grad.abs().sum() > 0
+    last = adapter.mlp[-1]
+    assert isinstance(last, nn.Linear)
+    assert last.weight.grad is not None
+    assert isinstance(last.weight, torch.Tensor)
+    assert last.weight.grad.abs().sum() > 0
 
 
 def test_when_layers_differ_then_conditioning_is_per_layer_distinct() -> None:
@@ -62,7 +70,9 @@ def test_when_layers_differ_then_conditioning_is_per_layer_distinct() -> None:
     torch.manual_seed(1)
     adapter = NoiseConditionedBlockAdapter(n_embd=16, cond_dim=8, n_layers=4)
     with torch.no_grad():
-        adapter.mlp[-1].weight.normal_(std=0.05)
+        last_weight = adapter.mlp[-1].weight
+        assert isinstance(last_weight, torch.Tensor)
+        last_weight.normal_(std=0.05)
     conds = adapter(torch.randn(2, 8, 16), torch.tensor([1.0, 1.0]))
     gammas = [g.reshape(-1) for g, _ in conds]
     for i in range(len(gammas) - 1):

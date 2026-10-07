@@ -22,7 +22,7 @@ def test_happy_path():
 def test_exception_is_captured():
     result = execute_code("1/0")
     assert not result.success
-    assert "ZeroDivisionError" in result.error
+    assert result.error is not None and "ZeroDivisionError" in result.error
 
 
 def test_timeout_kills_infinite_loop():

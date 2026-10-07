@@ -8,6 +8,10 @@ plus fused activation-LUT tables for the elementwise ops between quantized
 layers (PRD section 6).
 """
 
+from __future__ import annotations
+
+import typing
+
 import torch
 import torch.nn as nn
 
@@ -21,9 +25,43 @@ from nanochat.models.quant.lut import ACTIVATION_LUTS, compile_activation
 from nanochat.models.quant.packing import index_dtype_for_k, pack_weight_indices
 from nanochat.models.quant.sparse_artifact import pack_sparse_plan, plan_sparse_export
 
+if typing.TYPE_CHECKING:
+    from nanochat.models.quant.sparseprop import SparsePropLinearLCQAT
 
-def _activation_pairs(model: nn.Module, table: tuple):
-    """Yield `(module, parent_name, substr, act_name, kwargs)` for every wiring site.
+
+class _EngineTree(typing.Protocol):
+    """The `DiffusionBlockEngine`'s module-tree surface.
+
+    The engine is the second shape `export_lcqat_checkpoint`
+    accepts (see its docstring). It is not an `nn.Module` (it
+    owns three), but implements the same `named_modules` /
+    `state_dict` / `get_submodule` view, so export walks either
+    identically. The engine class itself cannot be imported
+    here: `nanochat/models/` must not depend on
+    `nanochat/training/` (see `tests/test_architecture_boundary.py`).
+    """
+
+    @property
+    def training(self) -> bool: ...
+
+    def named_modules(
+        self,
+        memo: set | None = ...,
+        prefix: str = ...,
+        remove_duplicate: bool = ...,
+    ) -> typing.Iterator[tuple[str, nn.Module]]: ...
+
+    def state_dict(self) -> dict[str, torch.Tensor]: ...
+
+    def get_submodule(self, target: str) -> "nn.Module | _EngineTree": ...
+
+    def eval(self) -> object: ...
+
+    def train(self, mode: bool = ...) -> object: ...
+
+
+def _activation_pairs(model: nn.Module | _EngineTree, table: tuple):
+    """Yield `(module, sibling, out_quantizer, act_quantizer, act_name, kwargs)`.
 
     Both the learnable and the frozen attachment walk the model the same way:
     find an out-quantized LCQATLinear whose name ends in a declared activation
@@ -38,7 +76,12 @@ def _activation_pairs(model: nn.Module, table: tuple):
         # than one set to None. Reading it directly raised AttributeError as soon
         # as any such layer existed, which is every export of a model with
         # --sparseprop applied to a projection that does not feed the KV cache.
-        if not is_lcqat_layer(module) or getattr(module, "out_quantizer", None) is None:
+        # Bound to locals: `getattr` returns Any, which is what keeps this
+        # walk checkable (direct access would go through `Module.__getattr__`).
+        if not is_lcqat_layer(module):
+            continue
+        out_quantizer = getattr(module, "out_quantizer", None)
+        if out_quantizer is None:
             continue
         for substr, act_name, kwargs in table:
             if not name.endswith(substr):
@@ -47,9 +90,10 @@ def _activation_pairs(model: nn.Module, table: tuple):
             parent_name = name[: -len(substr)]
             parent_name = parent_name[:-1] if parent_name.endswith(".") else parent_name
             sibling = _next_quantized_sibling(model, parent_name, substr.split(".")[-1])
-            if sibling is None or sibling.act_quantizer is None:
+            sibling_act = getattr(sibling, "act_quantizer", None)
+            if sibling is None or sibling_act is None:
                 continue
-            yield module, sibling, act_name, kwargs
+            yield module, sibling, out_quantizer, sibling_act, act_name, kwargs
 
 
 @torch.no_grad()
@@ -83,9 +127,18 @@ def attach_learnable_activation_luts(
     """
     table = activations if activations is not None else ACTIVATION_LUTS
     count = 0
-    for module, sibling, act_name, kwargs in _activation_pairs(model, table):
-        input_codebook = module.out_quantizer.get_codebook()
-        output_codebook = sibling.act_quantizer.get_codebook()
+    for (
+        module,
+        sibling,
+        out_quantizer,
+        act_quantizer,
+        act_name,
+        kwargs,
+    ) in _activation_pairs(model, table):
+        # Quantizers ride along from the walk (which guarantees presence),
+        # so neither call site repeats the sparse-safe lookup.
+        input_codebook = out_quantizer.get_codebook()
+        output_codebook = act_quantizer.get_codebook()
         body = None
         if act_body == ACT_BODY_SMOOTHPWL:
             if kwargs:
@@ -112,7 +165,7 @@ def attach_learnable_activation_luts(
         # path would have produced. Hardcoding uint8 truncates for K_act >
         # 255, where `compile_activation` yields int32 and the fused chain's
         # `activation_lut.dtype != torch.uint8` guard then rejects a table
-        # this function just built. Bound to a distinct name: reusing `table`
+        # this function built. Bound to a distinct name: reusing `table`
         # here rebinds the loop's iteration variable mid-loop.
         resolved = lut.resolved_table()
         _install_lut(module, resolved.to(index_dtype_for_k(lut.k_out)))
@@ -121,7 +174,9 @@ def attach_learnable_activation_luts(
 
 
 @torch.no_grad()
-def wire_activation_luts(model: nn.Module, activations: tuple | None = None) -> int:
+def wire_activation_luts(
+    model: nn.Module | _EngineTree, activations: tuple | None = None
+) -> int:
     """Compile elementwise activation tables for quantized-inference layer pairs.
 
     "Activation Functions become LUTs too" (PRD section 6): every activation
@@ -138,11 +193,18 @@ def wire_activation_luts(model: nn.Module, activations: tuple | None = None) -> 
     """
     table = activations if activations is not None else ACTIVATION_LUTS
     count = 0
-    for module, sibling, act_name, kwargs in _activation_pairs(model, table):
+    for (
+        module,
+        sibling,
+        out_quantizer,
+        act_quantizer,
+        act_name,
+        kwargs,
+    ) in _activation_pairs(model, table):
         lut = compile_activation(
             act_name,
-            module.out_quantizer.get_codebook(),
-            sibling.act_quantizer.get_codebook(),
+            out_quantizer.get_codebook(),
+            act_quantizer.get_codebook(),
             kwargs,
         )
         _install_lut(module, lut)
@@ -151,8 +213,8 @@ def wire_activation_luts(model: nn.Module, activations: tuple | None = None) -> 
 
 
 def _next_quantized_sibling(
-    model: nn.Module, parent_name: str, leaf: str
-) -> LCQATLinear | None:
+    model: nn.Module | _EngineTree, parent_name: str, leaf: str
+) -> "LCQATLinear | SparsePropLinearLCQAT | None":
     """Find the quantized Linear sibling that follows `leaf` under `parent_name`.
 
     nanochat's MLP is `c_fc -> relu^2 -> c_proj` (leaf names `c_fc` and `c_proj`
@@ -160,28 +222,44 @@ def _next_quantized_sibling(
     declaration order and returns the first LCQATLinear with an act_quantizer
     whose key comes after `leaf`.
     """
+    # `parent_name` is empty only for a top-level module of a bare
+    # `nn.Module` root: the engine's `named_modules()` prefixes
+    # every owned module with `db_adapters.` / `db_denoise_heads.`,
+    # so an engine-backed walk never reaches the `else` arm. Only
+    # the engine's `get_submodule("")` returns the engine itself;
+    # every non-empty path resolves to a real `nn.Module`, which
+    # the cast states.
     parent = model.get_submodule(parent_name) if parent_name else model
+    parent = typing.cast(nn.Module, parent)
     found_self = False
     for attr, child in parent.named_children():
         if attr == leaf:
             found_self = True
             continue
-        if found_self and is_lcqat_layer(child) and child.act_quantizer is not None:
+        # `getattr`: a sparse member may lack `act_quantizer` entirely.
+        if (
+            found_self
+            and is_lcqat_layer(child)
+            and getattr(child, "act_quantizer", None) is not None
+        ):
             return child
     return None
 
 
-def _install_lut(module: LCQATLinear, table: torch.Tensor) -> None:
+def _install_lut(
+    module: "LCQATLinear | SparsePropLinearLCQAT", table: torch.Tensor
+) -> None:
     """Register (or overwrite) the `activation_lut` buffer on `module`."""
-    if "activation_lut" in module._buffers:
-        module.activation_lut.copy_(table)
+    existing = module._buffers.get("activation_lut")
+    if isinstance(existing, torch.Tensor):
+        existing.copy_(table)
     else:
         module.register_buffer("activation_lut", table, persistent=True)
 
 
 @torch.no_grad()
 def export_lcqat_checkpoint(
-    model: nn.Module, export_path: str, sparse: bool = True
+    model: nn.Module | _EngineTree, export_path: str, sparse: bool = True
 ) -> dict:
     """Export a stripped LC-QAT state_dict and save it with torch.save.
 
@@ -212,8 +290,11 @@ def export_lcqat_checkpoint(
         # alone silently skips every sparse layer -- the artifact would come out
         # with an FP32 shadow weight intact and no index buffers at all. Match
         # on the quantizer the export actually needs, which both classes have.
+        # Bound to locals: `getattr` returns Any, which is what keeps this
+        # walk checkable (direct access would go through `Module.__getattr__`).
         weight_quantizer = getattr(module, "weight_quantizer", None)
-        if weight_quantizer is None or not hasattr(module, "K_weight"):
+        k_weight = getattr(module, "K_weight", None)
+        if weight_quantizer is None or k_weight is None:
             continue
         # A per-channel layer quantizes through `per_channel_weight_quantizer`,
         # a [C, K] table -- but `weight_quantizer` stays present and readable
@@ -232,7 +313,7 @@ def export_lcqat_checkpoint(
                 "express. Re-export from a model trained without "
                 "--lcqat-channel-center, or strip the per-channel table first."
             )
-        module.weight_quantizer.compile_for_inference()
+        weight_quantizer.compile_for_inference()
         act_quantizer = getattr(module, "act_quantizer", None)
         if act_quantizer is not None:
             act_quantizer.compile_for_inference()
@@ -240,13 +321,13 @@ def export_lcqat_checkpoint(
         if out_quantizer is not None:
             out_quantizer.compile_for_inference()
 
-        indices = module.weight_quantizer(module.weight).indices
+        indices = weight_quantizer(module.weight).indices
         # The dense buffer is always written, and is always packed from the full
         # [m, n] index matrix at the full alphabet. The sparse branch adds the
         # CSR listing beside it; it must not overwrite `packed`/`fmt`, or the
         # dense buffer ends up holding the flat `nnz` sparse values and every
         # dense consumer silently reads a wrong-shaped tensor.
-        packed, fmt = pack_weight_indices(indices, module.K_weight)
+        packed, fmt = pack_weight_indices(indices, k_weight)
         module.register_buffer("packed_weight_indices", packed, persistent=True)
         module.register_buffer(
             "weight_index_format", torch.tensor(fmt, dtype=torch.int64), persistent=True
@@ -254,7 +335,7 @@ def export_lcqat_checkpoint(
 
         mask = getattr(module, "sparsity_mask", None)
         if sparse and isinstance(mask, torch.Tensor):
-            plan = plan_sparse_export(indices, mask, k=module.K_weight)
+            plan = plan_sparse_export(indices, mask, k=k_weight)
             sparse_packed, sparse_fmt = pack_sparse_plan(plan)
             module.register_buffer(
                 "sparse_keep_indices", sparse_packed, persistent=True
@@ -270,7 +351,7 @@ def export_lcqat_checkpoint(
             )
             module.register_buffer(
                 "sparse_alphabet",
-                module.weight_quantizer.get_codebook()[plan.used].contiguous(),
+                weight_quantizer.get_codebook()[plan.used].contiguous(),
                 persistent=True,
             )
             module.register_buffer(

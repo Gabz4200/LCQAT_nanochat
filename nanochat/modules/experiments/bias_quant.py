@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from typing import Any
 
 import torch
 
@@ -29,14 +30,14 @@ BIAS_CODEBOOK_LIVE = "codebook gradient live: True"
 BIAS_CODEBOOK_DEAD = "codebook gradient live: False"
 
 
-def _weight_kwargs(spec: CodebookSpec) -> dict[str, object]:
+def _weight_kwargs(spec: CodebookSpec) -> dict[str, Any]:
     """A `LayerKConfig` cardinality as `from_float`'s weight-codebook kwargs."""
     if isinstance(spec, tuple):
         return {"K_weight_split": spec}
     return {"K_weight": int(spec)}
 
 
-def _act_kwargs(spec: CodebookSpec) -> dict[str, object]:
+def _act_kwargs(spec: CodebookSpec) -> dict[str, Any]:
     """A `LayerKConfig` cardinality as `from_float`'s activation kwargs."""
     if isinstance(spec, tuple):
         return {"K_act_split": spec}

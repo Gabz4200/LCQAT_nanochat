@@ -42,7 +42,7 @@ def reference() -> dict[str, str]:
 def test_fingerprint_matches_reference(reference: dict[str, str]) -> None:
     """The core gate: no path may change its numerics."""
     actual, tolerances = fingerprint()
-    drifted = {}
+    drifted: dict[str, tuple[str | None, str]] = {}
     for key, value in actual.items():
         expected = reference.get(key)
         if expected is None:

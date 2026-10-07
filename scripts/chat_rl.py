@@ -2,7 +2,7 @@
 Reinforcement learning on GSM8K via "GRPO".
 
 I put GRPO in quotes because we actually end up with something a lot
-simpler and more similar to just REINFORCE:
+simpler and more similar to REINFORCE:
 
 1) Delete trust region, so there is no KL regularization to a reference model
 2) We are on policy, so there's no need for PPO ratio+clip.
@@ -25,6 +25,7 @@ import torch
 import torch.distributed as dist
 import wandb
 
+from nanochat.data.tokenizer import RustBPETokenizer
 from nanochat.models.quant import lcqat_config_from_args, retrofit_summary
 from nanochat.models.quant.optimizer import build_qat_param_groups, verify_partition
 from nanochat.models.quant.retrofit import LayerKConfig, add_lcqat_args
@@ -45,6 +46,7 @@ from nanochat.utils.common import (
     print0,
 )
 from scripts._cli import add_common_cli_args
+from scripts._train.build import make_optimizer
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -98,7 +100,60 @@ parser.add_argument(
     "--matrix-lr",
     type=float,
     default=0.02,
-    help="learning rate for matrix parameters (AdamW)",
+    help="learning rate for matrix parameters (MinExpLSTM / AdamW)",
+)
+parser.add_argument(
+    "--optimizer",
+    type=str,
+    default="minexplstm",
+    choices=["minexplstm", "adamw"],
+    help="optimizer: MinExpLSTM joint online learned optimizer (default) or AdamW baseline",
+)
+parser.add_argument(
+    "--minexp-alpha",
+    type=float,
+    default=0.1,
+    help="Deprecated: non-zero values are accepted and ignored (the FiLM gain "
+    "replaces the residual coefficient); 0 freezes the FiLM head (pure SGD)",
+)
+parser.add_argument(
+    "--minexp-beta",
+    type=float,
+    default=0.9,
+    help="MinExpLSTM: fixed EMA decay target (used when --minexp-learnable-beta "
+    "is off; the lambda-coupled predictor is frozen to emit it at g_norm=0)",
+)
+parser.add_argument(
+    "--minexp-lam",
+    type=float,
+    default=0.10,
+    help="MinExpLSTM: fast/slow EMA horizon spacing in (0, 0.4] "
+    "(beta_slow - beta_fast == lam)",
+)
+parser.add_argument(
+    "--minexp-clamp",
+    type=float,
+    default=1.0,
+    help="MinExpLSTM: clamp bound on the FiLM directional shift delta",
+)
+parser.add_argument(
+    "--minexp-learnable-beta",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="MinExpLSTM: lambda-coupled betas learned via the cell's predictor "
+    "(default: on); off freezes the predictor at --minexp-beta",
+)
+parser.add_argument(
+    "--minexp-meta-every",
+    type=int,
+    default=50,
+    help="MinExpLSTM: joint online co-training interval (meta_step every K optimizer steps; 0 disables)",
+)
+parser.add_argument(
+    "--minexp-meta-lr",
+    type=float,
+    default=1e-3,
+    help="MinExpLSTM: meta-gradient LR for the cell co-training step (AdamW)",
 )
 parser.add_argument(
     "--weight-decay",
@@ -182,6 +237,9 @@ model, tokenizer, meta = load_model(
     step=args.model_step,
     lcqat=lcqat_requested,
 )
+# `load_model` is duck-typed through `build_model`; the
+# checkpoint always round-trips a `RustBPETokenizer`.
+assert isinstance(tokenizer, RustBPETokenizer)
 lcqat_meta = meta.get("lcqat")
 if lcqat_meta is None and lcqat_requested is not None:
     lcqat_meta = lcqat_requested.as_dict()
@@ -311,7 +369,7 @@ def get_batch():
         # NOTE also that the Engine returns mask=0 for BOTH the prompt tokens AND the tool use tokens.
         # So we will (correctly) end up not training on the prompt tokens, or the tool use forced tokens.
         rewards = torch.tensor(rewards, dtype=torch.float, device=device)
-        # Calculate the advantages by simply subtracting the mean (instead of z-score (x-mu)/sigma)
+        # Calculate the advantages by subtracting the mean (instead of z-score (x-mu)/sigma)
         mu = rewards.mean()
         advantages = rewards - mu
         # yield inputs/targets as (B, T) of ids and rewards as (B,) of floats
@@ -418,14 +476,7 @@ param_groups = build_qat_param_groups(
     weight_decay=args.weight_decay,
 )
 verify_partition(db_engine, param_groups)
-print0(
-    "Optimizer groups: "
-    + ", ".join(f"{g['role']}={len(g['params'])}" for g in param_groups)
-)
-optimizer = torch.optim.AdamW(
-    param_groups,
-    fused=(device_type == "cpu"),
-)
+optimizer = make_optimizer(param_groups, device_type, args)
 
 # Set the initial learning rate as a fraction of the base learning rate
 for group in optimizer.param_groups:
@@ -552,7 +603,7 @@ for step in range(num_steps):
             # db_engine.logprobs evaluates cross-entropy loss with block-isolation (L/B layers active)
             # and returns per-token NLL = -logp, so we negate
             logp = -db_engine.logprobs(inputs, targets).view_as(inputs)  # (B, T)
-            # Calculate the PG objective. Note that ignore_index=-1 ensures that invalid tokens have loss 0.
+            # Calculate the PG objective. ignore_index=-1 ensures that invalid tokens have loss 0.
             pg_obj = (logp * advantages.unsqueeze(-1)).sum()
             # normalize by the number of valid tokens, number of passes, and examples_per_rank
             num_valid = (targets >= 0).sum().clamp(min=1)
@@ -621,7 +672,11 @@ for step in range(num_steps):
         (step > 0 and step % args.save_every == 0) or step == num_steps - 1
     ):
         base_dir = get_base_dir()
-        depth = model.config.n_layer
+        # `model` is the DiffusionBlocks engine when the SFT
+        # checkpoint declared meta["db"]; `base_model` is the
+        # bare GPT in both branches, so its config is the one
+        # to read and re-save.
+        depth = base_model.config.n_layer
         output_dirname = (
             args.model_tag if args.model_tag else f"d{depth}"
         )  # base the model tag on the depth of the base model
@@ -629,7 +684,7 @@ for step in range(num_steps):
         # `asdict` (already used for the same meta key in `_train/build.py`)
         # rather than `config.__dict__`, which hands the caller a live alias
         # into the model's own config object.
-        model_config_kwargs = asdict(model.config)
+        model_config_kwargs = asdict(base_model.config)
         save_checkpoint(
             checkpoint_dir,
             step,

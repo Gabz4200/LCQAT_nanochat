@@ -1,0 +1,19 @@
+[kernel.sgd_minexplstm_cpu]
+backend = "cpu"
+depends = ["torch"]
+include = ["sgd_minexplstm_cpu"]
+src = [
+    "sgd_minexplstm.cpp",
+    "sgd_minexplstm.hpp",
+    "sgd_minexplstm_cpu_features.hpp",
+]
+
+[kernel.sgd_minexplstm_cpu_avx2]
+backend = "cpu"
+cxx-flags = ["-mavx2", "-mfma", "-mf16c", "-fopenmp"]
+depends = ["torch"]
+include = ["sgd_minexplstm_cpu"]
+src = [
+    "sgd_minexplstm_avx2.cpp",
+    "sgd_minexplstm_avx2.hpp",
+]

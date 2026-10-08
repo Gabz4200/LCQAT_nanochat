@@ -329,6 +329,8 @@ Repo-specific guardrails live in [AGENTS.md](AGENTS.md): the functional-core bou
 
 AI policy: disclose. When you submit a PR, declare parts with substantial LLM contribution that you have not written or do not fully understand.
 
+**For the record**: I do use AI often. For repetitive code tasks or cleared scope changes/additions, I write a PRD first, think it through, and then use AI to write much of the code. And for both the AI code and the code I do write, I ask AI to write the commit messages, because I am too lazy to write them myself.
+
 ---
 
 ## Acknowledgements

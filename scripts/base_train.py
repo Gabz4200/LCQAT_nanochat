@@ -224,9 +224,54 @@ parser.add_argument(
 parser.add_argument(
     "--optimizer",
     type=str,
-    default="minexplstm",
-    choices=["minexplstm", "adamw"],
-    help="optimizer: MinExpLSTM joint online learned optimizer (default) or AdamW baseline",
+    default="mezo",
+    choices=["mezo", "minexplstm", "adamw"],
+    help="optimizer: MeZO zeroth-order learned optimizer (default, "
+    "memory-flat in batch size), MinExpLSTM first-order joint "
+    "online learned optimizer, or AdamW baseline",
+)
+parser.add_argument(
+    "--mezo-epsilon",
+    type=float,
+    default=1e-3,
+    help="MeZO perturbation scale (PRD 2.1)",
+)
+parser.add_argument(
+    "--mezo-K",
+    type=int,
+    default=4,
+    help="MeZO FIR history length (PRD 2.3)",
+)
+parser.add_argument(
+    "--mezo-delta-q",
+    type=float,
+    default=0.0625,
+    help="MeZO quantization step (PRD 2.4)",
+)
+parser.add_argument(
+    "--mezo-a-base",
+    type=float,
+    default=1.5,
+    help="MeZO FIR gain at full history (PRD 2.3)",
+)
+parser.add_argument(
+    "--mezo-a-min",
+    type=float,
+    default=0.1,
+    help="MeZO FIR gain floor (PRD 2.3)",
+)
+parser.add_argument(
+    "--mezo-lr-max",
+    type=float,
+    default=None,
+    help="MeZO lr cap (None = uncapped)",
+)
+parser.add_argument(
+    "--mezo-backend",
+    type=str,
+    default="cpu",
+    choices=["naive", "cpu", "gpu"],
+    help="MeZO fused-kernel backend (PRD 2.6)",
 )
 parser.add_argument(
     "--minexp-alpha",

@@ -45,6 +45,7 @@ from nanochat.training.diffusion_blocks import (
     DiffusionBlockEngine,
     EquiProbabilityPartitioner,
 )
+from nanochat.training.mezo_minexplstm import MeZo_MinExpLstm_Optimizer
 from nanochat.training.minexp_lstm import SGD_MinExpLstm_Optimizer
 from nanochat.utils.common import COMPUTE_DTYPE, get_base_dir, print0
 
@@ -195,7 +196,8 @@ def build_base_model(args, vocab_size, device, ddp_rank, sparse_schedule):
         # The block partition is checkpoint provenance, not a fresh choice: resuming
         # with a different --db-blocks would silently re-partition the model and
         # change which parameters receive gradients every micro-step.
-        resumed_db_blocks = (meta_data.get("db") or {}).get("num_blocks")
+        db_meta = meta_data.get("db") if meta_data is not None else None
+        resumed_db_blocks = db_meta.get("num_blocks") if db_meta is not None else None
         del model_data, base_model_data  # free up this memory after the copy
     elif lcqat_requested is not None:
         retrofit_model(model, lcqat_requested)
@@ -230,7 +232,8 @@ def build_base_model(args, vocab_size, device, ddp_rank, sparse_schedule):
         # A checkpoint trained without sparsity has no mask buffers to load, so the
         # freshly-injected mask is what will be used. State that rather than
         # letting it look like a restored pattern.
-        ckpt_sparse = (meta_data or {}).get("sparseprop", {}).get("enabled")
+        sp_meta = meta_data.get("sparseprop") if meta_data is not None else None
+        ckpt_sparse = sp_meta.get("enabled") if sp_meta is not None else None
         if ckpt_sparse is not True:
             print0(
                 "SparseProp resumed with a freshly-built magnitude mask: the "
@@ -675,15 +678,40 @@ def make_optimizer(param_groups, device_type: str, args):
         "Optimizer groups: "
         + ", ".join(f"{g['role']}={len(g['params'])}" for g in param_groups)
     )
-    optimizer_kind = getattr(args, "optimizer", "minexplstm")
+    optimizer_kind = getattr(args, "optimizer", "mezo")
     if optimizer_kind == "adamw":
         print0("Optimizer: torch.optim.AdamW (baseline, --optimizer adamw)")
         optimizer = torch.optim.AdamW(param_groups, fused=(device_type == "cpu"))
+    elif optimizer_kind == "mezo":
+        # Zeroth-order default: the step materializes no
+        # gradient, so it is memory-flat in batch size.
+        print0(
+            "Optimizer: MeZo_MinExpLstm_Optimizer "
+            f"(epsilon={getattr(args, 'mezo_epsilon', 1e-3)}, "
+            f"K={getattr(args, 'mezo_K', 4)}, "
+            f"backend={getattr(args, 'mezo_backend', 'cpu')})"
+        )
+        optimizer = MeZo_MinExpLstm_Optimizer(
+            param_groups,
+            lr=param_groups[0]["lr"],
+            weight_decay=param_groups[0].get("weight_decay", 0.0),
+            lam=getattr(args, "minexp_lam", 0.10),
+            clamp_val=getattr(args, "minexp_clamp", 1.0),
+            meta_lr=getattr(args, "minexp_meta_lr", 1e-3),
+            epsilon=getattr(args, "mezo_epsilon", 1e-3),
+            K=getattr(args, "mezo_K", 4),
+            delta_q=getattr(args, "mezo_delta_q", 0.0625),
+            a_base=getattr(args, "mezo_a_base", 1.5),
+            a_min=getattr(args, "mezo_a_min", 0.1),
+            lr_max=getattr(args, "mezo_lr_max", None),
+            backend=getattr(args, "mezo_backend", "cpu"),
+        )
     else:
         print0(
             "Optimizer: SGD_MinExpLstm_Optimizer "
             f"(learnable_beta={getattr(args, 'minexp_learnable_beta', True)}, "
-            f"lam={getattr(args, 'minexp_lam', 0.10)})"
+            f"lam={getattr(args, 'minexp_lam', 0.10)}, "
+            f"--optimizer minexplstm)"
         )
         optimizer = SGD_MinExpLstm_Optimizer(
             param_groups,

@@ -106,8 +106,10 @@ parser.add_argument(
     "--optimizer",
     type=str,
     default="minexplstm",
-    choices=["minexplstm", "adamw"],
-    help="optimizer: MinExpLSTM joint online learned optimizer (default) or AdamW baseline",
+    choices=["minexplstm", "adamw", "mezo"],
+    help="optimizer: MinExpLSTM joint online learned optimizer (default) "
+    "or AdamW baseline; MeZO is zeroth-order and needs the dual-forward "
+    "step in the base-train loop, so it is opt-in here",
 )
 parser.add_argument(
     "--minexp-alpha",

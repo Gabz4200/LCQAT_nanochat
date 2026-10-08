@@ -430,6 +430,13 @@ def train_loop(ctx):
         step_aux_lm_logged = 0.0
 
         for micro_step in range(grad_accum_steps):
+            # Zeroth-order MeZO: apply the seed-replayed perturbation
+            # before the forward pass so the loss below is the
+            # positive-point loss. The dual forward runs once per
+            # optimizer step (micro_step == 0): MeZO materializes no
+            # gradient, so later micro-steps only prefetch.
+            if getattr(args, "optimizer", "minexplstm") == "mezo" and micro_step == 0:
+                ctx.optimizer.perturb(step, scaling=1.0)
             # DARD needs a vocabulary distribution. The CE and KD branches
             # already hold `logits`; the two branches below do not, so
             # `d_logits` is filled by the branch that can produce them and the
@@ -533,13 +540,33 @@ def train_loop(ctx):
                 else:
                     loss = loss + aux
             train_loss = loss.detach()  # for logging
-            loss = (
-                loss / grad_accum_steps
-            )  # each .backward() is a grad sum => normalize loss here
-            if ctx.scaler is not None:
-                ctx.scaler.scale(loss).backward()
+            # Zeroth-order MeZO: the optimizer replaces the
+            # materialized gradient with a scalar SPSA
+            # estimate, so the step is a dual forward pass.
+            # `train_loss` above is the positive-point loss;
+            # the negative-point loss is a second forward
+            # with the perturbation moved to its negative side.
+            if getattr(args, "optimizer", "minexplstm") == "mezo" and micro_step == 0:
+                # `perturb(seed, -2)` moves to the negative
+                # point, `perturb(seed, +1)` restores it.
+                mezo_opt = ctx.optimizer
+                mezo_opt.perturb(step, scaling=-2.0)
+                with torch.no_grad():
+                    loss_neg = ctx.model(x, targets=y, attn_mask=train_attn_mask)
+                mezo_opt.perturb(step, scaling=1.0)
+                mezo_opt.stage_mezo_estimate(step, train_loss, loss_neg)
             else:
-                loss.backward()
+                # Gradient path (every optimizer but MeZO,
+                # or a MeZO micro-step past the first, which
+                # has already staged its estimate).
+                if getattr(args, "optimizer", "minexplstm") != "mezo":
+                    loss = (
+                        loss / grad_accum_steps
+                    )  # each .backward() is a grad sum => normalize loss here
+                    if ctx.scaler is not None:
+                        ctx.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
             x, y, ctx.dataloader_state_dict = next(
                 ctx.train_loader
             )  # prefetch the next batch while the GPU is busy with forward/backward
@@ -547,11 +574,15 @@ def train_loop(ctx):
         lrm = get_lr_multiplier(step, args, num_iterations)
         for group in ctx.optimizer.param_groups:
             group["lr"] = group["initial_lr"] * lrm
-        if ctx.scaler is not None:
+        if getattr(args, "optimizer", "minexplstm") == "mezo":
+            # MeZO already consumed the staged estimate in its
+            # own step (no gradients to unscale, no AMP scaler).
+            ctx.optimizer.step()
+        elif ctx.scaler is not None:
             ctx.scaler.unscale_(ctx.optimizer)
             # In distributed training, all ranks must agree on whether to skip the step.
             # Each rank may independently encounter inf/nan gradients, so we all-reduce
-            # the found_inf flag (MAX = if any rank found inf, all ranks skip).
+            # the found_inf flag (MAX = if any rank found inf, all skip).
             if is_ddp_initialized():
                 for v in ctx.scaler._found_inf_per_device(ctx.optimizer).values():
                     dist.all_reduce(v, op=dist.ReduceOp.MAX)

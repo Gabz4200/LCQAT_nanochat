@@ -209,7 +209,6 @@ class QuantizedLinear(nn.Module):
         self.out_features = out_features
         self.eps = eps
         self.lut_front = lut_front
-        self.quantize_bias_enabled = bool(quantize_bias)
         if lut_front not in (LUT_FRONT_CODEBOOK, LUT_FRONT_CLASSIC):
             raise ValueError(
                 f"lut_front must be one of "
@@ -232,7 +231,7 @@ class QuantizedLinear(nn.Module):
                 index_dtype=input_dtype,
                 output_dtype=output_dtype,
             )
-            if bias
+            if bias and quantize_bias
             else None
         )
         # Present only in `classic` mode, and parameter-free: the scale is read
@@ -253,9 +252,6 @@ class QuantizedLinear(nn.Module):
     def forward(self, x: torch.Tensor):
         quantized_weight = self._correct(self.weight, self.quantize_weight)
         quantized_bias = None
-        # `quantize_bias` is built only when the module has a
-        # bias to quantize, so the two guards are the same
-        # condition; state it once and narrow the lookup.
         if self.bias is not None and self.quantize_bias is not None:
             quantized_bias = self._correct(self.bias, self.quantize_bias)
         # Perform linear transformation with quantized weights and biases

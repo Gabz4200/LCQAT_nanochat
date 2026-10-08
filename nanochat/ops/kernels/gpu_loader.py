@@ -28,10 +28,16 @@ from nanochat.models.quant.packing import (
 #: Largest head dim the attention kernel's per-row accumulator is sized for.
 #: Taichi resolves a module-level Python int as a compile-time constant inside a
 #: kernel body, so the Python-side guard in `quant_attn_gpu` and the `ti.Vector`
-#: width below are the same number by construction rather than by convention --
+#: width below are the same number by construction rather than by convention:
 #: raising the guard alone would otherwise turn a clear ValueError into an
 #: out-of-range write.
 GPU_MAX_HEAD_DIM = 256
+
+#: Floor for the MeZO hidden-state scale. A degenerate all-zero hidden state
+#: quantizes to scale 0, which would divide by zero on the next dequantize;
+#: the floor keeps the scale strictly positive. Distinct from the RMS eps
+#: (1e-8): this is a quantization floor, not a numerical stability constant.
+_SCALE_H_MIN = 1e-12
 
 _lock = Lock()
 _initialized = False
@@ -846,9 +852,9 @@ def run_sgd_minexplstm_step(
     scale_h_new = float(scale_h_out.to_numpy().copy()[0]) / 127.0 + eps
     # Guard against a degenerate all-zero state (the
     # scale would be 0 and the INT8 values would be 0/0).
-    scale_fast_new = max(scale_fast_new, 1e-12)
-    scale_slow_new = max(scale_slow_new, 1e-12)
-    scale_h_new = max(scale_h_new, 1e-12)
+    scale_fast_new = max(scale_fast_new, _SCALE_H_MIN)
+    scale_slow_new = max(scale_slow_new, _SCALE_H_MIN)
+    scale_h_new = max(scale_h_new, _SCALE_H_MIN)
 
     # Copy the updated weight back to the caller's tensor.
     weight.copy_(torch.from_numpy(weight_out.to_numpy().copy()).reshape(weight.shape))
@@ -876,6 +882,328 @@ def run_sgd_minexplstm_step(
         ).to(torch.int8)
     )
     return scale_fast_new, scale_slow_new, scale_h_new
+
+
+# MeZO-MinExpLSTM fused optimizer kernel (PRD v2.0, sections
+# 2.2-2.5/6): two Taichi launches. Pass 1 reduces the
+# squared FIR/MeZO/hidden magnitudes (the layer-wise RMS
+# inputs); pass 2 runs the cell and the update. The FIR
+# signal and the raw MeZO vector are replayed from the
+# PRNG seeds host-side (the Python reference `_replay`),
+# so the kernel consumes the resulting [N] float vectors
+# directly -- one thread per element, the idiomatic
+# Taichi form shared with the GEMV, SparseProp and
+# SGD-MinExpLSTM kernels.
+
+
+@ti.kernel
+def _mezo_minexplstm_rms_kernel(
+    fir: _F32_ARR,
+    mezo: _F32_ARR,
+    h_int8: _I32_ARR,
+    scale_h: ti.f32,
+    fir_sq: _F32_ARR,
+    mezo_sq: _F32_ARR,
+    h_sq: _F32_ARR,
+    n: ti.i32,
+):
+    """Pass 1: accumulate the squared FIR/MeZO/hidden magnitudes.
+
+    One thread per element; each contributes its squared
+    magnitude to a scalar accumulator via atomic add (the
+    reduction is serial by construction, matching the GEMV
+    and SGD-MinExpLSTM RMS passes).
+    """
+    for i in range(n):
+        f = fir[i]
+        m = mezo[i]
+        h = ti.cast(h_int8[i], ti.f32) * scale_h
+        ti.atomic_add(fir_sq[0], f * f)
+        ti.atomic_add(mezo_sq[0], m * m)
+        ti.atomic_add(h_sq[0], h * h)
+
+
+def run_mezo_minexplstm_rms(
+    fir: torch.Tensor,
+    mezo: torch.Tensor,
+    h_int8: torch.Tensor,
+    scale_h: float,
+    n: int,
+) -> tuple[float, float, float]:
+    """Run pass 1: layer-wise RMS inputs (PRD 3.1 contract)."""
+    _ensure_init()
+    # Taichi-owned accumulators: _to_ti copies data in but
+    # never back, so reduction outputs must be ti.ndarray
+    # allocations read back with to_numpy().copy() (the GEMV
+    # pattern).
+    fir_sq = ti.ndarray(ti.f32, shape=(1,))
+    mezo_sq = ti.ndarray(ti.f32, shape=(1,))
+    h_sq = ti.ndarray(ti.f32, shape=(1,))
+    _mezo_minexplstm_rms_kernel(
+        _to_ti(fir.contiguous(), ti.f32),
+        _to_ti(mezo.contiguous(), ti.f32),
+        _to_ti(h_int8.contiguous(), ti.i32),
+        float(scale_h),
+        fir_sq,
+        mezo_sq,
+        h_sq,
+        n,
+    )
+    ti.sync()
+    eps = 1e-8
+    rms_fir = (float(fir_sq.to_numpy().copy()[0]) / n + eps) ** 0.5
+    rms_mezo = (float(mezo_sq.to_numpy().copy()[0]) / n + eps) ** 0.5
+    rms_h = (float(h_sq.to_numpy().copy()[0]) / n + eps) ** 0.5
+    return rms_fir, rms_mezo, rms_h
+
+
+@ti.kernel
+def _mezo_minexplstm_step_kernel(
+    fir: _F32_ARR,
+    mezo: _F32_ARR,
+    weight: _F32_ARR,
+    h_int8: _I32_ARR,
+    scale_h: ti.f32,
+    # The layer-wise RMS values from pass 1.
+    rms_fir: ti.f32,
+    rms_mezo: ti.f32,
+    rms_h: ti.f32,
+    # Cell parameters packed into a single constant array.
+    # Layout (30 floats):
+    #   [0:3]   phi_w   [3]   phi_b
+    #   [4:7]   iota_w  [7]   iota_b
+    #   [8:11]  h_w     [11]  h_b
+    #   [12:16] out_w   [16:20] out_b
+    #   [20:28] film_w  [28:30] film_b
+    cell_params: _F32_ARR,
+    # Optimizer hyperparams
+    lr: ti.f32,
+    wd: ti.f32,
+    clamp_val: ti.f32,
+    clip_val: ti.f32,
+    n: ti.i32,
+    # Outputs
+    weight_out: _F32_ARR,
+    h_next_out: _F32_ARR,
+    scale_h_out: _F32_ARR,
+):
+    """Fused MeZO-MinExpLSTM step (PRD v2.0 sections 2.2-2.5).
+
+    One thread per element: RMS-normalize the FIR/MeZO/hidden
+    inputs (RMS values from pass 1), run the log-domain cell
+    with the 4D latent FiLM head, apply the clipped
+    FiLM-modulated MeZO update with decoupled weight decay,
+    and fold the per-tensor max-abs into the scale
+    accumulator (serial by construction -- `ti.atomic_max`
+    is the reduction primitive, matching the SGD kernel's
+    scale pass).
+    """
+    eps = 1e-8
+    for tid in range(n):
+        # 1. Dequantize the hidden state and RMS-normalize
+        # all three cell inputs (the scale-invariant input
+        # contract).
+        h_prev = ti.cast(h_int8[tid], ti.f32) * scale_h
+        fir_norm = fir[tid] / (rms_fir + eps)
+        mezo_norm = mezo[tid] / (rms_mezo + eps)
+        h_norm = h_prev / (rms_h + eps)
+
+        # 2. Cell forward (log-domain gates, 4D latent FiLM).
+        # x = [fir_norm, mezo_norm, h_norm]
+        x0 = fir_norm
+        x1 = mezo_norm
+        x2 = h_norm
+        phi_val = (
+            cell_params[0] * x0
+            + cell_params[1] * x1
+            + cell_params[2] * x2
+            + cell_params[3]
+        )
+        iota_val = (
+            cell_params[4] * x0
+            + cell_params[5] * x1
+            + cell_params[6] * x2
+            + cell_params[7]
+        )
+        hat_phi = 1.0 / (1.0 + ti.exp(-(phi_val - iota_val)))
+        tilde_h = (
+            cell_params[8] * x0
+            + cell_params[9] * x1
+            + cell_params[10] * x2
+            + cell_params[11]
+        )
+        h_next = hat_phi * h_prev + (1.0 - hat_phi) * tilde_h
+        # 4D latent: z = ReLU(out_proj(h_next))
+        z0 = cell_params[12] * h_next + cell_params[16]
+        z1 = cell_params[13] * h_next + cell_params[17]
+        z2 = cell_params[14] * h_next + cell_params[18]
+        z3 = cell_params[15] * h_next + cell_params[19]
+        if z0 < 0.0:
+            z0 = 0.0
+        if z1 < 0.0:
+            z1 = 0.0
+        if z2 < 0.0:
+            z2 = 0.0
+        if z3 < 0.0:
+            z3 = 0.0
+        # FiLM: [gamma, beta] = film_proj(z)
+        gamma = (
+            cell_params[20] * z0
+            + cell_params[21] * z1
+            + cell_params[22] * z2
+            + cell_params[23] * z3
+            + cell_params[28]
+        )
+        beta = (
+            cell_params[24] * z0
+            + cell_params[25] * z1
+            + cell_params[26] * z2
+            + cell_params[27] * z3
+            + cell_params[29]
+        )
+
+        # 3. FiLM clamp bounds, coordinate-wise clipping, and
+        # the decoupled-weight-decay MeZO update (PRD 2.4/2.5).
+        if gamma < -0.9:
+            gamma = -0.9
+        elif gamma > 2.0:
+            gamma = 2.0
+        if beta < -clamp_val:
+            beta = -clamp_val
+        elif beta > clamp_val:
+            beta = clamp_val
+        raw_update = gamma * mezo[tid] + beta
+        if raw_update < -clip_val:
+            raw_update = -clip_val
+        elif raw_update > clip_val:
+            raw_update = clip_val
+        weight_out[tid] = weight[tid] * (1.0 - lr * wd) - lr * raw_update
+
+        # 4. Fold the per-tensor max-abs into the scale
+        # accumulator (serial by construction; ti.atomic_max is
+        # the atomic reduction primitive). The INT8 quantization
+        # happens host-side against the final scale once the
+        # kernel returns -- the scale is unknown until every
+        # thread has contributed its magnitude.
+        ah = h_next
+        if ah < 0.0:
+            ah = -ah
+        ti.atomic_max(scale_h_out[0], ah)
+        h_next_out[tid] = h_next
+
+
+def run_mezo_minexplstm_step(
+    fir: torch.Tensor,
+    mezo: torch.Tensor,
+    weight: torch.Tensor,
+    h_int8: torch.Tensor,
+    scale_h: float,
+    # Cell parameters
+    phi_w: torch.Tensor,
+    phi_b: torch.Tensor,
+    iota_w: torch.Tensor,
+    iota_b: torch.Tensor,
+    h_w: torch.Tensor,
+    h_b: torch.Tensor,
+    out_w: torch.Tensor,
+    out_b: torch.Tensor,
+    film_w: torch.Tensor,
+    film_b: torch.Tensor,
+    # Hyperparameters
+    lr: float,
+    wd: float,
+    clamp_val: float,
+    clip_val: float,
+) -> float:
+    """Run the fused MeZO-MinExpLSTM step (two Taichi launches).
+
+    Returns the new per-tensor max-abs scale for the hidden
+    state, so the dispatch layer can write it back into the
+    caller's scale tensor (the naive and CPU paths mutate that
+    tensor in place; the GPU path receives the scale as a float
+    and returns the updated value).
+    """
+    _ensure_init()
+
+    fir = fir.contiguous()
+    mezo = mezo.contiguous()
+    weight = weight.contiguous()
+    h_int8 = h_int8.contiguous()
+
+    n = fir.numel()
+
+    # Pass 1: layer-wise RMS of the FIR/MeZO/hidden inputs.
+    rms_fir, rms_mezo, rms_h = run_mezo_minexplstm_rms(fir, mezo, h_int8, scale_h, n)
+
+    # Pack the 30 cell scalars into a single constant array
+    # (PRD section 6.3: load cell weights into constant memory).
+    cell_params_host = torch.zeros(30, dtype=torch.float32, device=fir.device)
+    cell_params_host[0:3] = phi_w.contiguous().flatten()
+    cell_params_host[3] = phi_b.contiguous().flatten()[0]
+    cell_params_host[4:7] = iota_w.contiguous().flatten()
+    cell_params_host[7] = iota_b.contiguous().flatten()[0]
+    cell_params_host[8:11] = h_w.contiguous().flatten()
+    cell_params_host[11] = h_b.contiguous().flatten()[0]
+    cell_params_host[12:16] = out_w.contiguous().flatten()
+    cell_params_host[16:20] = out_b.contiguous().flatten()
+    cell_params_host[20:28] = film_w.contiguous().flatten()
+    cell_params_host[28:30] = film_b.contiguous().flatten()
+
+    # Outputs are Taichi-owned ndarrays: _to_ti is one-way, so
+    # the GEMV pattern (allocate with ti.ndarray, read back with
+    # to_numpy().copy()) applies to every output here.
+    weight_out = ti.ndarray(ti.f32, shape=(n,))
+    h_next_out = ti.ndarray(ti.f32, shape=(n,))
+    scale_h_out = ti.ndarray(ti.f32, shape=(1,))
+
+    _mezo_minexplstm_step_kernel(
+        _to_ti(fir, ti.f32),
+        _to_ti(mezo, ti.f32),
+        _to_ti(weight, ti.f32),
+        _to_ti(h_int8, ti.i32),
+        float(scale_h),
+        rms_fir,
+        rms_mezo,
+        rms_h,
+        _to_ti(cell_params_host, ti.f32),
+        float(lr),
+        float(wd),
+        float(clamp_val),
+        float(clip_val),
+        n,
+        weight_out,
+        h_next_out,
+        scale_h_out,
+    )
+    ti.sync()
+
+    # The kernel folded the per-tensor max-abs into
+    # scale_h_out[0] (serial by construction, like the RMS
+    # pass). Read the final max-abs back, convert to the
+    # symmetric INT8 scale (max-abs / 127, matching the naive
+    # reference's _quantize), then re-quantize the stashed
+    # FP32 hidden state to INT8 against the true final scale.
+    eps = 1e-8
+    scale_h_new = float(scale_h_out.to_numpy().copy()[0]) / 127.0 + eps
+    # Guard against a degenerate all-zero hidden state (scale 0
+    # would divide by zero on the next dequantize). Distinct from
+    # the RMS eps: this is a quantization floor, not a numerical
+    # stability constant.
+    scale_h_new = max(scale_h_new, _SCALE_H_MIN)
+
+    # Copy the updated weight back to the caller's tensor.
+    weight.copy_(torch.from_numpy(weight_out.to_numpy().copy()).reshape(weight.shape))
+    # Re-quantize the new hidden state to INT8 against the
+    # final scale (PRD 4.1: symmetric max-abs, int8 range).
+    h_next = torch.from_numpy(h_next_out.to_numpy().copy()).reshape(h_int8.shape)
+    h_int8.copy_(
+        torch.clamp(
+            torch.round(h_next / scale_h_new),
+            -128,
+            127,
+        ).to(torch.int8)
+    )
+    return scale_h_new
 
 
 # DiffusionBlocks EDM denoising loss (arXiv 2506.14202, training objective).

@@ -11,31 +11,28 @@
  * 6. FiLM-modulated SGD step with weight decay
  * 7. Re-quantize states to INT8 (symmetric max-abs)
  *
- * AVX2 primary path; scalar fallback for CPUs without AVX2.
- * Kernel processes 1024-element blocks for L1/L2 cache locality.
- * OpenMP parallelism over 1024-element blocks.
+ * Scalar implementation of the fused pipeline. AVX2 and block
+ * parallelism are future work; correctness comes first, and the
+ * scalar path is the parity reference the kernels are tested
+ * against (the blocking constants below document the intended
+ * cache shape, not a current loop structure).
  */
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <torch/library.h>
-#include <immintrin.h>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 namespace {
 
 // Cell parameters (34 total, loaded from Python)
-// Packed layout for efficient SIMD access:
-// [phi_w(3), iota_w(3), h_w(3), out_w(4), film_w(8), film_b(2), phi_b, iota_b, h_b, out_b(4), w_beta, b_beta]
+// Layout: [phi_w(3), iota_w(3), h_w(3), out_w(4),
+//          film_w(8), film_b(2), phi_b, iota_b, h_b,
+//          out_b(4), w_beta, b_beta]
 // Total: 3+3+3+4+8+2 + 1+1+1+4 + 1+1 = 34 floats
 
-constexpr int kInputSize = 3;   // [g_norm, ema_fast_norm, ema_slow_norm]
-constexpr int kHiddenSize = 1;
-constexpr int kLatentDim = 4;
-constexpr int kOutputSize = 2;  // [gamma, delta]
-
-constexpr int kBlockSize = 1024;  // L1/L2 cache blocking
 constexpr float kEps = 1e-8f;
 constexpr float kGammaMin = -0.9f;
 constexpr float kGammaMax = 2.0f;
@@ -93,19 +90,24 @@ void sgd_minexplstm_step_scalar(
     }
     float rms_g = sqrtf(sum_sq / n + kEps);
 
-    // Dequantize EMA states
-    float* ema_fast = static_cast<float*>(alloca(n * sizeof(float)));
-    float* ema_slow = static_cast<float*>(alloca(n * sizeof(float)));
-    float* h_prev = static_cast<float*>(alloca(n * sizeof(float)));
+    // Dequantize EMA states. Heap, not stack: `n` is the parameter
+    // count and an lm_head alone is vocab*dim elements (millions),
+    // which would overflow the stack frame via alloca.
+    std::vector<float> ema_fast(static_cast<size_t>(n));
+    std::vector<float> ema_slow(static_cast<size_t>(n));
+    std::vector<float> h_prev(static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i) {
-        ema_fast[i] = ema_fast_int8[i] * scale_fast;
-        ema_slow[i] = ema_slow_int8[i] * scale_slow;
-        h_prev[i] = h_int8[i] * scale_h;
+        ema_fast[static_cast<size_t>(i)] = ema_fast_int8[i] * scale_fast;
+        ema_slow[static_cast<size_t>(i)] = ema_slow_int8[i] * scale_slow;
+        h_prev[static_cast<size_t>(i)] = h_int8[i] * scale_h;
     }
 
-    // Lambda-coupled beta prediction (shared w_beta, b_beta)
-    float beta_fast_arr[1024]; // max block size
-    float beta_slow_arr[1024];
+    // Lambda-coupled beta prediction (shared w_beta, b_beta).
+    // Sized to `n`, not a fixed 1024: the prediction is
+    // per-coordinate and the kernel processes the whole tensor
+    // in one pass, so any n > 1024 would overflow a fixed buffer.
+    std::vector<float> beta_fast_arr(static_cast<size_t>(n));
+    std::vector<float> beta_slow_arr(static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i) {
         float g_norm = grad[i] / (rms_g + kEps);
         float u = g_norm * w_beta + b_beta;
@@ -235,6 +237,23 @@ void sgd_minexplstm_step(
     TORCH_CHECK(ema_fast_int8.sizes() == grad.sizes(), "ema_fast shape mismatch");
     TORCH_CHECK(ema_slow_int8.sizes() == grad.sizes(), "ema_slow shape mismatch");
     TORCH_CHECK(h_int8.sizes() == grad.sizes(), "h shape mismatch");
+    // Validate dtypes and devices: the raw-pointer extraction
+    // below (data_ptr<float>, item<float>) is undefined
+    // behavior on a non-FP32 tensor and silently wrong on a
+    // non-CPU tensor, so the contract is enforced here rather
+    // than left to the caller.
+    TORCH_CHECK(grad.device().is_cpu(), "grad must be a CPU tensor");
+    TORCH_CHECK(grad.dtype() == at::kFloat, "grad must be FP32");
+    TORCH_CHECK(weight.dtype() == at::kFloat, "weight must be FP32");
+    TORCH_CHECK(ema_fast_int8.dtype() == at::kChar, "ema_fast_int8 must be int8");
+    TORCH_CHECK(ema_slow_int8.dtype() == at::kChar, "ema_slow_int8 must be int8");
+    TORCH_CHECK(h_int8.dtype() == at::kChar, "h_int8 must be int8");
+    for (const auto& t : {phi_w, iota_w, h_w, out_w, film_w}) {
+        TORCH_CHECK(t.dtype() == at::kFloat, "cell weights must be FP32");
+    }
+    for (const auto& t : {phi_b, iota_b, h_b, out_b, film_b, w_beta_t, b_beta_t}) {
+        TORCH_CHECK(t.dtype() == at::kFloat, "cell biases must be FP32");
+    }
 
     // Contiguous
     grad = grad.contiguous();
@@ -278,7 +297,8 @@ void sgd_minexplstm_step(
     float film_b_arr[2];
     for (int i = 0; i < 2; ++i) film_b_arr[i] = film_b[i].item<float>();
 
-    // Call scalar implementation (AVX2 to be added)
+    // Scalar implementation; AVX2/block parallelism
+    // is future work (see the header comment).
     sgd_minexplstm_step_scalar(
         grad.data_ptr<float>(),
         weight.data_ptr<float>(),

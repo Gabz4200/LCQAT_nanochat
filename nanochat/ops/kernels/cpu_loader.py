@@ -95,10 +95,18 @@ def load_cpu_db_denoise_extension():
 def load_cpu_sgd_minexplstm_extension():
     """Build (once per process) the SGD-MinExpLSTM CPU extension.
 
-    Registers `nanochat::sgd_minexplstm_step`. Its own extension so it compiles
-    independently of the other kernels: a change to one kernel
-    then costs one rebuild, not all of them. (Every one of these must use
-    TORCH_LIBRARY_FRAGMENT, never a second TORCH_LIBRARY on the same namespace
-    -- the latter SIGABRTs during dlopen.)
+    See ``load_cpu_extension`` for the build contract.
     """
     return _load("nanochat_sgd_minexplstm_cpu", "sgd_minexplstm.cpp")
+
+
+def load_cpu_mezo_minexplstm_extension():
+    """Build (once per process) the MeZO-MinExpLSTM CPU extension.
+
+    Same contract as ``load_cpu_sgd_minexplstm_extension``: the
+    MeZO step kernel shares the fused pipeline shape (INT8 state
+    in, FP32 update, INT8 state out) with the SGD step, so the
+    extension is cached per process and built on first
+    ``backend="cpu"`` dispatch only.
+    """
+    return _load("nanochat_mezo_minexplstm_cpu", "mezo_minexplstm.cpp")

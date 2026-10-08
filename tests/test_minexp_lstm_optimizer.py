@@ -26,6 +26,7 @@ The mathematical anchors:
   momentum hyperparameters.
 """
 
+import pytest
 import torch
 
 from nanochat.training.minexp_lstm import MinExpLSTMCell, SGD_MinExpLstm_Optimizer
@@ -372,7 +373,9 @@ def test_optimizer_trains_diffusion_blocks_engine() -> None:
     This is the joint-usage requirement: DiffusionBlocks, LC-QAT
     (the engine wraps LCQATLinear layers), and the learned optimizer
     all run in the same step. The block-isolated backward must reach
-    the optimizer, and a matrix weight must move.
+    the optimizer, a matrix weight must move, and the loss must
+    actually decrease -- a weight update in the wrong direction
+    would move the weight but leave the model no better.
     """
     from nanochat.modules.experiments.tiny_models import make_engine
 
@@ -381,13 +384,22 @@ def test_optimizer_trains_diffusion_blocks_engine() -> None:
     opt = SGD_MinExpLstm_Optimizer(list(engine.parameters()), lr=3e-4)
     idx = torch.randint(0, 128, (2, 16))
     before = engine.model.transformer.h[0].attn.c_q.weight.detach().clone()
-    opt.zero_grad(set_to_none=True)
-    loss = engine.train_step(idx, idx, block_idx=0)
-    loss.backward()
-    opt.step()
+    first_losses = []
+    for _ in range(3):
+        opt.zero_grad(set_to_none=True)
+        loss = engine.train_step(idx, idx, block_idx=0)
+        first_losses.append(float(loss.detach()))
+        loss.backward()
+        opt.step()
     after = engine.model.transformer.h[0].attn.c_q.weight.detach()
     assert not torch.equal(before, after)
     assert torch.isfinite(after).all()
+    # The loss must trend down across the steps: the optimizer
+    # is the whole point, and a step that moves weights without
+    # reducing the reconstruction loss is not training.
+    assert first_losses[-1] < first_losses[0], (
+        f"loss did not decrease: {first_losses[0]:.4f} -> {first_losses[-1]:.4f}"
+    )
 
 
 def test_optimizer_trains_lcqat_codebook_params() -> None:
@@ -542,6 +554,13 @@ def test_meta_step_returns_loss_and_is_differentiable() -> None:
     p = next(module.parameters())
     opt = SGD_MinExpLstm_Optimizer([p], lr=1e-3)
 
+    # The closure rebuilds each parameter from its gradient, so
+    # a step (which populates p.grad and the optimizer state)
+    # must precede meta_step. meta_step before zero_grad: the
+    # closure reads p.grad to rebuild the updated value.
+    p.grad = torch.ones_like(p)
+    opt.step()
+
     def closure(params):
         # Build a differentiable loss from the updated params.
         return torch.stack([v.sum() for v in params.values()])
@@ -549,6 +568,28 @@ def test_meta_step_returns_loss_and_is_differentiable() -> None:
     loss = opt.meta_step(module, closure, meta_lr=0.0)
     assert isinstance(loss, torch.Tensor)
     assert loss.requires_grad
+
+
+def test_meta_step_without_grad_raises() -> None:
+    """meta_step(model, closure) with no gradient fails loudly.
+
+    The closure rebuilds every optimizer-owned parameter from
+    ``p.grad``. A zeroed (or never-populated) gradient leaves
+    nothing to rebuild; the historical behavior was a silent
+    no-op that left the cell untrained while reporting a
+    healthy loss. Fail fast instead.
+    """
+    torch.manual_seed(8)
+    module = torch.nn.Linear(4, 4, bias=False)
+    p = next(module.parameters())
+    opt = SGD_MinExpLstm_Optimizer([p], lr=1e-3)
+
+    def closure(params):
+        return torch.stack([v.sum() for v in params.values()])
+
+    # No step ran, so p.grad is None and the state is empty.
+    with pytest.raises(RuntimeError, match="rebuilt 0 parameters"):
+        opt.meta_step(module, closure)
 
 
 def test_learnable_beta_is_data_dependent_and_bounded() -> None:

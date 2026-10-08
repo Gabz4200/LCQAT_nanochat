@@ -123,6 +123,48 @@ def test_when_packed_mask_then_concat_mask_respects_documents() -> None:
     assert full_bool[0, 0, t + 6, t + 5 : t + 8].tolist() == [True, True, False]
 
 
+def test_when_documents_do_not_fill_the_sequence_then_padding_is_isolated() -> None:
+    """The padding tail is its own (last) document, so no real token sees it.
+
+    ``block_diagonal_mask`` stamps every position past the last
+    document with a fresh document id. A mask that left the tail at
+    id 0 (or the previous document's id) would let a real token attend
+    into padding -- silent information leakage that only shows up as a
+    slightly wrong loss on short batches.
+    """
+    from nanochat.training.diffusion_blocks import block_diagonal_mask
+
+    # Two documents (lengths 5 and 2) packed into a sequence of 8:
+    # positions 7 is padding.
+    mask = block_diagonal_mask([5, 2], 8, device="cpu")
+    m = mask[0, 0] if mask.ndim == 4 else mask
+    # Position 7 (padding) attends to nothing: it is its own document.
+    assert not m[7, :7].any(), "padding token attends to a real token"
+    # A real token (position 6, doc 2) does NOT attend to padding (7).
+    assert not m[6, 7], "real token attends to padding"
+    # Document 1 (positions 0..4) and document 2 (positions 5..6)
+    # stay mutually invisible.
+    assert not m[5, :5].any(), "doc 2 attends to doc 1"
+    assert not m[0, 5:7].any(), "doc 1 attends to doc 2"
+
+
+def test_when_documents_have_unequal_tails_then_each_keeps_its_own_past() -> None:
+    """A long document followed by a short one: the short one's last token
+    sees its own full past and nothing from the long document.
+    """
+    from nanochat.training.diffusion_blocks import block_diagonal_mask
+
+    # Doc 0 spans positions 0..5 (length 6); doc 1 spans 6..7 (length 2).
+    mask = block_diagonal_mask([6, 2], 8, device="cpu")
+    m = mask[0, 0] if mask.ndim == 4 else mask
+    # Position 7 (last token of doc 1) attends to its own past (6)
+    # and itself, but never to doc 0 (0..5).
+    assert bool(m[7, 6]), "doc 1 misses its own past"
+    assert not m[7, :6].any(), "doc 1 attends to doc 0"
+    # Doc 0's last token (5) never sees doc 1 (6..7).
+    assert not m[5, 6:8].any(), "doc 0 attends to doc 1"
+
+
 def test_when_engine_backend_cpu_then_matches_naive() -> None:
     """The compiled kernel must not change training, only how it is computed."""
     torch.manual_seed(3)

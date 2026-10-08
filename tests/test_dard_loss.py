@@ -326,6 +326,36 @@ def test_when_the_first_step_runs_then_no_division_by_an_unseeded_ema() -> None:
     assert aml.grad is not None and aml.grad.abs() > 0
 
 
+def test_when_warmup_ends_then_the_next_step_normalizes() -> None:
+    """The warmup branch is `steps <= 1` *after* the EMA update, so only the
+    first call is warmup; the second call is the first normalized one.
+
+    A warmup that ran one step too long (or too short) would flip the
+    loss scale mid-run while every single-step assertion still passed:
+    the unweighted step reports the raw sum, the normalized step reports
+    the EMA-quotient. Pinning the boundary means the two regimes are
+    distinguishable at exactly the second call.
+    """
+    balancer = DardLossBalancer(ema_decay=0.9, lambda_global=0.5)
+    balancer.train()
+    # First call: _update raises steps to 1, so the warmup branch
+    # fires and the total is the unweighted sum.
+    total, _ = balancer(torch.tensor(2.0), torch.tensor(0.5))
+    assert total.item() == pytest.approx(2.5, abs=1e-6)
+    # Second call: _update runs first (steps -> 2), seeding the
+    # EMA by one more decay step, then the normalized branch
+    # divides each term by its just-updated EMA and scales the
+    # aux term by lambda_global. Replicate the EMA math the
+    # forward is about to apply so the expected value is exact.
+    mu_ce = 0.2 * 0.9 + 2.0 * 0.1  # post-update, second call
+    mu_aml = 0.05 * 0.9 + 0.5 * 0.1
+    total, _ = balancer(torch.tensor(2.0), torch.tensor(0.5))
+    assert total.item() == pytest.approx(
+        2.0 / mu_ce + 0.5 * 0.5 / mu_aml,
+        abs=1e-6,
+    ), "the second call must leave the warmup branch and normalize by the EMA"
+
+
 def test_when_in_eval_mode_then_the_ema_is_frozen() -> None:
     """Eval must not mutate training state: a val pass would otherwise shift mu."""
     balancer = DardLossBalancer(ema_decay=0.9)

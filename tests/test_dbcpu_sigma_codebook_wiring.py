@@ -337,6 +337,40 @@ class TestQuantizedRuntimeGuard:
         assert maybe_sigma_call(mlp.c_fc, torch.randn(2, 8), None) is not None
 
 
+class TestSigmaNoneForward:
+    def test_when_conditioned_and_sigma_is_none_then_forward_raises(self) -> None:
+        """A sigma-conditioned layer cannot quantize without the level.
+
+        ``forward`` resolves the batch's noise level against the
+        input rows; with ``sigma=None`` it has nothing to condition
+        on. The error names the flag that produces the layer so the
+        fix (pass sigma or disable --db-sigma-codebook) is actionable.
+        """
+        from nanochat.models.quant.linear import LCQATLinear
+
+        layer = LCQATLinear(8, 8, bias=False)
+        layer.act_quantizer = modulated(
+            __import__(
+                "nanochat.models.quant.codebook", fromlist=["x"]
+            ).MemoryEfficientLearnedCodebook(m_neg=3, m_pos=3)
+        )
+        with pytest.raises(ValueError, match="sigma-conditioned"):
+            layer(torch.randn(2, 8), sigma=None)
+
+    def test_when_static_and_sigma_is_none_then_forward_works(self) -> None:
+        """A static (unconditioned) layer never reads sigma.
+
+        The raise above must be scoped to conditioned layers only:
+        a guard that fired on sigma=None for every layer would break
+        the plain-quantized forward, which passes sigma=None today.
+        """
+        from nanochat.models.quant.linear import LCQATLinear
+
+        layer = LCQATLinear(8, 8, bias=False)
+        out = layer(torch.randn(2, 8), sigma=None)
+        assert out.shape == (2, 8)
+
+
 class TestGradientScaling:
     def test_when_inv_sqrt_n_then_the_conditioned_gradient_is_scaled(self) -> None:
         """PRD 2.4 applies to conditioned codebooks too.

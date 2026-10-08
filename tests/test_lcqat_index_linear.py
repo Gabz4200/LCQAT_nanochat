@@ -12,11 +12,6 @@ import torch
 
 from nanochat.models.quant.packing import FORMAT_TRITS, pack_weight_indices
 from nanochat.ops import dispatch_index_linear
-from nanochat.ops.kernels.gpu_loader import vulkan_available
-
-requires_vulkan = pytest.mark.skipif(
-    not vulkan_available(), reason="Vulkan device unavailable for the Taichi backend"
-)
 
 
 def make_case(k: int, m: int, n: int, t: int, seed: int = 0):
@@ -145,7 +140,6 @@ def test_when_cpu_backend_all_formats_then_matches_naive(k: int) -> None:
     assert torch.allclose(cpu, naive, atol=1e-5, rtol=1e-5)
 
 
-@requires_vulkan
 @pytest.mark.parametrize("k", [3, 15, 255])
 def test_when_gpu_backend_then_matches_naive(k: int) -> None:
     case, _ = make_case(k, 8, 32, 5, seed=300 + k)

@@ -20,17 +20,13 @@ from nanochat.models.quant.sparseprop import (
     inject_sparseprop_layers,
 )
 from nanochat.ops import dispatch_sparseprop_backward, dispatch_sparseprop_forward
-from nanochat.ops.kernels.gpu_loader import vulkan_available
+from nanochat.ops.dispatch import Backend
 from nanochat.ops.sparseprop import (
     build_csr_csc_from_mask,
     gather_values_from_dense,
     gather_values_from_dense_csc,
     sparseprop_backward_cpu,
     sparseprop_forward_cpu,
-)
-
-requires_vulkan = pytest.mark.skipif(
-    not vulkan_available(), reason="Vulkan device unavailable for the Taichi backend"
 )
 
 
@@ -163,26 +159,19 @@ def loop_oracle_backward(
     return gX, gW
 
 
-# ---------------------------------------------------------------------------
-# Forward and backward parity: naive == cpu == gpu == loop oracle
-# ---------------------------------------------------------------------------
+# The four parity shapes below dispatch the same
+# forward/backward calls; only the backend pair differs.
+PARITY_SHAPES = [
+    (6, 8, 5, 0.5),
+    (16, 32, 13, 0.75),
+    (32, 64, 16, 0.9),
+    (8, 8, 8, 0.5),
+]
+PARITY_IDS = ["small", "default", "high", "aligned"]
 
 
-@pytest.mark.parametrize(
-    ("M", "K", "B", "sparsity"),
-    [
-        (6, 8, 5, 0.5),  # B % 8 != 0 (scalar tail in the AVX2 walk)
-        (16, 32, 13, 0.75),  # default sparsity, misaligned batch
-        (32, 64, 16, 0.9),  # high sparsity, the sparse regime
-        (8, 8, 8, 0.5),  # square, vector-width aligned
-    ],
-    ids=["small", "default", "high", "aligned"],
-)
-def test_when_naive_backend_then_matches_independent_loop(
-    M: int, K: int, B: int, sparsity: float
-) -> None:
-    case = make_case(M, K, B, sparsity, seed=M * 1000 + K)
-    got = dispatch_sparseprop_forward(
+def _forward(case: dict, backend: Backend) -> torch.Tensor:
+    return dispatch_sparseprop_forward(
         case["x"].t(),
         case["weight_dense"],
         case["mask"],
@@ -191,184 +180,84 @@ def test_when_naive_backend_then_matches_independent_loop(
         case["w_ptr"],
         case["bias"],
         case["M"],
-        backend="naive",
+        backend=backend,
     )
+
+
+def _backward(case: dict, backend: Backend) -> tuple[torch.Tensor, torch.Tensor]:
+    return dispatch_sparseprop_backward(
+        case["gY"],
+        case["x"].t(),
+        case["weight_dense"],
+        case["mask"],
+        case["w_val"],
+        case["w_col"],
+        case["w_ptr"],
+        case["w_val_csc"],
+        case["w_row"],
+        case["w_cptr"],
+        case["M"],
+        case["K"],
+        backend=backend,
+    )
+
+
+def _nnz_rows(case: dict) -> torch.Tensor:
+    """Row index of every nnz listing entry."""
+    return torch.repeat_interleave(
+        torch.arange(case["M"]),
+        (case["w_ptr"][1:] - case["w_ptr"][:-1]).to(torch.int64),
+    )
+
+
+@pytest.mark.parametrize(("M", "K", "B", "sparsity"), PARITY_SHAPES, ids=PARITY_IDS)
+def test_when_naive_backend_then_matches_independent_loop(
+    M: int, K: int, B: int, sparsity: float
+) -> None:
+    case = make_case(M, K, B, sparsity, seed=M * 1000 + K)
+    got = _forward(case, "naive")
     expected = loop_oracle_forward(
         case["weight_dense"], case["mask"], case["x"], case["bias"]
     )
     assert torch.allclose(got, expected, atol=1e-5)
 
-    gX, gW_val = dispatch_sparseprop_backward(
-        case["gY"],
-        case["x"].t(),
-        case["weight_dense"],
-        case["mask"],
-        case["w_val"],
-        case["w_col"],
-        case["w_ptr"],
-        case["w_val_csc"],
-        case["w_row"],
-        case["w_cptr"],
-        case["M"],
-        case["K"],
-        backend="naive",
-    )
+    gX, gW_val = _backward(case, "naive")
     gX_ref, gW_ref = loop_oracle_backward(
         case["gY"], case["weight_dense"], case["mask"], case["x"]
     )
     assert torch.allclose(gX, gX_ref, atol=1e-5)
-    # The naive backend returns the nnz listing: extract the same
-    # positions from the loop oracle's dense gradient.
-    row_idx = torch.repeat_interleave(
-        torch.arange(M),
-        (case["w_ptr"][1:] - case["w_ptr"][:-1]).to(torch.int64),
-    )
-    lin_idx = row_idx.long() * K + case["w_col"].long()
+    # The naive backend returns the nnz listing, not a dense [M, K] tensor.
+    lin_idx = _nnz_rows(case).long() * K + case["w_col"].long()
     assert torch.allclose(gW_val, gW_ref.reshape(-1)[lin_idx], atol=1e-5)
 
 
-@pytest.mark.parametrize(
-    ("M", "K", "B", "sparsity"),
-    [
-        (6, 8, 5, 0.5),
-        (16, 32, 13, 0.75),
-        (32, 64, 16, 0.9),
-        (8, 8, 8, 0.5),
-    ],
-    ids=["small", "default", "high", "aligned"],
-)
+@pytest.mark.parametrize(("M", "K", "B", "sparsity"), PARITY_SHAPES, ids=PARITY_IDS)
 def test_when_cpu_backend_then_matches_naive(
     M: int, K: int, B: int, sparsity: float
 ) -> None:
     case = make_case(M, K, B, sparsity, seed=M * 1000 + K + 1)
-    naive = dispatch_sparseprop_forward(
-        case["x"].t(),
-        case["weight_dense"],
-        case["mask"],
-        case["w_val"],
-        case["w_col"],
-        case["w_ptr"],
-        case["bias"],
-        case["M"],
-        backend="naive",
-    )
-    cpu = dispatch_sparseprop_forward(
-        case["x"].t(),
-        case["weight_dense"],
-        case["mask"],
-        case["w_val"],
-        case["w_col"],
-        case["w_ptr"],
-        case["bias"],
-        case["M"],
-        backend="cpu",
-    )
+    naive = _forward(case, "naive")
+    cpu = _forward(case, "cpu")
     assert torch.allclose(cpu, naive, atol=1e-5)
 
-    gX_n, gW_n = dispatch_sparseprop_backward(
-        case["gY"],
-        case["x"].t(),
-        case["weight_dense"],
-        case["mask"],
-        case["w_val"],
-        case["w_col"],
-        case["w_ptr"],
-        case["w_val_csc"],
-        case["w_row"],
-        case["w_cptr"],
-        case["M"],
-        case["K"],
-        backend="naive",
-    )
-    gX_c, gW_c = dispatch_sparseprop_backward(
-        case["gY"],
-        case["x"].t(),
-        case["weight_dense"],
-        case["mask"],
-        case["w_val"],
-        case["w_col"],
-        case["w_ptr"],
-        case["w_val_csc"],
-        case["w_row"],
-        case["w_cptr"],
-        case["M"],
-        case["K"],
-        backend="cpu",
-    )
+    gX_n, gW_n = _backward(case, "naive")
+    gX_c, gW_c = _backward(case, "cpu")
     assert torch.allclose(gX_c, gX_n, atol=1e-5)
     assert torch.allclose(gW_c, gW_n, atol=1e-5)
 
 
-@requires_vulkan
-@pytest.mark.parametrize(
-    ("M", "K", "B", "sparsity"),
-    [
-        (6, 8, 5, 0.5),
-        (16, 32, 13, 0.75),
-        (32, 64, 16, 0.9),
-        (8, 8, 8, 0.5),
-    ],
-    ids=["small", "default", "high", "aligned"],
-)
+@pytest.mark.parametrize(("M", "K", "B", "sparsity"), PARITY_SHAPES, ids=PARITY_IDS)
 def test_when_gpu_backend_then_matches_naive(
     M: int, K: int, B: int, sparsity: float
 ) -> None:
     case = make_case(M, K, B, sparsity, seed=M * 1000 + K + 2)
-    naive = dispatch_sparseprop_forward(
-        case["x"].t(),
-        case["weight_dense"],
-        case["mask"],
-        case["w_val"],
-        case["w_col"],
-        case["w_ptr"],
-        case["bias"],
-        case["M"],
-        backend="naive",
-    )
-    gpu = dispatch_sparseprop_forward(
-        case["x"].t(),
-        case["weight_dense"],
-        case["mask"],
-        case["w_val"],
-        case["w_col"],
-        case["w_ptr"],
-        case["bias"],
-        case["M"],
-        backend="gpu",
-    )
+    naive = _forward(case, "naive")
+    gpu = _forward(case, "gpu")
     assert gpu.shape == naive.shape
     assert torch.allclose(gpu, naive, atol=1e-5)
 
-    gX_n, gW_n = dispatch_sparseprop_backward(
-        case["gY"],
-        case["x"].t(),
-        case["weight_dense"],
-        case["mask"],
-        case["w_val"],
-        case["w_col"],
-        case["w_ptr"],
-        case["w_val_csc"],
-        case["w_row"],
-        case["w_cptr"],
-        case["M"],
-        case["K"],
-        backend="naive",
-    )
-    gX_g, gW_g = dispatch_sparseprop_backward(
-        case["gY"],
-        case["x"].t(),
-        case["weight_dense"],
-        case["mask"],
-        case["w_val"],
-        case["w_col"],
-        case["w_ptr"],
-        case["w_val_csc"],
-        case["w_row"],
-        case["w_cptr"],
-        case["M"],
-        case["K"],
-        backend="gpu",
-    )
+    gX_n, gW_n = _backward(case, "naive")
+    gX_g, gW_g = _backward(case, "gpu")
     assert torch.allclose(gX_g, gX_n, atol=1e-5)
     assert torch.allclose(gW_g, gW_n, atol=1e-5)
 
@@ -383,28 +272,8 @@ def test_when_no_bias_then_matches_naive(
 ) -> None:
     case = make_case(M, K, B, sparsity, seed=7, bias=False)
     assert case["bias"] is None
-    naive = dispatch_sparseprop_forward(
-        case["x"].t(),
-        case["weight_dense"],
-        case["mask"],
-        case["w_val"],
-        case["w_col"],
-        case["w_ptr"],
-        None,
-        case["M"],
-        backend="naive",
-    )
-    cpu = dispatch_sparseprop_forward(
-        case["x"].t(),
-        case["weight_dense"],
-        case["mask"],
-        case["w_val"],
-        case["w_col"],
-        case["w_ptr"],
-        None,
-        case["M"],
-        backend="cpu",
-    )
+    naive = _forward(case, "naive")
+    cpu = _forward(case, "cpu")
     assert torch.allclose(cpu, naive, atol=1e-5)
 
 
@@ -416,31 +285,11 @@ def test_when_no_bias_then_matches_naive(
 def test_when_adversarial_mask_then_cpu_matches_naive(
     dense_row: bool, dense_col: bool
 ) -> None:
-    """A fully-kept row (or column) is the adversarial end of the
-    CSR/CSC walk: one listing entry count at the maximum."""
+    """A fully-kept row (or column) is the adversarial end of
+    the CSR/CSC walk: one listing entry count at the maximum."""
     case = make_case(16, 32, 13, 0.75, seed=9, dense_row=dense_row, dense_col=dense_col)
-    naive = dispatch_sparseprop_forward(
-        case["x"].t(),
-        case["weight_dense"],
-        case["mask"],
-        case["w_val"],
-        case["w_col"],
-        case["w_ptr"],
-        case["bias"],
-        case["M"],
-        backend="naive",
-    )
-    cpu = dispatch_sparseprop_forward(
-        case["x"].t(),
-        case["weight_dense"],
-        case["mask"],
-        case["w_val"],
-        case["w_col"],
-        case["w_ptr"],
-        case["bias"],
-        case["M"],
-        backend="cpu",
-    )
+    naive = _forward(case, "naive")
+    cpu = _forward(case, "cpu")
     assert torch.allclose(cpu, naive, atol=1e-5)
 
 
@@ -720,7 +569,7 @@ class TestMeasuredCrossover:
         layer._set_mask(torch.rand(8, 16) < 0.15)
         assert layer._kernel_choice is None
 
-    @pytest.mark.parametrize("kernel", ["cpu"])
+    @pytest.mark.parametrize("kernel", ["cpu", "gpu"])
     def test_when_sparse_kernel_forced_then_gradients_match_dense(
         self, kernel: str
     ) -> None:
@@ -764,44 +613,6 @@ class TestMeasuredCrossover:
         )
         # The freeze contract: pruned slots hold an exact zero
         # gradient (a mask multiply could only approximate this).
-        assert bool((layer.weight.grad[~mask] == 0).all())
-
-    @requires_vulkan
-    def test_when_gpu_kernel_forced_then_gradients_match_dense(self) -> None:
-        torch.manual_seed(0)
-        M, K = 8, 16
-        lin = nn.Linear(K, M, bias=True)
-        layer = SparsePropLinear.from_linear(lin, sparsity=0.9)
-        mask = torch.rand(M, K) < 0.15
-        layer._set_mask(mask)
-        layer._kernel_choice = "gpu"
-
-        x = torch.randn(4, K)
-        x_sparse = x.clone().requires_grad_(True)
-        y = layer(x_sparse)
-        loss = y.square().mean()
-        loss.backward()
-
-        lin_ref = nn.Linear(K, M, bias=True)
-        with torch.no_grad():
-            lin_ref.weight.copy_(layer.weight)
-            lin_ref.bias.copy_(layer.bias)
-        x_ref = x.clone().requires_grad_(True)
-        y_ref = lin_ref(x_ref)
-        loss_ref = y_ref.square().mean()
-        loss_ref.backward()
-
-        assert x_sparse.grad is not None and x_ref.grad is not None, (
-            "input gradient is None after backward"
-        )
-        assert layer.weight.grad is not None and lin_ref.weight.grad is not None, (
-            "weight gradient is None after backward"
-        )
-        assert torch.allclose(y, y_ref, atol=1e-5)
-        assert torch.allclose(x_sparse.grad, x_ref.grad, atol=1e-5)
-        assert torch.allclose(
-            layer.weight.grad[mask], lin_ref.weight.grad[mask], atol=1e-5
-        )
         assert bool((layer.weight.grad[~mask] == 0).all())
 
 

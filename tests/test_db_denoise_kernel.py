@@ -19,11 +19,6 @@ import pytest
 import torch
 
 from nanochat.ops import dispatch_db_denoise
-from nanochat.ops.kernels.gpu_loader import vulkan_available
-
-requires_vulkan = pytest.mark.skipif(
-    not vulkan_available(), reason="Vulkan device unavailable for the Taichi backend"
-)
 
 
 def make_case(b: int = 2, t: int = 8, d: int = 16, seed: int = 0):
@@ -62,7 +57,6 @@ def test_when_cpu_backend_then_matches_naive() -> None:
         assert torch.allclose(got, expected, atol=1e-5, rtol=1e-5)
 
 
-@requires_vulkan
 def test_when_gpu_backend_then_matches_naive() -> None:
     for shape, seed in [((2, 8, 16), 1), ((1, 5, 7), 2)]:
         pred, clean, weight = make_case(*shape, seed=seed)

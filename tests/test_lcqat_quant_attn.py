@@ -14,14 +14,8 @@ import torch
 
 from nanochat.models.quant.packing import pack_nibbles
 from nanochat.ops import dispatch_quant_attn
-from nanochat.ops.kernels.gpu_loader import vulkan_available
-
-requires_vulkan = pytest.mark.skipif(
-    not vulkan_available(), reason="Vulkan device unavailable for the Taichi backend"
-)
 
 B, T, H, H_KV, D, K = 2, 16, 4, 2, 16, 15
-
 _BACKEND_CASES = [
     (1, -1, 16),
     (1, 4, 16),
@@ -144,7 +138,6 @@ def test_when_cpu_backend_then_matches_naive(
     assert torch.allclose(cpu, naive, atol=1e-5, rtol=1e-5)
 
 
-@requires_vulkan
 @pytest.mark.parametrize(
     ("tq", "window_left", "seqlen"),
     _BACKEND_CASES,

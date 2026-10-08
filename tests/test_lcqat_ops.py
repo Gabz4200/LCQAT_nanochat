@@ -12,12 +12,7 @@ import torch
 from nanochat.models.quant.packing import pack_nibbles, pack_trits
 from nanochat.ops import dispatch_gemv
 from nanochat.ops.gemv import _ensure_cpu_op, ternary_scales
-from nanochat.ops.kernels.gpu_loader import vulkan_available
 from nanochat.ops.references.gemv_reference import reference_gemv_k3
-
-requires_vulkan = pytest.mark.skipif(
-    not vulkan_available(), reason="Vulkan device unavailable for the Taichi backend"
-)
 
 
 def make_case(n: int = 64, m: int = 32, k_a: int = 15, seed: int = 0):
@@ -75,7 +70,6 @@ def test_when_cpu_backend_with_symmetric_scales_then_matches_naive() -> None:
     assert torch.allclose(cpu, naive, atol=1e-5, rtol=1e-5)
 
 
-@requires_vulkan
 @pytest.mark.parametrize("n", [16, 37, 64])
 def test_when_gpu_backend_then_matches_naive_reference(n: int) -> None:
     act, lut, w, s_neg, s_pos = make_case(n=n, m=n // 2 + 3, seed=n + 100)

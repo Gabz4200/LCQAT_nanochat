@@ -52,6 +52,7 @@ from scripts._train.build import (
     convert_to_fp8,
 )
 from scripts._train.eval import EvalContext
+from scripts._train.flags import add_minexp_flags
 from scripts._train.loop import LoopContext, load_dard_sidecar, train_loop
 
 print_banner()
@@ -273,52 +274,7 @@ parser.add_argument(
     choices=["naive", "cpu", "gpu"],
     help="MeZO fused-kernel backend (PRD 2.6)",
 )
-parser.add_argument(
-    "--minexp-alpha",
-    type=float,
-    default=0.1,
-    help="Deprecated: non-zero values are accepted and ignored (the FiLM gain "
-    "replaces the residual coefficient); 0 freezes the FiLM head (pure SGD)",
-)
-parser.add_argument(
-    "--minexp-beta",
-    type=float,
-    default=0.9,
-    help="MinExpLSTM: fixed EMA decay target (used when --minexp-learnable-beta "
-    "is off; the lambda-coupled predictor is frozen to emit it at g_norm=0)",
-)
-parser.add_argument(
-    "--minexp-lam",
-    type=float,
-    default=0.10,
-    help="MinExpLSTM: fast/slow EMA horizon spacing in (0, 0.4] "
-    "(beta_slow - beta_fast == lam)",
-)
-parser.add_argument(
-    "--minexp-clamp",
-    type=float,
-    default=1.0,
-    help="MinExpLSTM: clamp bound on the FiLM directional shift delta",
-)
-parser.add_argument(
-    "--minexp-learnable-beta",
-    action=argparse.BooleanOptionalAction,
-    default=True,
-    help="MinExpLSTM: lambda-coupled betas learned via the cell's predictor "
-    "(default: on); off freezes the predictor at --minexp-beta",
-)
-parser.add_argument(
-    "--minexp-meta-every",
-    type=int,
-    default=50,
-    help="MinExpLSTM: joint online co-training interval (meta_step every K optimizer steps; 0 disables)",
-)
-parser.add_argument(
-    "--minexp-meta-lr",
-    type=float,
-    default=1e-3,
-    help="MinExpLSTM: meta-gradient LR for the cell co-training step (AdamW)",
-)
+add_minexp_flags(parser)
 parser.add_argument(
     "--scalar-lr",
     type=float,

@@ -40,12 +40,29 @@ def run_both_impls(fn):
 
 def assert_close(t1, t2, name, atol=1e-2, rtol=1e-2):
     """Assert two tensors are close, with helpful error message."""
+    assert torch.allclose(t1, t2, atol=atol, rtol=rtol), (
+        f"{name}: tensors differ beyond tolerance"
+    )
     max_diff = (t1 - t2).abs().max().item()
     mean_diff = (t1 - t2).abs().mean().item()
-    assert torch.allclose(t1, t2, atol=atol, rtol=rtol), (
-        f"{name}: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}"
-    )
     return max_diff, mean_diff
+
+
+def compare_impls(name: str, run, atol=1e-2, rtol=1e-2):
+    """Run ``run()`` under both FA3 and SDPA and compare."""
+    y_fa3, y_sdpa = run_both_impls(run)
+    max_diff, mean_diff = assert_close(y_fa3, y_sdpa, name, atol, rtol)
+    print(f"{name}: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+
+
+def qkv(
+    B: int, T: int, H: int, D: int, device: str, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A random (q, k, v) triple with matching shapes."""
+    q = torch.randn(B, T, H, D, device=device, dtype=dtype)
+    k = torch.randn(B, T, H, D, device=device, dtype=dtype)
+    v = torch.randn(B, T, H, D, device=device, dtype=dtype)
+    return q, k, v
 
 
 # =============================================================================
@@ -61,49 +78,37 @@ class TestFA3VsSDPA:
     def test_basic_causal(self):
         """Basic causal attention."""
         B, T, H, D = 2, 64, 4, 32
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q, k, v = qkv(B, T, H, D, self.DEVICE, self.DTYPE)
 
         def run():
             return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "basic_causal")
-        print(f"basic_causal: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        compare_impls("basic_causal", run)
 
     def test_full_context(self):
         """Full context (window_size=-1)."""
         B, T, H, D = 2, 128, 4, 32
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q, k, v = qkv(B, T, H, D, self.DEVICE, self.DTYPE)
 
         def run():
             return flash_attn.flash_attn_func(
                 q, k, v, causal=True, window_size=(-1, -1)
             )
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "full_context")
-        print(f"full_context: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        compare_impls("full_context", run)
 
     def test_sliding_window(self):
         """Sliding window attention."""
         B, T, H, D = 2, 128, 4, 32
         window = 32
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q, k, v = qkv(B, T, H, D, self.DEVICE, self.DTYPE)
 
         def run():
             return flash_attn.flash_attn_func(
                 q, k, v, causal=True, window_size=(window, 0)
             )
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "sliding_window")
-        print(f"sliding_window: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        compare_impls("sliding_window", run)
 
     def test_gqa(self):
         """Group Query Attention (fewer KV heads than Q heads)."""
@@ -118,34 +123,26 @@ class TestFA3VsSDPA:
         def run():
             return flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "gqa")
-        print(f"gqa: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        compare_impls("gqa", run)
 
     def test_larger_model(self):
         """Larger dimensions closer to real model."""
         B, T, H, D = 4, 256, 12, 64
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q, k, v = qkv(B, T, H, D, self.DEVICE, self.DTYPE)
 
         def run():
             return flash_attn.flash_attn_func(
                 q, k, v, causal=True, window_size=(-1, -1)
             )
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "larger_model")
-        print(f"larger_model: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        compare_impls("larger_model", run)
 
     def test_kvcache_prefill(self):
         """Test prefill (inserting multiple tokens into empty cache)."""
         B, T_max, H, D = 2, 64, 4, 32
         T_prefill = 16
 
-        q = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q, k, v = qkv(B, T_prefill, H, D, self.DEVICE, self.DTYPE)
 
         def run():
             k_cache = torch.zeros(B, T_max, H, D, device=self.DEVICE, dtype=self.DTYPE)
@@ -162,20 +159,18 @@ class TestFA3VsSDPA:
                 window_size=(T_max, 0),
             )
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "prefill")
-        print(f"prefill: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        compare_impls("prefill", run)
 
     def test_kvcache_single_token(self):
         """Test single token generation (cache already has content)."""
         B, T_max, H, D = 2, 64, 4, 32
         T_prefill = 16
 
-        k_init = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v_init = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        q_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k_init, v_init = (
+            torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE),
+            torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE),
+        )
+        q_single, k_single, v_single = qkv(B, 1, H, D, self.DEVICE, self.DTYPE)
 
         def run():
             k_cache = torch.zeros(B, T_max, H, D, device=self.DEVICE, dtype=self.DTYPE)
@@ -196,9 +191,7 @@ class TestFA3VsSDPA:
                 window_size=(T_max, 0),
             )
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "single_token")
-        print(f"single_token: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
+        compare_impls("single_token", run)
 
     def test_kvcache_single_token_sliding_window(self):
         """Test single token decode with sliding window smaller than cache size.
@@ -211,11 +204,11 @@ class TestFA3VsSDPA:
         T_prefill = 32  # Enough tokens to exceed window
         window = 8  # Window SMALLER than cache size
 
-        k_init = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v_init = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        q_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        k_init, v_init = (
+            torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE),
+            torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE),
+        )
+        q_single, k_single, v_single = qkv(B, 1, H, D, self.DEVICE, self.DTYPE)
 
         def run():
             k_cache = torch.zeros(B, T_max, H, D, device=self.DEVICE, dtype=self.DTYPE)
@@ -236,11 +229,7 @@ class TestFA3VsSDPA:
                 window_size=(window, 0),  # window=8 < Tk=33
             )
 
-        y_fa3, y_sdpa = run_both_impls(run)
-        max_diff, mean_diff = assert_close(y_fa3, y_sdpa, "single_token_sliding_window")
-        print(
-            f"single_token_sliding_window: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}"
-        )
+        compare_impls("single_token_sliding_window", run)
 
     def test_backward_gradients_match(self):
         """Verify gradients are similar between FA3 and SDPA."""
@@ -301,9 +290,7 @@ class TestSDPAOnly:
         """Test SDPA forward pass produces valid output."""
         set_impl("sdpa")
         B, T, H, D = 2, 64, 4, 32
-        q = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q, k, v = qkv(B, T, H, D, self.DEVICE, self.DTYPE)
 
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=(T, 0))
 
@@ -354,9 +341,7 @@ class TestSDPAOnly:
 
         # Prefill
         T_prefill = 16
-        q = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q, k, v = qkv(B, T_prefill, H, D, self.DEVICE, self.DTYPE)
 
         y = flash_attn.flash_attn_with_kvcache(
             q,
@@ -373,9 +358,7 @@ class TestSDPAOnly:
         assert y.shape == (B, T_prefill, H, D)
         assert cache.get_pos() == T_prefill
 
-        q_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        k_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
-        v_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        q_single, k_single, v_single = qkv(B, 1, H, D, self.DEVICE, self.DTYPE)
 
         y_single = flash_attn.flash_attn_with_kvcache(
             q_single,

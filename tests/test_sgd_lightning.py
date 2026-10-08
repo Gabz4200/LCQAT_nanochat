@@ -11,45 +11,13 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn as nn
-from lightning.pytorch import Trainer
-from torch.utils.data import DataLoader, TensorDataset
 
 from nanochat.training.lightning_module import (
     JointTrainableModule,
     MeZoJointTrainableModule,
 )
 from nanochat.training.minexp_lstm import SGD_MinExpLstm_Optimizer
-
-
-class TinyModel(nn.Module):
-    """Two-linear model with a nonzero-gradient CE loss."""
-
-    def __init__(self, d: int = 8, vocab: int = 4) -> None:
-        super().__init__()
-        self.net = nn.Sequential(nn.Linear(d, d), nn.Tanh(), nn.Linear(d, vocab))
-
-    def forward(self, x):
-        return self.net(x)
-
-
-def _dataloader(n: int = 16, d: int = 8, batch_size: int = 4) -> DataLoader:
-    """Random CE dataloader."""
-    x = torch.randn(n, d)
-    y = torch.randint(0, 4, (n,))
-    return DataLoader(TensorDataset(x, y), batch_size=batch_size)
-
-
-def _trainer(max_steps: int) -> Trainer:
-    """A CPU Trainer with logging and checkpointing off."""
-    return Trainer(
-        max_steps=max_steps,
-        accelerator="cpu",
-        devices=1,
-        logger=False,
-        enable_checkpointing=False,
-        enable_progress_bar=False,
-    )
+from tests.lightning_common import TinyModel, dataloader, trainer
 
 
 def _inner_optimizer(module) -> SGD_MinExpLstm_Optimizer:
@@ -61,10 +29,10 @@ def _inner_optimizer(module) -> SGD_MinExpLstm_Optimizer:
     back to ``configure_optimizers`` directly.
     """
     try:
-        trainer = module.trainer
+        t = module.trainer
     except (RuntimeError, AttributeError):
-        trainer = None
-    strategy = getattr(trainer, "strategy", None) if trainer is not None else None
+        t = None
+    strategy = getattr(t, "strategy", None) if t is not None else None
     if strategy is not None and getattr(strategy, "optimizers", None):
         opt = strategy.optimizers[0]
     else:
@@ -77,8 +45,8 @@ def _inner_optimizer(module) -> SGD_MinExpLstm_Optimizer:
 def test_when_joint_module_trains_then_loss_finite() -> None:
     """A few Lightning steps run end-to-end with finite loss."""
     module = JointTrainableModule(TinyModel(), lr=1e-2, meta_interval=2)
-    trainer = _trainer(max_steps=4)
-    trainer.fit(module, _dataloader())
+    t = trainer(max_steps=4)
+    t.fit(module, dataloader())
     # The training loop completed and logged a finite CE loss.
     # A NaN/Inf loss would mean the FiLM update diverged, so the
     # assertion is about the logged training loss, not just that
@@ -100,8 +68,8 @@ def test_when_meta_interval_hits_then_cell_trains() -> None:
     # The Trainer adopts configure_optimizers' optimizer, so
     # read the cell after fit (the module's own optimizer,
     # not a freshly built one).
-    trainer = _trainer(max_steps=4)
-    trainer.fit(module, _dataloader())
+    t = trainer(max_steps=4)
+    t.fit(module, dataloader())
     opt = _inner_optimizer(module)
     # After fit the cell has been through the closure
     # meta-pass (meta_interval=1 fires every step). Its
@@ -122,8 +90,8 @@ def test_when_meta_step_before_zero_grad_then_no_stray_grads() -> None:
     onto the next step's manual_backward.
     """
     module = JointTrainableModule(TinyModel(), lr=1e-2, meta_interval=1)
-    trainer = _trainer(max_steps=4)
-    trainer.fit(module, _dataloader())
+    t = trainer(max_steps=4)
+    t.fit(module, dataloader())
     model_grads = [p.grad for p in module.target_model.parameters()]
     assert all(g is None for g in model_grads), (
         "model gradients must be cleared after each training step"
@@ -187,8 +155,8 @@ def test_when_sgd_and_mezo_modules_run_then_state_is_independent() -> None:
         TinyModel(), lr=1e-2, meta_interval=2, backend="naive"
     )
     for module in (sgd_module, mezo_module):
-        trainer = _trainer(max_steps=4)
-        trainer.fit(module, _dataloader())
+        t = trainer(max_steps=4)
+        t.fit(module, dataloader())
     sgd_opt = _inner_optimizer(sgd_module)
     mezo_opt = mezo_module.configure_optimizers()
     mezo_opt = mezo_opt[0] if isinstance(mezo_opt, list) else mezo_opt

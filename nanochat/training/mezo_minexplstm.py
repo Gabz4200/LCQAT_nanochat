@@ -60,10 +60,32 @@ from nanochat.ops.mezo_minexplstm import dispatch_mezo_minexplstm_step
 from nanochat.training.batched_step import (
     differentiable_mezo_cell_step,
     film_mezo_update,
+    meta_step_closure,
 )
 from nanochat.training.cell import SGDMinExpLSTMCellFiLM4D
 
-__all__ = ["MeZoMinExpLSTMCellFiLM4D", "MeZo_MinExpLstm_Optimizer"]
+
+def _meta_step_loss_tensor(
+    meta_optimizer: torch.optim.Optimizer, meta_loss: Tensor
+) -> Tensor:
+    """AdamW meta-step on a loss already wired to the cell.
+
+    Shared verbatim by both MinExpLSTM optimizers'
+    ``meta_step(loss)`` spellings: validate the tensor is
+    differentiable, backprop, step the cell's AdamW. One
+    implementation means the two optimizers' meta-steps
+    cannot drift on this spelling.
+    """
+    if not isinstance(meta_loss, Tensor) or not meta_loss.requires_grad:
+        raise TypeError(
+            "meta_step(loss) needs a differentiable loss tensor built "
+            "through the cell; the cell has no gradient path otherwise"
+        )
+    meta_optimizer.zero_grad(set_to_none=True)
+    meta_loss.backward()
+    meta_optimizer.step()
+    return meta_loss
+
 
 #: FIR history length default (PRD 2.2: K-tap Conv1d pre-filter).
 DEFAULT_K = 4
@@ -472,15 +494,7 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
 
     def _meta_step_tensor(self, meta_loss: Tensor) -> Tensor:
         """AdamW meta-step on a loss already wired to the cell."""
-        if not isinstance(meta_loss, Tensor) or not meta_loss.requires_grad:
-            raise TypeError(
-                "meta_step(loss) needs a differentiable loss tensor built "
-                "through the cell; the cell has no gradient path otherwise"
-            )
-        self.meta_optimizer.zero_grad(set_to_none=True)
-        meta_loss.backward()
-        self.meta_optimizer.step()
-        return meta_loss
+        return _meta_step_loss_tensor(self.meta_optimizer, meta_loss)
 
     def _meta_step_closure(self, model: nn.Module, closure) -> Tensor:
         """Co-training step rebuilding the loss from updated params.
@@ -492,112 +506,58 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
         ``c_j`` stay tensors so the AdamW gradient reaches
         ``conv_w``, and the replayed perturbations are constants.
         """
-        if closure is None:
-            raise TypeError(
-                "meta_step(model) needs a closure(params) -> loss; pass a "
-                "loss tensor directly only when it already runs through "
-                "the cell"
-            )
-        self.meta_optimizer.zero_grad(set_to_none=True)
-
-        params = dict(model.named_parameters())
-        name_of = {id(p): n for n, p in model.named_parameters()}
-        owned = {id(p) for group in self.param_groups for p in group["params"]}
+        # Canonical index of every optimizer-owned parameter,
+        # for the per-parameter seed derivation.
         idx_of: dict[int, int] = {}
         idx = 0
         for group in self.param_groups:
             for p in group["params"]:
                 idx_of[id(p)] = idx
                 idx += 1
+        opt = self
 
-        rebuilt = 0
-        for group in self.param_groups:
-            lr = group["lr"]
-            wd = group["weight_decay"]
-            clamp_val = group["clamp_val"]
-            clip_bound = self._clip_bound(lr)
-            for p in group["params"]:
-                if id(p) not in owned:
-                    continue
-                state = self.state[p]
-                if len(state) == 0:
-                    continue
-                shape = tuple(p.shape)
-                device = p.device
-                p_idx = idx_of[id(p)]
-                # Rebuild the FIR signal and MeZO vector
-                # differentiably through the same replay arithmetic
-                # the step uses.
-                K_curr = len(self.seed_history)
-                conv_w = self.cell.conv_w
-                m_fir = torch.zeros(shape, dtype=torch.float32, device=device)
-                for j in range(K_curr):
-                    c_j = conv_w[j] * self.mu_history[-(j + 1)]
-                    z_j = self._replay(
-                        _derive_seed(self.seed_history[-(j + 1)], p_idx),
-                        shape,
-                        device,
-                    )
-                    # c_j is a 0-dim tensor (conv_w[j] is a
-                    # Parameter), so the FIR accumulates via
-                    # tensor multiply-add rather than
-                    # ``add(alpha=...)`` -- alpha must be a
-                    # Python number, not a tensor.
-                    m_fir = m_fir + z_j * c_j
-                z_curr = self._replay(
-                    _derive_seed(self.seed_history[-1], p_idx), shape, device
+        def rebuild(p: Tensor, state: dict, group: dict) -> Tensor | None:
+            shape = tuple(p.shape)
+            device = p.device
+            p_idx = idx_of[id(p)]
+            # Rebuild the FIR signal and MeZO vector
+            # differentiably through the same replay arithmetic
+            # the step uses.
+            K_curr = len(opt.seed_history)
+            conv_w = opt.cell.conv_w
+            m_fir = torch.zeros(shape, dtype=torch.float32, device=device)
+            for j in range(K_curr):
+                c_j = conv_w[j] * opt.mu_history[-(j + 1)]
+                z_j = opt._replay(
+                    _derive_seed(opt.seed_history[-(j + 1)], p_idx),
+                    shape,
+                    device,
                 )
-                raw_mezo = self.mu_history[-1] * z_curr
-                h_fp = state["h_int8"].to(torch.float32) * state["scale_h"]
+                # c_j is a 0-dim tensor (conv_w[j] is a Parameter),
+                # so the FIR accumulates via tensor multiply-add.
+                m_fir = m_fir + z_j * c_j
+            z_curr = opt._replay(
+                _derive_seed(opt.seed_history[-1], p_idx), shape, device
+            )
+            raw_mezo = opt.mu_history[-1] * z_curr
+            h_fp = state["h_int8"].to(torch.float32) * state["scale_h"]
 
-                # The shared differentiable MeZO cell
-                # step (PRD 2.3-2.5) -- the same math
-                # the fused step and the naive oracle
-                # run, so the rebuilt theta_new matches
-                # what step() produced. The closure runs
-                # it live (the graph reaches the cell
-                # through conv_w); the fused step runs
-                # it detached under no_grad.
-                gamma, beta, _ = differentiable_mezo_cell_step(
-                    self.cell, m_fir, raw_mezo, h_fp, _EPS
-                )
-                # The shared FiLM-modulated MeZO update
-                # (PRD 2.4/2.5) -- the same formula the step
-                # and the fused kernels run, so the rebuilt
-                # theta_new matches what step() produced.
-                clipped = film_mezo_update(
-                    gamma,
-                    beta,
-                    raw_mezo.reshape(-1),
-                    clamp_val,
-                    clip_bound,
-                )
-                updated = p.data.mul(1.0 - lr * wd).sub(lr * clipped.reshape(shape))
-                params[name_of[id(p)]] = updated
-                rebuilt += 1
-
-        # Fail fast: the closure rebuilds every optimizer-owned
-        # parameter from its step state. If none was rebuilt,
-        # no step ran (the state is empty) or the optimizer
-        # owns no trained parameters -- either way a silent
-        # no-op would leave the cell untrained while
-        # reporting a healthy loss.
-        if rebuilt == 0:
-            raise RuntimeError(
-                "meta_step(model, closure) rebuilt 0 parameters: "
-                "every optimizer-owned parameter has empty state. "
-                "Run a step (stage_mezo_estimate + step) before "
-                "meta_step so the closure has a FIR/MeZO signal "
-                "and a hidden state to rebuild from."
+            # Same math step() runs, so the rebuilt theta_new matches.
+            gamma, beta, _ = differentiable_mezo_cell_step(
+                opt.cell, m_fir, raw_mezo, h_fp, _EPS
+            )
+            clipped = film_mezo_update(
+                gamma,
+                beta,
+                raw_mezo.reshape(-1),
+                group["clamp_val"],
+                opt._clip_bound(group["lr"]),
+            )
+            return p.data.mul(1.0 - group["lr"] * group["weight_decay"]).sub(
+                group["lr"] * clipped.reshape(shape)
             )
 
-        loss = closure(params)
-        if not isinstance(loss, Tensor) or not loss.requires_grad:
-            raise TypeError(
-                "meta_step closure must return a differentiable loss "
-                "tensor built from the params it was handed; the cell "
-                "has no gradient path otherwise"
-            )
-        loss.backward()
-        self.meta_optimizer.step()
-        return loss
+        return meta_step_closure(self, self.meta_optimizer, model, closure, rebuild)
+
+
+__all__ = ["MeZoMinExpLSTMCellFiLM4D", "MeZo_MinExpLstm_Optimizer"]

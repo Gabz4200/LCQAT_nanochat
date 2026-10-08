@@ -63,6 +63,7 @@ from nanochat.training.batched_step import (
     batched_cell_forward,
     differentiable_cell_step,
     film_sgd_update,
+    meta_step_closure,
     quantize_batch,
 )
 from nanochat.training.cell import MinExpLSTMCell, SGDMinExpLSTMCellFiLM4D
@@ -387,83 +388,36 @@ class SGD_MinExpLstm_Optimizer(torch.optim.Optimizer):
         optimizer-owned parameter replaced by its *updated* value and
         evaluates the loss on them.
         """
-        if closure is None:
-            raise TypeError(
-                "meta_step(model) needs a closure(params) -> loss; pass a "
-                "loss tensor directly only when it already runs through "
-                "the cell"
+        cell = self.cell
+
+        def rebuild(p: Tensor, state: dict, group: dict) -> Tensor | None:
+            if p.grad is None:
+                return None
+            grad = p.grad.data
+            ema_fast = self._dequantize(state["ema_fast_int8"], state["scale_fast"])
+            ema_slow = self._dequantize(state["ema_slow_int8"], state["scale_slow"])
+            h_fp32 = self._dequantize(state["h_int8"], state["scale_h"])
+            # Same math step() runs, so the rebuilt theta_new matches.
+            gamma, delta, _, _, _ = differentiable_cell_step(
+                cell,
+                grad,
+                ema_fast,
+                ema_slow,
+                h_fp32.unsqueeze(-1),
+                group["lam"],
             )
-        self.meta_optimizer.zero_grad(set_to_none=True)
-
-        params = dict(model.named_parameters())
-        name_of = {id(p): n for n, p in model.named_parameters()}
-        owned = {id(p) for group in self.param_groups for p in group["params"]}
-        rebuilt = 0
-        for group in self.param_groups:
-            lr = group["lr"]
-            wd = group["weight_decay"]
-            lam = group["lam"]
-            clamp_val = group["clamp_val"]
-            for p in group["params"]:
-                if p.grad is None or id(p) not in owned:
-                    continue
-                state = self.state[p]
-                if len(state) == 0:
-                    continue
-                grad = p.grad.data
-                ema_fast = self._dequantize(state["ema_fast_int8"], state["scale_fast"])
-                ema_slow = self._dequantize(state["ema_slow_int8"], state["scale_slow"])
-                h_fp32 = self._dequantize(state["h_int8"], state["scale_h"])
-                # The shared differentiable cell step
-                # (PRD 3.1-3.5) -- the same math the fused
-                # step runs via batched_cell_forward, so the
-                # rebuilt theta_new matches what step()
-                # produced. The closure runs it live (the
-                # graph reaches the cell); the fused step
-                # runs it detached under no_grad.
-                gamma, delta, _, _, _ = differentiable_cell_step(
-                    self.cell,
-                    grad,
-                    ema_fast,
-                    ema_slow,
-                    h_fp32.unsqueeze(-1),
-                    lam,
-                )
-                # The shared FiLM-modulated SGD update
-                # (PRD 3.6) -- the same formula the step and
-                # the fused kernels run, so the rebuilt
-                # theta_new matches what step() produced.
-                updated = p.data + film_sgd_update(
-                    gamma, delta, grad, p.data, lr, wd, clamp_val
-                )
-                params[name_of[id(p)]] = updated
-                rebuilt += 1
-
-        # Fail fast: the closure rebuilds every optimizer-owned
-        # parameter from its gradient. If none was rebuilt, the
-        # caller zeroed the gradients before calling meta_step
-        # (the historical bug) or the optimizer owns no trained
-        # parameters -- either way a silent no-op would leave
-        # the cell untrained while reporting a healthy loss.
-        if rebuilt == 0:
-            raise RuntimeError(
-                "meta_step(model, closure) rebuilt 0 parameters: every "
-                "optimizer-owned parameter had a None gradient. "
-                "Call meta_step BEFORE zero_grad (the closure reads "
-                "p.grad to rebuild each updated parameter), or pass a "
-                "differentiable loss tensor directly via meta_step(loss)."
+            # Same formula step() applies to the base weights.
+            return p.data + film_sgd_update(
+                gamma,
+                delta,
+                grad,
+                p.data,
+                group["lr"],
+                group["weight_decay"],
+                group["clamp_val"],
             )
 
-        loss = closure(params)
-        if not isinstance(loss, Tensor) or not loss.requires_grad:
-            raise TypeError(
-                "meta_step closure must return a differentiable loss "
-                "tensor built from the params it was handed; the cell "
-                "has no gradient path otherwise"
-            )
-        loss.backward()
-        self.meta_optimizer.step()
-        return loss
+        return meta_step_closure(self, self.meta_optimizer, model, closure, rebuild)
 
 
 __all__ = [

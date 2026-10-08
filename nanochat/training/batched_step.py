@@ -207,3 +207,65 @@ def differentiable_mezo_cell_step(
 def scalar_rms(t: Tensor, eps: float = 1e-8) -> Tensor:
     """Layer-wise RMS of ``t``: ``sqrt(mean(t^2) + eps)``, scalar."""
     return torch.sqrt(t.float().square().mean() + eps)
+
+
+def meta_step_closure(
+    optimizer: torch.optim.Optimizer,
+    meta_optimizer: torch.optim.Optimizer,
+    model: torch.nn.Module,
+    closure,
+    rebuild,
+) -> Tensor:
+    """The shared skeleton of both MinExpLSTM optimizers' ``meta_step(model, closure)``.
+
+    ``rebuild`` returns the updated parameter value (a tensor,
+    possibly a view of ``p.data``) or ``None`` to skip the parameter.
+    """
+    if closure is None:
+        raise TypeError(
+            "meta_step(model) needs a closure(params) -> loss; pass a "
+            "loss tensor directly only when it already runs through "
+            "the cell"
+        )
+    meta_optimizer.zero_grad(set_to_none=True)
+
+    params = dict(model.named_parameters())
+    name_of = {id(p): n for n, p in model.named_parameters()}
+    owned = {id(p) for group in optimizer.param_groups for p in group["params"]}
+
+    rebuilt = 0
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            if id(p) not in owned:
+                continue
+            state = optimizer.state[p]
+            if len(state) == 0:
+                continue
+            updated = rebuild(p, state, group)
+            if updated is None:
+                continue
+            params[name_of[id(p)]] = updated
+            rebuilt += 1
+
+    # A zero rebuild means the caller zeroed grads before
+    # meta_step (the historical bug) or owns no trained params.
+    if rebuilt == 0:
+        raise RuntimeError(
+            "meta_step(model, closure) rebuilt 0 parameters: every "
+            "optimizer-owned parameter had a None gradient or empty "
+            "state. Call meta_step BEFORE zero_grad (the closure "
+            "reads p.grad to rebuild each updated parameter), or "
+            "pass a differentiable loss tensor directly via "
+            "meta_step(loss)."
+        )
+
+    loss = closure(params)
+    if not isinstance(loss, Tensor) or not loss.requires_grad:
+        raise TypeError(
+            "meta_step closure must return a differentiable loss "
+            "tensor built from the params it was handed; the cell "
+            "has no gradient path otherwise"
+        )
+    loss.backward()
+    meta_optimizer.step()
+    return loss

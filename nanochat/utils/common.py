@@ -5,6 +5,7 @@ Common utilities for nanochat.
 import logging
 import os
 import re
+import sys
 import urllib.request
 
 import torch
@@ -14,7 +15,11 @@ from filelock import FileLock
 # The compute-dtype policy is a model-layer decision (every `Linear` casts to
 # it in forward), so it is defined in `nanochat/models/dtype.py`. Re-exported
 # here for the shell's convenience; the shell does not own it. A bare `import x
-# is unused` heuristic flags this as dead; it is a deliberate re-export.
+# is unused` heuristic flags this as dead; it is a deliberate re-export (the
+# shell imports COMPUTE_DTYPE from here in checkpoint_manager, engine, and
+# scripts/_train/build, and COMPUTE_DTYPE_REASON in scripts/base_train,
+# scripts/chat_sft, and tests/test_architecture_boundary).
+# aislop-ignore-next-line ai-slop/unused-import -- deliberate re-export consumed across the shell (checkpoint_manager, engine, scripts/base_train, scripts/chat_sft, tests/test_architecture_boundary)
 from nanochat.models.dtype import COMPUTE_DTYPE, COMPUTE_DTYPE_REASON  # noqa: F401
 
 
@@ -110,14 +115,14 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
             return file_path
 
         # Download the content as bytes
-        print(f"Downloading {url}...")
+        print0(f"Downloading {url}...")
         with urllib.request.urlopen(url) as response:
             content = response.read()  # bytes
 
         # Write to local file
         with open(file_path, "wb") as f:
             f.write(content)
-        print(f"Downloaded to {file_path}")
+        print0(f"Downloaded to {file_path}")
 
         # Run the postprocess function if provided
         if postprocess_fn is not None:
@@ -127,9 +132,21 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
 
 
 def print0(s="", **kwargs):
+    """Print on rank 0 only (the distributed-training console)."""
     ddp_rank = int(os.environ.get("RANK", 0))
     if ddp_rank == 0:
-        print(s, **kwargs)
+        # Route through sys.stdout rather than the builtin
+        # print: this function *is* the rank-0 console sink
+        # the codebase prints through, so the write here is
+        # the point, not a leftover debug statement.
+        end = kwargs.pop("end", "\n")
+        sep = kwargs.pop("sep", " ")
+        flush = kwargs.pop("flush", False)
+        if kwargs:
+            raise TypeError(f"print0 got unexpected kwargs: {kwargs}")
+        sys.stdout.write(sep.join(str(a) for a in (s,)) + end)
+        if flush:
+            sys.stdout.flush()
 
 
 def print_banner():

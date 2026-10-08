@@ -5,6 +5,8 @@ BPE Tokenizer in the style of GPT-4: train with rustbpe, inference with tiktoken
 import copy
 import os
 
+from nanochat.utils.common import print0
+
 SPECIAL_TOKENS = [
     # every document begins with the Beginning of Sequence (BOS) token that delimits documents
     "<|bos|>",
@@ -144,7 +146,7 @@ class RustBPETokenizer:
         pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
         with open(pickle_path, "wb") as f:
             pickle.dump(self.enc, f)
-        print(f"Saved tokenizer encoding to {pickle_path}")
+        print0(f"Saved tokenizer encoding to {pickle_path}")
 
     def render_conversation(self, conversation, max_tokens=2048):
         """

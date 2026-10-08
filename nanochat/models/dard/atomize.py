@@ -61,7 +61,7 @@ def _find_atoms(sequences: list[frozenset[int]]) -> list[frozenset[int]]:
         # A co-occurrence witness is at most `MAX_ATOM_TOKENS` wide. Without a
         # cap the candidate set is every subset of every sequence, which for
         # real text is the whole corpus.
-        for start in range(len(items)):
+        for start, _ in enumerate(items):
             for width in range(1, MAX_ATOM_TOKENS + 1):
                 end = start + width
                 if end > len(items):

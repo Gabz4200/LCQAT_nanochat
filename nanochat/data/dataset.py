@@ -19,6 +19,7 @@ import requests
 from nanochat.utils.common import get_base_dir
 
 # The URL on the internet where the data is hosted and downloaded from on demand
+# aislop-ignore-next-line ai-slop/hardcoded-url -- the dataset's canonical HF URL, not a secret endpoint
 BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
 MAX_SHARD = 6542  # the last datashard is shard_06542.parquet
 index_to_filename = lambda index: (

@@ -66,6 +66,7 @@ def load_hub_dataset(repo_id, subset="default", split="train"):
             # only a single rank acquires the lock and downloads, the others block
             # here and then skip the download because they recheck the manifest
             if not os.path.exists(manifest_path):
+                # aislop-ignore-next-line ai-slop/hardcoded-url -- HF datasets API endpoint, not a secret
                 listing_url = f"https://huggingface.co/api/datasets/{repo_id}/parquet/{subset}/{split}"
                 with urllib.request.urlopen(listing_url) as response:
                     shard_urls = json.loads(response.read())

@@ -41,18 +41,19 @@ _SCALE_H_MIN = 1e-12
 
 _lock = Lock()
 _initialized = False
+_gpu_available = False
 _init_error: BaseException | None = None
 
 _VULKAN_ERROR = (
-    "LC-QAT GPU backend unavailable: Taichi could not initialize a Vulkan "
-    "device. Install a Vulkan driver/ICD (e.g. vulkan-intel, vulkan-radeon, "
-    "nvidia drivers), or dispatch with backend='cpu' or backend='naive'."
+    "LC-QAT GPU backend unavailable: Taichi could not "
+    "initialize any runtime (GPU or CPU). Dispatch with "
+    "backend='cpu' or backend='naive' instead."
 )
 
 
 def _ensure_init() -> None:
-    """Initialize the Taichi Vulkan runtime once (actionable error if absent)."""
-    global _initialized, _init_error
+    """Initialize the Taichi runtime once (GPU, CPU fallback)."""
+    global _initialized, _gpu_available, _init_error
     if _initialized:
         return
     with _lock:
@@ -61,7 +62,8 @@ def _ensure_init() -> None:
         if _init_error is not None:
             raise RuntimeError(_VULKAN_ERROR) from _init_error
         try:
-            ti.init(arch=ti.vulkan, log_level="error")
+            ti.init(arch=ti.gpu, log_level="error")
+            _gpu_available = ti.lang.impl.current_cfg().arch != ti.x64
         except Exception as error:
             _init_error = error
             raise RuntimeError(_VULKAN_ERROR) from error
@@ -69,10 +71,10 @@ def _ensure_init() -> None:
 
 
 def vulkan_available() -> bool:
-    """True when the Taichi Vulkan runtime initializes (test skip marks)."""
+    """True when a Taichi GPU runtime initialized (informational)."""
     try:
         _ensure_init()
-        return True
+        return _gpu_available
     except Exception:
         return False
 
@@ -1010,56 +1012,8 @@ def _mezo_minexplstm_step_kernel(
 
         # 2. Cell forward (log-domain gates, 4D latent FiLM).
         # x = [fir_norm, mezo_norm, h_norm]
-        x0 = fir_norm
-        x1 = mezo_norm
-        x2 = h_norm
-        phi_val = (
-            cell_params[0] * x0
-            + cell_params[1] * x1
-            + cell_params[2] * x2
-            + cell_params[3]
-        )
-        iota_val = (
-            cell_params[4] * x0
-            + cell_params[5] * x1
-            + cell_params[6] * x2
-            + cell_params[7]
-        )
-        hat_phi = 1.0 / (1.0 + ti.exp(-(phi_val - iota_val)))
-        tilde_h = (
-            cell_params[8] * x0
-            + cell_params[9] * x1
-            + cell_params[10] * x2
-            + cell_params[11]
-        )
-        h_next = hat_phi * h_prev + (1.0 - hat_phi) * tilde_h
-        # 4D latent: z = ReLU(out_proj(h_next))
-        z0 = cell_params[12] * h_next + cell_params[16]
-        z1 = cell_params[13] * h_next + cell_params[17]
-        z2 = cell_params[14] * h_next + cell_params[18]
-        z3 = cell_params[15] * h_next + cell_params[19]
-        if z0 < 0.0:
-            z0 = 0.0
-        if z1 < 0.0:
-            z1 = 0.0
-        if z2 < 0.0:
-            z2 = 0.0
-        if z3 < 0.0:
-            z3 = 0.0
-        # FiLM: [gamma, beta] = film_proj(z)
-        gamma = (
-            cell_params[20] * z0
-            + cell_params[21] * z1
-            + cell_params[22] * z2
-            + cell_params[23] * z3
-            + cell_params[28]
-        )
-        beta = (
-            cell_params[24] * z0
-            + cell_params[25] * z1
-            + cell_params[26] * z2
-            + cell_params[27] * z3
-            + cell_params[29]
+        gamma, beta, h_next = _minexp_cell_forward(
+            fir_norm, mezo_norm, h_norm, h_prev, cell_params
         )
 
         # 3. FiLM clamp bounds, coordinate-wise clipping, and
@@ -1282,6 +1236,73 @@ def _sgd_minexplstm_step_kernel(
 
 
 @ti.func
+def _minexp_cell_forward(
+    x0: ti.f32,
+    x1: ti.f32,
+    x2: ti.f32,
+    h_prev: ti.f32,
+    cell_params: _F32_ARR,
+) -> ti.types.vector(3, ti.f32):  # type: ignore[invalid-annotation]
+    """The shared MinExpLSTM cell forward (PRD 3.4/3.5).
+
+    ``cell_params`` layout (30 floats):
+      [0:3] phi_w [3] phi_b, [4:7] iota_w [7] iota_b,
+      [8:11] h_w [11] h_b, [12:16] out_w [16:20] out_b,
+      [20:28] film_w [28:30] film_b.
+    Returns ``(gamma, delta, h_next)``.
+    """
+    # Log-domain gates: hat_phi = sigmoid(phi - iota)
+    phi_val = (
+        cell_params[0] * x0 + cell_params[1] * x1 + cell_params[2] * x2 + cell_params[3]
+    )
+    iota_val = (
+        cell_params[4] * x0 + cell_params[5] * x1 + cell_params[6] * x2 + cell_params[7]
+    )
+    hat_phi = 1.0 / (1.0 + ti.exp(-(phi_val - iota_val)))
+    # tilde_h = h_proj(x)
+    tilde_h = (
+        cell_params[8] * x0
+        + cell_params[9] * x1
+        + cell_params[10] * x2
+        + cell_params[11]
+    )
+    # h_next = hat_phi * h_prev + (1 - hat_phi) * tilde_h
+    h_next = hat_phi * h_prev + (1.0 - hat_phi) * tilde_h
+    # 4D latent: z = ReLU(out_proj(h_next))
+    # out_proj.weight is [4, 1] flattened to [4].
+    z0 = cell_params[12] * h_next + cell_params[16]
+    z1 = cell_params[13] * h_next + cell_params[17]
+    z2 = cell_params[14] * h_next + cell_params[18]
+    z3 = cell_params[15] * h_next + cell_params[19]
+    if z0 < 0.0:
+        z0 = 0.0
+    if z1 < 0.0:
+        z1 = 0.0
+    if z2 < 0.0:
+        z2 = 0.0
+    if z3 < 0.0:
+        z3 = 0.0
+    # FiLM: [gamma, delta] = film_proj(z)
+    # film_w is [2, 4] flattened row-major at
+    # cell_params[20:28]; film_b at [28:30].
+    gamma = (
+        cell_params[20] * z0
+        + cell_params[21] * z1
+        + cell_params[22] * z2
+        + cell_params[23] * z3
+        + cell_params[28]
+    )
+    delta = (
+        cell_params[24] * z0
+        + cell_params[25] * z1
+        + cell_params[26] * z2
+        + cell_params[27] * z3
+        + cell_params[29]
+    )
+    return ti.Vector([gamma, delta, h_next])
+
+
+@ti.func
 def _sgd_minexplstm_step_element(
     tid: ti.i32,
     grad: _F32_ARR,
@@ -1321,57 +1342,8 @@ def _sgd_minexplstm_step_element(
 
     # 2. Cell forward (PRD 3.4 + 3.5).
     # x = [g_norm, fast_norm, slow_norm]
-    x0 = g_norm
-    x1 = fast_norm
-    x2 = slow_norm
-    # Log-domain gates: hat_phi = sigmoid(phi - iota)
-    phi_val = (
-        cell_params[0] * x0 + cell_params[1] * x1 + cell_params[2] * x2 + cell_params[3]
-    )
-    iota_val = (
-        cell_params[4] * x0 + cell_params[5] * x1 + cell_params[6] * x2 + cell_params[7]
-    )
-    hat_phi = 1.0 / (1.0 + ti.exp(-(phi_val - iota_val)))
-    # tilde_h = h_proj(x)
-    tilde_h = (
-        cell_params[8] * x0
-        + cell_params[9] * x1
-        + cell_params[10] * x2
-        + cell_params[11]
-    )
-    # h_next = hat_phi * h_prev + (1 - hat_phi) * tilde_h
-    h_next = hat_phi * h_prev + (1.0 - hat_phi) * tilde_h
-    # 4D latent: z = ReLU(out_proj(h_next))
-    # out_proj.weight is [4, 1] flattened to [4] at
-    # cell_params[12:16]; out_b at [16:20].
-    z0 = cell_params[12] * h_next + cell_params[16]
-    z1 = cell_params[13] * h_next + cell_params[17]
-    z2 = cell_params[14] * h_next + cell_params[18]
-    z3 = cell_params[15] * h_next + cell_params[19]
-    if z0 < 0.0:
-        z0 = 0.0
-    if z1 < 0.0:
-        z1 = 0.0
-    if z2 < 0.0:
-        z2 = 0.0
-    if z3 < 0.0:
-        z3 = 0.0
-    # FiLM: [gamma, delta] = film_proj(z)
-    # film_w is [2, 4] flattened row-major at
-    # cell_params[20:28]; film_b at [28:30].
-    gamma = (
-        cell_params[20] * z0
-        + cell_params[21] * z1
-        + cell_params[22] * z2
-        + cell_params[23] * z3
-        + cell_params[28]
-    )
-    delta = (
-        cell_params[24] * z0
-        + cell_params[25] * z1
-        + cell_params[26] * z2
-        + cell_params[27] * z3
-        + cell_params[29]
+    gamma, delta, h_next = _minexp_cell_forward(
+        g_norm, fast_norm, slow_norm, h_prev, cell_params
     )
 
     # 3. FiLM-modulated SGD step + weight decay (PRD 3.6).

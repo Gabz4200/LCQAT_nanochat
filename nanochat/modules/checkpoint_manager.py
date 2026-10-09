@@ -136,6 +136,23 @@ def _db_keys_need(model_data: dict, suffix: str) -> bool:
     return any(k.startswith("db_") and k.endswith(suffix) for k in model_data)
 
 
+def _base_keys_need(model_data: dict, suffix: str) -> bool:
+    """True when any base-model (non-`db_*`) state key ends with `suffix`.
+
+    The base-model counterpart of `_db_keys_need`: the only evidence that
+    the bare transformer plus its `lm_head` / `smear_gate` was trained
+    with SparseProp buffers is a non-`db_*` key ending in `suffix`. A run
+    whose base was retrofitted to FourBitLinear or LC-QAT-free shapes
+    leaves no nn.Linear to wrap, so its checkpoint carries no base sparse
+    state even though `meta["sparseprop"]["enabled"]` is True -- and
+    injecting into it would register buffers the strict base load then
+    rejects as missing. The `db_*` engine subtree is excluded because the
+    engine applies its own retrofit (gated on `_db_keys_need`) and those
+    keys are stripped before the base load anyway.
+    """
+    return any(not k.startswith(DB_PREFIXES) and k.endswith(suffix) for k in model_data)
+
+
 def _prepare_exported_db_buffers(engine, model_data: dict) -> None:
     """Put the engine-owned LCQAT layers into the exported runtime shape.
 
@@ -345,27 +362,9 @@ def build_model(
         engine = DiffusionBlockEngine(
             model, partitioner, device=device, dtype=COMPUTE_DTYPE
         )
-        # The engine's own layers need the same retrofits the base GPT already
-        # got above. `prepare_lcqat_before_load` and `inject_sparseprop_layers`
-        # only see the bare GPT, and the engine is constructed after both have
-        # run, so nothing had retrofitted the adapters and denoise heads. The
-        # load below is `strict=False`, so every db_* key the fresh float layers
-        # did not expect -- all the codebook params, and sparsity_mask / w_ptr /
-        # w_col / w_ptr_csc -- was discarded silently. The weights survived
-        # (a plain nn.Linear does have a `.weight`), so the engine came back
-        # structurally valid and numerically wrong: unquantized, unmasked
-        # adapters and heads, with nothing to indicate a key went missing.
-        #
-        # Gated on the state keys rather than on `lcqat_active` /
-        # `sparseprop_meta`, because those describe the base GPT. Retrofitting a
-        # subtree the checkpoint has no codebooks for would fabricate fresh
-        # codebooks that the strict-ish load then ignores, and an export would
-        # freeze those random levels into the artifact.
+        # The engine's own layers need the same retrofits the base GPT already got above. `prepare_lcqat_before_load` and `inject_sparseprop_layers` only see the bare GPT, and the engine is constructed after both have run, so nothing had retrofitted the adapters and denoise heads. The load below is `strict=False`, so every db_* key the fresh float layers did not expect -- all the codebook params, and sparsity_mask / w_ptr / w_col / w_ptr_csc -- was discarded silently. The weights survived (a plain nn.Linear does have a `.weight`), so the engine came back structurally valid and numerically wrong: unquantized, unmasked adapters and heads, with nothing to indicate a key went missing. Gated on the state keys rather than on `lcqat_active` / `sparseprop_meta`, because those describe the base GPT. Retrofitting a subtree the checkpoint has no codebooks for would fabricate fresh codebooks that the strict-ish load then ignores, and an export would freeze those random levels into the artifact.
         exported = is_exported_lcqat_state(model_data)
-        # A training checkpoint carries `raw_*_deltas` (the un-frozen step
-        # parameters); an exported one carries `packed_weight_indices` and
-        # `compiled_codebook` instead. Both mean the db_* layers were quantized,
-        # and both need `apply_lcqat` to build the modules that can receive them.
+        # A training checkpoint carries `raw_*_deltas` (the un-frozen step parameters); an exported one carries `packed_weight_indices` and `compiled_codebook` instead. Both mean the db_* layers were quantized, and both need `apply_lcqat` to build the modules that can receive them.
         db_is_lcqat = _db_keys_need(model_data, "weight_quantizer.raw_pos_deltas") or (
             exported and _db_keys_need(model_data, "packed_weight_indices")
         )

@@ -118,7 +118,7 @@ def film_sgd_update(
     delta: Tensor,
     grad: Tensor,
     weight: Tensor,
-    lr: float,
+    lr: float | Tensor,
     wd: float,
     clamp_val: float,
 ) -> Tensor:
@@ -134,7 +134,10 @@ def film_sgd_update(
 
     ``gamma``/``delta`` are the raw FiLM pair (unclamped); ``grad``
     and ``weight`` are the parameter's gradient and current value
-    (same shape). Returns the parameter *delta* (not the new value):
+    (same shape). ``lr`` is the (data-dependent) learning rate: a
+    float for the fixed-LR paths, a differentiable 0-dim tensor
+    for the learnable-LR path (broadcast over the update). Returns
+    the parameter *delta* (not the new value):
     ``theta_new = theta + film_sgd_update(...)``.
     """
     gamma_c = torch.clamp(gamma, -0.9, 2.0)

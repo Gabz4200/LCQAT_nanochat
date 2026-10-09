@@ -32,7 +32,7 @@ def dispatch_sgd_minexplstm_step(
     w_beta: torch.Tensor,
     b_beta: torch.Tensor,
     # Hyperparameters
-    lr: float,
+    lr: float | torch.Tensor,
     wd: float,
     lam: float,
     clamp_val: float,
@@ -66,7 +66,11 @@ def dispatch_sgd_minexplstm_step(
         out_w, out_b: Cell output projection weights/bias
         film_w, film_b: FiLM projection weights/bias
         w_beta, b_beta: Beta predictor parameters
-        lr: Learning rate
+        lr: Learning rate -- a float, or a 0-dim tensor for the
+            data-dependent (learnable) LR. The fused kernels run the
+            forward step, so they consume the LR's value; the LR's
+            gradient flows through the differentiable closure rebuild
+            (meta_step), not through this fused path.
         wd: Weight decay
         lam: Lambda (beta_slow - beta_fast)
         clamp_val: Clamp value for delta
@@ -77,6 +81,9 @@ def dispatch_sgd_minexplstm_step(
     # Validate inputs
     if backend not in ("naive", "cpu", "gpu"):
         raise ValueError(f"Unknown backend: {backend}. Must be one of: naive, cpu, gpu")
+
+    # The fused kernels consume the LR's value. A 0-dim tensor (the data-dependent LR) is detached to a float here; its gradient flows through the closure rebuild, never through the fused kernel (the kernel is the forward path, like the cell's fused step).
+    lr_val = float(lr.item()) if isinstance(lr, torch.Tensor) else float(lr)
 
     def _naive():
         # Naive PyTorch implementation for testing/debugging
@@ -101,7 +108,7 @@ def dispatch_sgd_minexplstm_step(
             film_b,
             w_beta,
             b_beta,
-            lr,
+            lr_val,
             wd,
             lam,
             clamp_val,
@@ -137,19 +144,14 @@ def dispatch_sgd_minexplstm_step(
             film_b,
             w_beta,
             b_beta,
-            lr,
+            lr_val,
             wd,
             lam,
             clamp_val,
         )
 
     def _gpu():
-        # GPU (Taichi) fused kernel. The GPU path receives the
-        # per-tensor scales as floats (Taichi kernels take
-        # scalars, not torch tensors) and returns the updated
-        # scales; write them back so the caller's scale
-        # tensors reflect this step's quantization, matching
-        # the in-place mutation of the naive and CPU paths.
+        # GPU (Taichi) fused kernel. The GPU path receives the per-tensor scales as floats (Taichi kernels take scalars, not torch tensors) and returns the updated scales; write them back so the caller's scale tensors reflect this step's quantization, matching the in-place mutation of the naive and CPU paths.
         from nanochat.ops.kernels.gpu_loader import run_sgd_minexplstm_step
 
         scale_fast_new, scale_slow_new, scale_h_new = run_sgd_minexplstm_step(
@@ -173,7 +175,7 @@ def dispatch_sgd_minexplstm_step(
             film_b,
             w_beta,
             b_beta,
-            lr,
+            lr_val,
             wd,
             lam,
             clamp_val,

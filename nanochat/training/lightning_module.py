@@ -154,7 +154,14 @@ class MinExpLSTMLightningModule(LightningModule):
         )
         suggested = result.suggestion()
         self.hparams["lr"] = suggested
-        for group in self.trainer.optimizers[0].param_groups:
+        # Apply the suggestion to the right LR. The SGD and MeZO-MinExpLSTM optimizers own an AdamW meta-optimizer (the "optimizer's optimizer" that trains the cell and the data-dependent LR predictor); its LR is a plain hyperparameter, so Lightning's finder optimizes IT before training starts (warmup). The primary optimizer's LR is data-dependent (the learnable predictor), so the finder does not set it directly -- it only seeds the predictor's initial bias. The AdamW baseline has no meta-optimizer, so the finder tunes its own (only) LR.
+        primary = self.trainer.optimizers[0]
+        meta_opt = getattr(primary, "meta_optimizer", None)
+        if meta_opt is not None:
+            for group in meta_opt.param_groups:
+                group["lr"] = suggested
+            self.hparams["meta_lr"] = suggested
+        for group in primary.param_groups:
             group["lr"] = suggested
         return suggested
 

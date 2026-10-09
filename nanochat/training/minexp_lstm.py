@@ -69,6 +69,25 @@ from nanochat.training.batched_step import (
 from nanochat.training.cell import MinExpLSTMCell, SGDMinExpLSTMCellFiLM4D
 
 
+def _inv_sigmoid(target: float) -> float:
+    """The logit whose sigmoid is ``target``: logit = log(t/(1-t)).
+
+    Inverse of the LR parametrization: a predictor bias set to
+    this value makes ``sigmoid(bias) == target`` for any target
+    in (0, 1), so a zero-weight LR predictor starts at the
+    requested scalar ``lr``. ``target=0`` (the degenerate
+    "freeze updates" construction) maps to a large negative
+    logit: the LR is strictly positive (never exactly 0) but
+    numerically negligible, so a zero-LR optimizer still steps
+    ~nothing while the parametrization stays smooth.
+    """
+    if target <= 0.0:
+        return -12.0
+    if target >= 1.0:
+        return 12.0
+    return float(torch.log(torch.tensor(target / (1.0 - target))))
+
+
 class SGD_MinExpLstm_Optimizer(torch.optim.Optimizer):
     """Joint online learned optimizer, an AdamW replacement.
 
@@ -142,16 +161,48 @@ class SGD_MinExpLstm_Optimizer(torch.optim.Optimizer):
                 "design (bounds are structural now) and are ignored",
                 stacklevel=2,
             )
-        # The optimizer's optimizer (PRD principle 5): AdamW over the
-        # cell's own < 50 params is < 1KB of state. One instance is
-        # reused across meta-steps so its moments persist.
-        self.meta_optimizer = torch.optim.AdamW(self.cell.parameters(), lr=meta_lr)
-        # Backend for the fused step (the same "naive"/"cpu"/"gpu"
-        # contract the MeZO-MinExpLSTM dispatcher uses). Default
-        # "naive" keeps the pure-PyTorch path the historical
-        # behavior; "cpu"/"gpu" route through
-        # dispatch_sgd_minexplstm_step.
+        # The optimizer's optimizer (PRD principle 5): AdamW over the cell's own < 50 params plus the LR predictor. One instance is reused across meta-steps so its moments persist. The meta LR (meta_lr) is a plain hyperparameter -- Lightning's LR finder tunes it before training (warmup); it is NOT learned online.
+        self.meta_optimizer = torch.optim.AdamW(
+            list(self.cell.parameters()), lr=meta_lr
+        )
+        # Data-dependent, learnable learning rate. The LR is a function of the current step's data (the RMS-normalized gradient magnitude), not a stored per-coordinate vector: the model is elementwise and parallel across the batch dimension, so one LR value per batch element suffices. A tiny linear predictor maps the normalized gradient magnitude to a logit, and a sigmoid parametrizes the LR to (0, 1) -- strictly positive (the optimizer always moves) and bounded by 1 (the step is bounded). The predictor is zero-initialized so a fresh optimizer's LR is the constant `lr` (the inverse-sigmoid of the requested scalar), matching native SGD at step 0; the meta-optimizer then co-trains it so the LR adapts to the loss landscape.
+        self.lr_predictor = nn.Linear(1, 1)
+        with torch.no_grad():
+            # Zero weight, bias = inv_sigmoid(lr): the initial LR is the constant `lr` regardless of the input.
+            self.lr_predictor.weight.zero_()
+            self.lr_predictor.bias.fill_(float(_inv_sigmoid(lr)))
+        self.meta_optimizer.add_param_group(
+            {"params": list(self.lr_predictor.parameters())}
+        )
+        # Backend for the fused step (the same "naive"/"cpu"/"gpu" contract the MeZO-MinExpLSTM dispatcher uses. Default "naive" keeps the pure-PyTorch path the historical behavior; "cpu"/"gpu" route through dispatch_sgd_minexplstm_step.
         self.backend: Literal["naive", "cpu", "gpu"] = backend
+        # QAT on the 4-bit main-model layout (see __init__ docstring). The step quantizes grads to INT8 and refreshes the FourBitLinear 4-bit mirrors.
+        self.qat_4bit = qat_4bit
+
+    def _all_params(self) -> list[Tensor]:
+        """Every parameter in every group, in traversal order."""
+        out: list[Tensor] = []
+        for group in self.param_groups:
+            out.extend(group["params"])
+        return out
+
+    def predict_lr(self, grad_rms: Tensor) -> Tensor:
+        """The data-dependent LR for a shape group, in (0, 1).
+
+        ``grad_rms`` is the layer-wise RMS of the group's
+        gradients (the same scale-invariant input the cell and
+        the beta predictor consume). The predictor maps it to a
+        logit and a sigmoid parametrizes the LR to (0, 1). The
+        result is differentiable in the predictor parameters, so
+        the meta-optimizer's closure rebuild routes the loss
+        gradient back to the LR predictor.
+
+        ``grad_rms`` is a scalar (0-dim) tensor; it is reshaped
+        to a 1-element batch so ``nn.Linear`` accepts it, and
+        the output is squeezed back to a scalar.
+        """
+        logit = self.lr_predictor(grad_rms.reshape(1))
+        return torch.sigmoid(logit).squeeze(0)
 
     @staticmethod
     def _rms(t: Tensor, eps: float = 1e-8) -> Tensor:
@@ -206,11 +257,12 @@ class SGD_MinExpLstm_Optimizer(torch.optim.Optimizer):
         group_cfg: dict,
     ) -> None:
         """Batched optimizer step over one group of same-shape params."""
-        lr = group_cfg["lr"]
         wd = group_cfg["weight_decay"]
         lam = group_cfg["lam"]
         clamp_val = group_cfg["clamp_val"]
         grad_batch = torch.stack([p.grad for p in params if p.grad is not None])
+        # Data-dependent learning rate (PRD: the LR is a function of the current step's data). The predictor consumes the group's RMS-normalized gradient magnitude -- the same scale-invariant signal the cell and the beta predictor read, computed after the normalization pre-filter -- and a sigmoid parametrizes the LR to (0, 1). The result is a differentiable tensor, so the meta-rebuild routes the loss gradient back to the LR predictor.
+        lr = self.predict_lr(self._rms(grad_batch))
         state_list: list[dict] = []
 
         fast_list: list[Tensor] = []
@@ -412,13 +464,14 @@ class SGD_MinExpLstm_Optimizer(torch.optim.Optimizer):
                 h_fp32.unsqueeze(-1),
                 group["lam"],
             )
-            # Same formula step() applies to the base weights.
+            # Same formula step() applies to the base weights. The LR is the data-dependent learnable LR: computed from the rebuilt gradient's RMS-normalized magnitude (the same signal step() consumes), so the LR predictor sits on the gradient path and the meta-optimizer co-trains it alongside the cell.
+            lr = self.predict_lr(self._rms(grad.unsqueeze(0)))
             return p.data + film_sgd_update(
                 gamma,
                 delta,
                 grad,
                 p.data,
-                group["lr"],
+                lr,
                 group["weight_decay"],
                 group["clamp_val"],
             )

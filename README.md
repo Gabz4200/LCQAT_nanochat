@@ -85,10 +85,12 @@ Entry points live in `scripts/` and share the global `COMPUTE_DTYPE` and the `--
 | Base eval | `scripts/base_eval.py` | CORE metric, bits-per-byte, sampling |
 | SFT | `scripts/chat_sft.py` | Supervised finetune; LC-QAT/SparseProp on |
 | RL | `scripts/chat_rl.py` | PPO-style RL finetune; LC-QAT/SparseProp on |
-| Chat eval | `scripts/chat_eval.py` | ChatCORE score for an SFT/RL checkpoint |
+| Chat eval | `scripts/chat_eval.py` | ChatCore score for an SFT/RL checkpoint |
 | Export | `scripts/export_lcqat.py` | Freeze an LC-QAT checkpoint into a stripped quantized inference artifact |
 | DARD mining | `scripts/dard_mine.py` | Mine AML rules from the corpus and save a compiled rule set (not a stage) |
 | Chat | `scripts/chat_cli.py` | Talk to a trained model over CLI |
+
+**Backbones.** `--backbone gpt` (default, all-attention Transformer) or `--backbone lfm2` (the LFM2 hybrid: gated short convolutions interleaved with a small fraction of GQA blocks, SwiGLU MLPs, pre-norm RMSNorm, RoPE with QK-norm; arXiv 2511.23404). Both speak the same interface, so every stage, optimizer (SGD_MinExpLstm, MeZo_MinExpLstm, AdamW), and quantization stage (LC-QAT, SparseProp, 4-bit QAT, DARD, DiffusionBlocks) works on either. `base_eval` / `chat_cli` detect the backbone from the saved config, so a checkpoint loads the stack it was trained with.
 
 `speedrun.sh` runs the first six back to back. The ablation harness, kernel microbenchmarks, and inference benchmark also live in `scripts/`; the ablation is summarized under [What's in the box](#whats-in-the-box) and the benchmarks under [docs/kernels.md](docs/kernels.md#benchmarks).
 
@@ -138,9 +140,10 @@ It passes `--db-blocks=2` instead of the default 4. On a toy depth the per-block
 **CPU-specific code:**
 
 | Area | Where | Note |
-||---|---|---|
-|| SGD_MinExpLstm_Optimizer | `nanochat/training/minexp_lstm.py` | Default optimizer (`--optimizer minexplstm`): elementwise SGDMinExpLSTMCellFiLM4D predicts FiLM gain/shift on top of SGD, lambda-coupled dual-EMA horizons, INT8 fast/slow/hidden states (3 bytes/param), joint online co-training via `meta_step` (AdamW over the cell). `--optimizer adamw` keeps the baseline |
-|| Fused AdamW | `nanochat/training/optim.py`, `cpu_adamw_for` | `fused=True`. Non-fused AdamW walks the parameter list in Python, a real cost at this size |
+|---|---|---|
+| SGD_MinExpLstm_Optimizer | `nanochat/training/minexp_lstm.py` | Default optimizer (`--optimizer minexplstm`): elementwise SGDMinExpLSTMCellFiLM4D predicts FiLM gain/shift on top of SGD, lambda-coupled dual-EMA horizons, INT8 fast/slow/hidden states (3 bytes/param), joint online co-training via `meta_step` (AdamW over the cell + the learnable LR predictor). The LR is a **learnable, data-dependent** value: a tiny predictor maps the RMS-normalized gradient magnitude through a sigmoid to (0, 1), co-trained by the meta-optimizer; the AdamW meta-optimizer's own LR (`meta_lr`) stays a plain hyperparameter, tuned by Lightning's LR finder before training starts. `--optimizer adamw` keeps the baseline |
+| MeZo_MinExpLstm_Optimizer | `nanochat/training/mezo_minexplstm.py` | Zeroth-order variant (`--optimizer mezo`): the same cell and FiLM head, but the update direction is a SPSA estimate `(L(θ+εz) - L(θ-εz)) / (2ε)` from dual forward passes, so no gradient is materialized. `--mezo-probes M` (default 1) runs M independent probes per step, averaged order-invariantly (PRD v2.1); M=4 is the target. `naive`/`cpu`/`gpu` backends with three-way parity |
+| Fused AdamW | `nanochat/training/optim.py`, `cpu_adamw_for` | `fused=True`. Non-fused AdamW walks the parameter list in Python, a real cost at this size |
 | Thread pools | `configure_cpu_training(num_threads)` | Sets intra- and inter-op pools; the inter-op pool is the one people forget |
 | ISA dispatch | `ops/native/cpu/gemv.cpp` | AVX-512 / AVX2 / scalar chosen at runtime via cpuid, so the extension builds and runs without AVX-512 |
 | Storage-bound kernels | `ops/native/cpu/index_linear.cpp`, `quant_attn.cpp` | Deliberately `-O3` scalar. Both read packed indices in place with no materialized fp32 matrix, so LUT gathers and memory set the pace, not FMA throughput |
@@ -249,6 +252,11 @@ Four mechanisms ship on by default and compose:
 - **DARD** mines algebraic rules from the corpus offline, compiles them into a differentiable auxiliary loss, and surfaces rule violations as gradient instead of relearning them statistically each step.
 - **Fused CPU kernels** read those packed indices in place at decode time.
 
+Two opt-in quantization / execution stages:
+
+- **4-bit QAT** (`--qat-4bit`, mutually exclusive with `--lcqat`) retrofits every eligible `Linear` to `FourBitLinear`: an fp32 master weight plus a packed-nibble (uint8, two weights per byte) mirror that the straight-through-estimator forward reads, refreshed after each step. All weights are real 4 bits at inference; the fp32 master exists only for the optimizer update. See [dev/FOURBIT_QAT_RESULTS.md](dev/FOURBIT_QAT_RESULTS.md).
+- **Parallel DiffusionBlocks** (`--db-block-execution parallel`, MeZO-only) runs every block's denoiser concurrently over the same `[clean | noisy]` input and sums their EDM losses, so all B blocks get a gradient signal each step instead of 1/B. The memory-traffic trade: sequential (default) holds O(L/B) activation memory; parallel holds O(L) transiently, which is only safe under MeZo_MinExpLstm_Optimizer because its SPSA estimate consumes the loss *value* and never backprops the positive-point graph. On CPU the concurrent blocks overlap because torch releases the GIL inside matmuls. See [docs/diffusionblocks.md](docs/diffusionblocks.md#sequential-vs-parallel-block-execution).
+
 One reference page per mechanism:
 
 | | |
@@ -259,6 +267,8 @@ One reference page per mechanism:
 | [docs/diffusionblocks.md](docs/diffusionblocks.md) | Block-wise engine, versioned block/noise map, compiled EDM loss kernel, clean-past conditioning, `--db-blocks=0`, why EDM and AR losses never compare |
 | [docs/dard.md](docs/dard.md) | Offline AML rule mining, log-domain rule weighting, differentiable order-violation loss, how it attaches to a DiffusionBlocks objective without logits |
 | [docs/architecture.md](docs/architecture.md) | Package layout and the functional-core boundary |
+
+The LFM2 backbone (`nanochat/models/lfm2.py`) and the 4-bit QAT stage are summarized under [What's in the box](#whats-in-the-box); the LFM2 + MeZO + parallel-DiffusionBlocks + 4-bit QAT run results live in [`dev/LFM2_MEZO_DB_RESULTS.md`](dev/LFM2_MEZO_DB_RESULTS.md).
 
 The ablation harness (`scripts/lcqat_ablation.py`) tests nine claims from this repo so runs can falsify them instead of asserting them. It runs nine experiments and writes 20 rows into the generated table in [`dev/LEADERBOARD.md`](dev/LEADERBOARD.md); the driver exits non-zero when an advertised claim fails. Each row is a micro-probe over random weights and a few SGD steps, not a training run, so none states an accuracy claim.
 

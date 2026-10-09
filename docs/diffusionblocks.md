@@ -25,6 +25,15 @@ Use `--db-blocks=0` for a conventional LM baseline. It differs from `--db-object
 
 **The per-step loss jitters by design.** The sampler redraws sigma each step and reweights with `w(sigma) = (sigma^2+sigma_d^2)/(sigma*sigma_d)^2`, so the loss moves between steps at fixed weights. That movement is EDM as specified, not instability.
 
+## Sequential vs parallel block execution
+
+`--db-block-execution {sequential,parallel}` (default `sequential`) chooses how the B blocks train within one step: a memory-traffic decision, not a throughput one.
+
+- **sequential** (default): `denoise_step` samples ONE block per step and runs only its L/B layers. Every block's graph except the active one is dead, so peak activation memory is O(L/B), the B-fold saving that is DiffusionBlocks' reason to exist. Use it under a first-order optimizer or on a memory-bound host.
+- **parallel**: `denoise_step_parallel` runs EVERY block's denoiser concurrently over the same `[clean | noisy]` input and sums the per-block EDM losses, so all B blocks receive a gradient signal each step instead of 1/B. The trade: every block's graph is live at once, so activation memory is O(L), not O(L/B). That is only safe under MeZO, whose SPSA estimate consumes the loss VALUE and never backprops the positive-point graph, so the cost is one transient forward, not a persistent graph. On CPU the concurrent blocks overlap because torch releases the GIL inside matmuls, so compute is faster too.
+
+The training loop wires the parallel path through the MeZO branch for both the positive point and the negative point (the negative runs the same forward under `no_grad`, so the two loss values are comparable: an SPSA estimate of one objective, not a difference of two). Under any other optimizer, keep `sequential`: `parallel` would hold B graphs for a backward that materializes all of them.
+
 ## On CPU
 
 DiffusionBlocks makes this fork viable without a GPU.

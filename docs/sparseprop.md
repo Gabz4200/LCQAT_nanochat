@@ -9,7 +9,7 @@ SparseProp is always-on by default alongside LC-QAT. When LC-QAT is active, LCQA
 | Flag | Meaning |
 |------|---------|
 | `--no-sparseprop` | Disable SparseProp (default: on) |
-| `--sparseprop-sparsity` | Sparsity level 0.0–1.0 (default `0.75`) |
+| `--sparseprop-sparsity` | Sparsity level 0.0-1.0 (default `0.75`) |
 | `--sparseprop-scope {layer,global}` | `layer` (default) = Uniform-GMP, every layer pruned to the same fraction; `global` = Global-GMP, magnitudes ranked across all prunable layers jointly (SparseProp Fig. 6 favours global at equal average sparsity) |
 | `--sparseprop-start-frac` | Starting sparsity as a fraction of `--sparseprop-sparsity` (default `0.0` = one-shot at the full target) |
 | `--sparseprop-every` | Re-prune every N optimizer steps; `0` (default) prunes once at setup and never again |

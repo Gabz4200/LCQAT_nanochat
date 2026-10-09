@@ -129,11 +129,11 @@ The engine publishes `last_dard_logits` and does **not** add the penalty itself;
 
 ### The per-block head, and what it costs
 
-With only the above, the penalty reads the *final* block's hidden state. But `denoise_step` executes one block per step, and `_activate_block` froze the others — so the rule penalty reached **no** transformer layer at all. Measured before the fix: layers with non-zero DARD gradient = `[]`. The rules were being enforced against a representation no rule could shape.
+With only the above, the penalty reads the *final* block's hidden state. But `denoise_step` executes one block per step, and `_activate_block` froze the others, so the rule penalty reached **no** transformer layer at all. Measured before the fix: layers with non-zero DARD gradient = `[]`. The rules were being enforced against a representation no rule could shape.
 
 The fix projects **every** block's own hidden state through the **same** `lm_head` (`_run_block_denoiser(collect_block_logits=True)`) and makes every block require grad, so the penalty reaches all of them. One weight does the work: no second head, and no new parameters or checkpoint keys. Measured after: every layer of every block, non-zero, for every sampled block index.
 
-**This trades away forward isolation.** Running every block is L layers per step, not L/B — the saving DiffusionBlocks exists for. So it is opt-in (`set_dard(..., per_block_head=False)` to decline), not a silent default. `tests/test_dbcpu_denoise.py::test_when_ce_and_edm_objectives_then_only_edm_isolates_the_forward` caught the regression when it was on by default, and two tests now pin both sides: `test_when_the_per_block_head_is_off_then_block_isolation_is_preserved` and `test_when_dard_is_off_then_no_block_logits_are_collected`.
+**This trades away forward isolation.** Running every block is L layers per step, not L/B, the saving DiffusionBlocks exists for. So it is opt-in (`set_dard(..., per_block_head=False)` to decline), not a silent default. `tests/test_dbcpu_denoise.py::test_when_ce_and_edm_objectives_then_only_edm_isolates_the_forward` caught the regression when it was on by default, and two tests now pin both sides: `test_when_the_per_block_head_is_off_then_block_isolation_is_preserved` and `test_when_dard_is_off_then_no_block_logits_are_collected`.
 
 Block-isolation in the *noise-specialization* sense is untouched either way: the data loss still trains one block per step. What per-block adds is that the auxiliary rule term updates every block too.
 
@@ -236,10 +236,10 @@ Measured on the 4-core i5-8250U this was tuned on, not assumed:
 |---|---|
 | bf16 matmul ceiling | **0.7 TFLOP/s** |
 | full-depth AR micro-step, depth 6 | 5.2 s |
-| DiffusionBlocks B=2 / B=3 | 2.9 s / **2.0 s** (1.8–2.7× faster) |
+| DiffusionBlocks B=2 / B=3 | 2.9 s / **2.0 s** (1.8-2.7× faster) |
 | with LC-QAT + SparseProp on top | 8.2 s per micro-step |
 | end-to-end | ~135 s/step at a 32k batch, ~230 tok/s |
 
-DiffusionBlocks is a real and worthwhile **1.8–2.7× wall-clock** win. It is not a token-throughput win in the sense that changes the budget: every token still passes through every layer over a full block cycle, so it cuts activation memory and FLOPs per micro-step, not the number of tokens the machine can afford to train on. Both facts matter when sizing a run.
+DiffusionBlocks is a real and worthwhile **1.8-2.7× wall-clock** win. It is not a token-throughput win in the sense that changes the budget: every token still passes through every layer over a full block cycle, so it cuts activation memory and FLOPs per micro-step, not the number of tokens the machine can afford to train on. Both facts matter when sizing a run.
 
 At 230 tok/s a 6.5-hour budget is ~5.4M tokens. For a 37M-parameter model that is **0.15 tokens/parameter**, against the ~20 that Chinchilla calls optimal. The compute-optimal size for this budget is therefore closer to 8M parameters, and any run here is heavily data-starved. Expect a real loss curve and locally well-formed English, not GPT-2 quality. GPT-2 small (124M) on this box would need ~120x the budget.

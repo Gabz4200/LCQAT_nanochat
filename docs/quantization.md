@@ -26,7 +26,7 @@ python -m scripts.chat_rl --no-lcqat --no-sparseprop           # plain RL
 | `--lcqat-preset small` | Symmetric max compression: q/k weights K=3 (mul-less ternary), everything else K=15 |
 | `--lcqat-preset prd` | PRD table: `mlp.c_proj` (down_proj) at K=255/255, rest as small |
 | `--lcqat-k-map substr:KW/KA,...` | Per-module overrides. Each K is a total level count (`15`) or an explicit split (`0-7`), e.g. `mlp.c_proj:0-7/0-7` |
-| `--codebook-lr` | Codebook AdamW LR (PRD: 10–50× network weights), no weight decay |
+| `--codebook-lr` | Codebook AdamW LR (PRD: 10-50× network weights), no weight decay |
 | `--codebook-grad-scale {inv_sqrt_n,none}` | PRD 2.4 codebook gradient scaling. `inv_sqrt_n` (default) scales the codebook gradient by `1/sqrt(numel)`; with `N = B·T·D` in the millions this is ~1000× smaller, so it interacts multiplicatively with `--codebook-lr` |
 | `--db-objective {edm,ce}` | DiffusionBlocks objective. `edm` (default) trains each block as a denoiser over its own noise range, so only L/B layers run and activations are `O(L/B)`. `ce` is full-depth next-token cross-entropy with block-isolated gradients (saves backward memory, no forward FLOPs). **`ce` is not the same as turning DiffusionBlocks off**: it still runs through the engine and still gradients one block per step. Use `--db-blocks=0` for a conventional baseline |
 | `--db-blocks` | Number of independent diffusion blocks (checkpoint provenance: cannot change on resume). **`0` disables DiffusionBlocks entirely** and trains a plain autoregressive LM: no partitioner, no denoise heads, no block isolation, every layer trains every step |
@@ -94,3 +94,17 @@ Two facts govern use:
 - **It costs `C × K` levels** versus `K` for a shared codebook. That is a table-size change, not a rounding change, so it stays opt-in and the fused inference paths do not consume it.
 
 Measured result: given one channel 100x larger than the others, a fitted shared codebook flattens the small channels to NMSE ~= 1.0 (they round entirely onto the anchor), while per-channel rescues one to ~= 0.4. The effect is **per channel, not on the pooled mean**: the pooled mean is dominated by the large channel, where the two are near-identical, so a mean-based comparison re-tests the big channel and hides the effect. It is also the only loss under which a per-channel table is the right tool: under pooled MSE the gradient is dominated by the largest channel and the small channels' tables never move. No end-to-end accuracy claim follows; the tests in `tests/test_lcqat_per_channel.py` establish the mechanism, not a training win.
+
+## 4-bit QAT (`--qat-4bit`)
+
+`FourBitLinear` (`nanochat/models/quant/fourbit.py`) is the second quantization stage, and it is **mutually exclusive with `--lcqat`**: a weight is either a codebook index (LC-QAT) or a packed 4-bit nibble (4-bit QAT), never both.
+
+Mechanism:
+
+- **fp32 master weight + packed-nibble mirror.** The master stays fp32 so the optimizer updates in full precision; the mirror is a `uint8` tensor holding two 4-bit weights per byte (16 levels, symmetric around the per-tensor scale). The forward reads the *mirror* through a straight-through estimator, so every weight is real 4 bits at inference.
+- **`quantize_weight_()` refreshes the mirror** after each optimizer step, so the mirror tracks the master as training moves it. The STE gradient flows to the master as if the forward had been identity.
+- **Retrofit is structural.** `retrofit_fourbit(model, min_linear_dim)` replaces every eligible `Linear` with `FourBitLinear`, in place, after backbone construction. Because `FourBitLinear` is not a plain `nn.Linear`, the LC-QAT and SparseProp retrofit paths skip it, so `--qat-4bit` composes with SparseProp at the *engine-owned* layers (the DiffusionBlocks adapters / denoise heads) but leaves the base transformer in 4-bit nibble form.
+
+Parity and storage are pinned in `tests/test_fourbit_qat.py` (12 tests): the packed mirror round-trips to the quantized weight, the STE forward matches the quantized value, and the packed storage is a quarter of fp32. Measured layer counts on the LFM2 clone: depth 6 → 20 layers, depth 8 → 28 layers, depth 12 → 40 layers. Run results: [`dev/FOURBIT_QAT_RESULTS.md`](../dev/FOURBIT_QAT_RESULTS.md).
+
+The interaction with checkpoint loading matters: a `--qat-4bit` checkpoint's base transformer has no plain `nn.Linear` to wrap with SparseProp, so `checkpoint_manager.build_model` gates SparseProp injection on the checkpoint's *own* sparse-state keys rather than the always-on `meta["sparseprop"]["enabled"]` flag (per the SparseProp paper, the CSR structures exist only to route gradients; the forward function is the dense linear with pruned weights zeroed). See [docs/diffusionblocks.md](diffusionblocks.md#sequential-vs-parallel-block-execution) and the checkpoint-loading note in [`dev/LFM2_MEZO_DB_RESULTS.md`](../dev/LFM2_MEZO_DB_RESULTS.md).

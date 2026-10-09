@@ -283,6 +283,20 @@ parser.add_argument(
     choices=["naive", "cpu", "gpu"],
     help="MeZO fused-kernel backend (PRD 2.6)",
 )
+parser.add_argument(
+    "--qat-4bit",
+    action="store_true",
+    default=False,
+    help="Quantization-Aware Training on the 4-bit main-model "
+    "layout: the model's weights are stored at 4 bits "
+    "(packed nibbles + scale, 0.5 bytes/weight), the SGD "
+    "optimizer additionally quantizes gradients to INT8 "
+    "(8-bit gradients), and both MinExpLSTM optimizers "
+    "refresh the 4-bit storage mirror after each step. "
+    "The fp32 weight is the optimization surrogate the "
+    "optimizers step; the 4-bit packed buffer is the "
+    "persistent storage form.",
+)
 add_minexp_flags(parser)
 parser.add_argument(
     "--scalar-lr",
@@ -357,12 +371,9 @@ parser.add_argument(
 # Output
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
-# The SparseProp pruning schedule: scope, gradual ramp, dense-below-threshold.
-# Built here (right after parsing) so every setup path sees the same object and
-# the training loop can call `sparse_schedule.apply(engine, step)`.
+# The SparseProp pruning schedule: scope, gradual ramp, dense-below-threshold. Built here (right after parsing) so every setup path sees the same object and the training loop can call `sparse_schedule.apply(engine, step)`.
 sparse_schedule = schedule_from_args(args)
-# -----------------------------------------------------------------------------
-# Compute init and wandb logging
+# ----------------------------------------------------------------------------- Compute init and wandb logging
 
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)

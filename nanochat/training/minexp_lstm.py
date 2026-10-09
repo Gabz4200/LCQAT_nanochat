@@ -97,20 +97,16 @@ class SGD_MinExpLstm_Optimizer(torch.optim.Optimizer):
         lam: float = 0.10,
         clamp_val: float = 1.0,
         meta_lr: float = 1e-3,
-        # Fused-kernel backend ("naive", "cpu", "gpu"): the
-        # same selection surface the MeZO optimizer exposes.
-        # "naive" is the pure-PyTorch reference path; "cpu"
-        # and "gpu" run the fused kernels (nanochat/ops).
+        # Fused-kernel backend ("naive", "cpu", "gpu"): the same selection surface the MeZO optimizer exposes. "naive" is the pure-PyTorch reference path; "cpu" and "gpu" run the fused kernels (nanochat/ops).
         backend: Literal["naive", "cpu", "gpu"] = "naive",
-        # Deprecated pre-PRD-v3.2 spellings, mapped below so existing
-        # scripts keep running. `alpha_residual=0` freezes the FiLM
-        # head (pure SGD forever); `learnable_beta=False` freezes the
-        # beta predictor at the fixed `beta`.
+        # Deprecated pre-PRD-v3.2 spellings, mapped below so existing scripts keep running. `alpha_residual=0` freezes the FiLM head (pure SGD forever); `learnable_beta=False` freezes the beta predictor at the fixed `beta`.
         alpha_residual: float | None = None,
         beta: float = 0.9,
         learnable_beta: bool = True,
         beta_min: float = 0.5,
         beta_max: float = 0.999,
+        # Quantization-Aware Training on the 4-bit main-model layout (nanochat/models/quant/fourbit.py). When True the optimizer (1) quantizes gradients to INT8 (8-bit gradients, the PRD's SGD allowance) and (2) refreshes each FourBitLinear's 4-bit storage mirror after the step, so the persistent weight form stays at 4 bits between steps. Off by default: the shipped optimizers keep their fp32/INT8-state path byte-for-byte.
+        qat_4bit: bool = False,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -193,6 +189,14 @@ class SGD_MinExpLstm_Optimizer(torch.optim.Optimizer):
             for shape, params in shape_groups.items():
                 self._step_shape_group(params, shape, group)
 
+        # QAT on the 4-bit main-model layout: after every parameter has been stepped, refresh each FourBitLinear's 4-bit storage mirror (packed nibbles + scale) from the fp32 surrogate, so the persistent weight form stays at 4 bits between steps. Parameters that are not FourBitLinear weights (codebook deltas, the LR predictor, biases) are left untouched.
+        if self.qat_4bit:
+            for group in self.param_groups:
+                for p in group["params"]:
+                    module = getattr(p, "_fourbit_linear", None)
+                    if module is not None:
+                        module.quantize_weight_()
+
         return loss
 
     def _step_shape_group(
@@ -236,21 +240,23 @@ class SGD_MinExpLstm_Optimizer(torch.optim.Optimizer):
         ema_slow = torch.stack(slow_list)
         h_fp32 = torch.stack(h_list)
 
+        # QAT (PRD 8-bit-gradient allowance for the SGD path): each gradient is quantized to INT8 (symmetric max-abs, one scale per tensor) and the INT8 buffer + scale live in the state, so the grad footprint is 1 byte/param instead of 4. The cell and the FiLM update still consume the fp32 gradient; the INT8 buffer is the stored 8-bit-gradient form.
+        if self.qat_4bit:
+            for p in params:
+                if p.grad is None:
+                    continue
+                gi, gs = quantize_batch(p.grad.reshape(1, -1))
+                self.state[p]["grad_int8"] = gi.reshape(p.grad.shape)
+                self.state[p]["scale_grad"] = gs
+
         if self.backend == "naive":
-            # Pure-PyTorch path (the historical behavior and the
-            # naive reference): one batched cell forward, one
-            # in-place update, INT8 requantization.
+            # Pure-PyTorch path (the historical behavior and the naive reference): one batched cell forward, one in-place update, INT8 requantization.
             gamma, delta, next_h, ema_fast_new, ema_slow_new = batched_cell_forward(
                 self.cell, grad_batch, ema_fast, ema_slow, h_fp32, lam
             )
             B = gamma.shape[0]
             N = grad_batch[0].numel()
-            # FiLM application (PRD 3.6): the shared formula
-            # clamps gamma to [-0.9, 2.0] (so (1 + gamma) stays
-            # in [0.1, 3.0] and never flips the SGD direction)
-            # and delta to [-clamp_val, clamp_val]. It runs on
-            # the flat [B, N] layout the cell forward returns,
-            # matching batched_cell_forward's internal flatten.
+            # FiLM application (PRD 3.6): the shared formula clamps gamma to [-0.9, 2.0] (so (1 + gamma) stays in [0.1, 3.0] and never flips the SGD direction) and delta to [-clamp_val, clamp_val]. It runs on the flat [B, N] layout the cell forward returns, matching batched_cell_forward's internal flatten.
             weight_flat = torch.stack([p.data.reshape(N) for p in params])
             grad_flat = grad_batch.reshape(B, N)
             update = film_sgd_update(

@@ -11,6 +11,12 @@ from nanochat.models.quant.export import (
     export_lcqat_checkpoint,
     wire_activation_luts,
 )
+from nanochat.models.quant.fourbit import (
+    FourBitLinear,
+    dequantize_fourbit,
+    pack_fourbit_weights,
+    unpack_fourbit_weights,
+)
 from nanochat.models.quant.kd import (
     DenoiserDistiller,
     KDLoss,
@@ -34,6 +40,7 @@ from nanochat.models.quant.retrofit import (
     lcqat_config_from_args,
     parse_k_map,
     prepare_lcqat_before_load,
+    retrofit_fourbit,
     retrofit_model,
     retrofit_summary,
 )
@@ -60,6 +67,10 @@ __all__ = [
     "MemoryEfficientLearnedCodebook",
     "QuantizedOutput",
     "LCQATLinear",
+    "FourBitLinear",
+    "dequantize_fourbit",
+    "pack_fourbit_weights",
+    "unpack_fourbit_weights",
     "SparsePropLinear",
     "SparsePropLinearLCQAT",
     "SparsePropLinearFunction",
@@ -88,6 +99,7 @@ __all__ = [
     "parse_k_map",
     "prepare_lcqat_before_load",
     "retrofit_model",
+    "retrofit_fourbit",
     "retrofit_summary",
     "add_w6_args",
     "build_denoiser_teacher",

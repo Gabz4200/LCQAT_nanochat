@@ -728,6 +728,7 @@ def make_optimizer(param_groups, device_type: str, args):
             meta_lr=getattr(args, "minexp_meta_lr", 1e-3),
             epsilon=getattr(args, "mezo_epsilon", 1e-3),
             K=getattr(args, "mezo_K", 4),
+            qat_4bit=getattr(args, "qat_4bit", False),
             delta_q=getattr(args, "mezo_delta_q", 0.0625),
             a_base=getattr(args, "mezo_a_base", 1.5),
             a_min=getattr(args, "mezo_a_min", 0.1),
@@ -751,6 +752,7 @@ def make_optimizer(param_groups, device_type: str, args):
             alpha_residual=getattr(args, "minexp_alpha", None),
             beta=getattr(args, "minexp_beta", 0.9),
             learnable_beta=getattr(args, "minexp_learnable_beta", True),
+            qat_4bit=getattr(args, "qat_4bit", False),
         )
     for group in optimizer.param_groups:
         group["initial_lr"] = group["lr"]

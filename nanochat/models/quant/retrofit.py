@@ -20,6 +20,7 @@ from nanochat.models.io import CodebookSpec, LayerQuantSpec, ModuleTree
 from nanochat.models.quant.activation import ACT_BODIES, ACT_BODY_PWL
 from nanochat.models.quant.codebook import split_from_k
 from nanochat.models.quant.codebook import validate_split as _validate_split
+from nanochat.models.quant.fourbit import FourBitLinear
 from nanochat.models.quant.learnable_lut import RELAXATION_LOGITS, RELAXATIONS
 from nanochat.models.quant.linear import (
     GRAD_SCALE_INV_SQRT_N,
@@ -594,13 +595,63 @@ def retrofit_model(model: _M, config: LayerKConfig) -> _M:
                 out_split=spec_split(spec.effective_output),
                 grad_scale=config.grad_scale,
                 per_channel_weight=config.per_channel_weight,
-                # A per-layer no-op where the module has no bias: every nanochat
-                # projection is `bias=False`, so this is the normal case, not an
-                # error. `from_float` still raises on the direct-construction
-                # combination.
+                # A per-layer no-op where the module has no bias: every nanochat projection is `bias=False`, so this is the normal case, not an error. `from_float` still raises on the direct-construction combination.
                 quantize_bias=config.quantize_bias,
             ),
         )
+    return model
+
+
+def retrofit_fourbit(model: _M, min_linear_dim: int = 128) -> _M:
+    """Recursively replace eligible ``nn.Linear`` modules with
+    :class:`~nanochat.models.quant.fourbit.FourBitLinear`, in place.
+
+    The 4-bit main-model layout (the PRD's storage pillar): each
+    linear's persistent weight becomes packed nibbles (uint8, two
+    per byte) plus one fp32 scale, so the stored weight costs
+    0.5 bytes/weight instead of 4. The fp32 ``weight`` parameter
+    stays as the optimization surrogate the MinExpLSTM optimizers
+    step; :meth:`FourBitLinear.quantize_weight_` refreshes the
+    4-bit mirror (the QAT optimizers call it after each step).
+
+    Mirrors :func:`retrofit_model`'s eligibility rules: skips
+    ``lm_head`` and any module below ``min_linear_dim``, skips
+    already-retrofitted modules (idempotent), and requires
+    materialized (non-meta) weights. ``lm_head`` is kept in fp32
+    so the output projection's resolution is untouched (the same
+    reason LC-QAT skips it).
+    """
+    replacements: list[tuple[nn.Module, str, nn.Linear]] = []
+    for full_name, child in model.named_modules():
+        if not isinstance(child, nn.Linear):
+            continue
+        if is_lcqat_layer(child) or isinstance(child, FourBitLinear):
+            continue
+        if "lm_head" in full_name:
+            continue
+        if min(child.in_features, child.out_features) < min_linear_dim:
+            continue
+        if child.weight.is_meta:
+            raise RuntimeError(
+                f"Cannot retrofit {full_name}: weight is on the meta device; "
+                "run to_empty()/init_weights() first"
+            )
+        parent_name, _, attr = full_name.rpartition(".")
+        parent = model.get_submodule(parent_name) if parent_name else model
+        replacements.append((parent, attr, child))
+
+    for parent, attr, child in replacements:
+        fourbit = FourBitLinear(
+            child.in_features,
+            child.out_features,
+            bias=child.bias is not None,
+        )
+        with torch.no_grad():
+            fourbit.weight.copy_(child.weight)
+            if child.bias is not None:
+                fourbit.bias.copy_(child.bias)
+        fourbit.quantize_weight_()
+        setattr(parent, attr, fourbit)
     return model
 
 

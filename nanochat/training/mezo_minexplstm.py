@@ -178,6 +178,8 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
         a_min: float = 0.1,
         lr_max: float | None = None,
         backend: Literal["naive", "cpu", "gpu"] = "cpu",
+        # Quantization-Aware Training on the 4-bit main-model layout (nanochat/models/quant/fourbit.py). When True the optimizer refreshes each FourBitLinear's 4-bit storage mirror after the step, so the persistent weight form stays at 4 bits between steps. Off by default: the shipped path keeps its fp32 weights.
+        qat_4bit: bool = False,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -224,6 +226,8 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
         # "naive"/"cpu"/"gpu" contract the SGD-MinExpLSTM
         # dispatcher uses).
         self.backend: Literal["naive", "cpu", "gpu"] = backend
+        # QAT on the 4-bit main-model layout (see __init__ docstring): refresh the FourBitLinear mirrors after each step so the persistent weight form stays 4-bit.
+        self.qat_4bit = qat_4bit
 
     # MeZO probe (PRD 2.1)
 
@@ -339,6 +343,14 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
                 shape_groups.setdefault(tuple(p.shape), []).append(p)
             for shape, params in shape_groups.items():
                 self._step_shape_group(params, shape, group, idx_of)
+
+        # QAT on the 4-bit main-model layout: after every parameter has been stepped, refresh each FourBitLinear's 4-bit storage mirror (packed nibbles + scale) from the fp32 surrogate, so the persistent weight form stays at 4 bits between steps. Non-FourBitLinear parameters are left untouched.
+        if self.qat_4bit:
+            for group in self.param_groups:
+                for p in group["params"]:
+                    module = getattr(p, "_fourbit_linear", None)
+                    if module is not None:
+                        module.quantize_weight_()
 
         return loss
 

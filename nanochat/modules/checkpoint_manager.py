@@ -28,16 +28,11 @@ from nanochat.training.diffusion_blocks import (
 )
 from nanochat.utils.common import COMPUTE_DTYPE, get_base_dir
 
-# `nanochat.utils.common` calls `setup_default_logging()` at its own import, so
-# calling it again here would be a no-op -- `logging.basicConfig` returns once
-# root has a handler.
+# `nanochat.utils.common` calls `setup_default_logging()` at its own import, so calling it again here would be a no-op -- `logging.basicConfig` returns once root has a handler.
 logger = logging.getLogger(__name__)
 
 
-#: State-dict key families the DiffusionBlocks engine owns, on top of the bare
-#: GPT. `diffusion_blocks.py` is the writer and this module is the reader, so the
-#: prefixes are declared once here rather than restated per check: a new family
-#: added to the writer but not to this tuple would load as an unexpected key.
+#: State-dict key families the DiffusionBlocks engine owns, on top of the bare GPT. `diffusion_blocks.py` is the writer and this module is the reader, so the prefixes are declared once here rather than restated per check: a new family added to the writer but not to this tuple would load as an unexpected key.
 DB_ADAPTER_PREFIX = "db_adapters."
 DB_HEAD_PREFIX = "db_denoise_heads."
 #: The single shared head that preceded per-block heads.
@@ -251,14 +246,7 @@ def build_model(
                 "sigma range). The block/noise assignment changed, so this "
                 "checkpoint cannot be resumed or evaluated; retrain it."
             )
-        # The engine's own parameters (adapters, denoise heads) are zero-initialized
-        # at construction (diffusion_blocks.py NoiseConditionedBlockAdapter /
-        # denoise_head). A checkpoint that declares meta["db"] but carries no
-        # db_* keys therefore loads a *silently zero* engine. That is always a
-        # bug in the writer, so fail loudly instead of evaluating garbage.
-        # Two required families, each satisfied by either the current or the
-        # legacy key prefix: `db_denoise_heads.{b}.*` (per-block, W1.3) or
-        # `db_denoise_head.*` (the single shared head that preceded it).
+        # The engine's own parameters (adapters, denoise heads) are zero-initialized at construction (diffusion_blocks.py NoiseConditionedBlockAdapter / denoise_head). A checkpoint that declares meta["db"] but carries no db_* keys therefore loads a *silently zero* engine. That is always a bug in the writer, so fail loudly instead of evaluating garbage. Two required families, each satisfied by either the current or the legacy key prefix: `db_denoise_heads.{b}.*` (per-block, W1.3) or `db_denoise_head.*` (the single shared head that preceded it).
         families = {
             "db_adapters.": (DB_ADAPTER_PREFIX,),
             "db_denoise_head": (DB_HEAD_PREFIX, DB_LEGACY_HEAD_PREFIX),
@@ -277,10 +265,7 @@ def build_model(
                 "`engine.state_dict()`; retrain or re-save it."
             )
 
-    # Early legacy-head check: if meta has num_blocks > 1 but state has the
-    # legacy single-head prefix (db_denoise_head.) and NOT the per-block
-    # prefix (db_denoise_heads.), fail with the intended message before
-    # the strict base load (which would complain about LUT keys instead).
+    # Early legacy-head check: if meta has num_blocks > 1 but state has the legacy single-head prefix (db_denoise_head.) and NOT the per-block prefix (db_denoise_heads.), fail with the intended message before the strict base load (which would complain about LUT keys instead).
     if db_meta is not None:
         has_legacy_head = any(k.startswith(DB_LEGACY_HEAD_PREFIX) for k in model_data)
         has_per_block_heads = any(k.startswith(DB_HEAD_PREFIX) for k in model_data)
@@ -293,51 +278,48 @@ def build_model(
                 "or re-save it with the current format."
             )
 
-    # LC-QAT: retrofit before load when the checkpoint already has codebooks,
-    # otherwise retrofit after load only when QAT start was requested
+    # LC-QAT: retrofit before load when the checkpoint already has codebooks, otherwise retrofit after load only when QAT start was requested
     lcqat_active = prepare_lcqat_before_load(
         model, model_data, meta_data.get("lcqat"), lcqat
     )
-    # SparseProp must also be injected BEFORE the load, for the same reason
-    # LC-QAT is: the checkpoint carries `sparsity_mask` / `w_ptr` / `w_col` /
-    # `w_ptr_csc` / `w_row` as persistent buffers, so loading into a model that
-    # was not injected fails with "unexpected key(s)". The training entry points
-    # do this themselves, but they inject *before* calling build_model; an eval
-    # or inference path that goes straight to load_model did not, so a model
-    # trained with the always-on SparseProp default could not be loaded for
-    # evaluation at all. Rebuild it here from meta["sparseprop"], which records
-    # the settings the checkpoint was written with.
+    # SparseProp must also be injected BEFORE the load, for the same reason LC-QAT is: the checkpoint carries `sparsity_mask` / `w_ptr` / `w_col` / `w_ptr_csc` / `w_row` as persistent buffers, so loading into a model that was not injected fails with "unexpected key(s)". The training entry points do this themselves, but they inject *before* calling build_model; an eval or inference path that goes straight to load_model did not, so a model trained with the always-on SparseProp default could not be loaded for evaluation at all. Rebuild it here from meta["sparseprop"], which records the settings the checkpoint was written with.
     sparseprop_meta = meta_data.get("sparseprop")
+    # Gate on the transformer state keys, not on the meta flag: `sparseprop` in the meta records what the run *intended*, but the injection only wraps plain nn.Linear (and LCQATLinear when with_lcqat). A checkpoint whose base transformer was retrofitted to FourBitLinear (--qat-4bit) or LC-QAT-free shapes has no nn.Linear left to wrap, so its transformer state carries no sparse buffers -- yet the engine path (apply_sparseprop on the db_adapters/denoise heads) did record them under db_*. Injecting here would register sparsity_mask / w_ptr / ... the checkpoint never saved, and the strict base load would then fail with "missing key(s)". The engine's own retrofit below is gated on exactly this state-key rule; the base model follows the same rule, which is what the engine path's comment calls for ("gated on the state keys rather than on ... sparseprop_meta"). Per the SparseProp paper (Sec. 3.2), the CSR structures exist to route gradients; the forward function is the dense linear with pruned weights zeroed, so a checkpoint with no transformer sparse state simply trains (and loads) a dense base transformer.
+    base_has_sparse_state = _base_keys_need(model_data, "sparsity_mask")
     if (
         sparseprop_meta
         and sparseprop_meta.get("enabled")
-        # An exported artifact is already in its final shape:
-        # `prepare_lcqat_before_load` ran `_prepare_exported_buffers` above,
-        # which registered the CSR structure the artifact carries. Injecting
-        # again asks `SparsePropLinearLCQAT.from_lcqat` for `lcqat_linear.weight`
-        # -- which export deleted, so it raised AttributeError on a stripped
-        # layer. Since SparseProp is on by default, that made every exported
-        # artifact unloadable.
+        and base_has_sparse_state
+        # An exported artifact is already in its final shape: `prepare_lcqat_before_load` ran `_prepare_exported_buffers` above, which registered the CSR structure the artifact carries. Injecting again asks `SparsePropLinearLCQAT.from_lcqat` for `lcqat_linear.weight` -- which export deleted, so it raised AttributeError on a stripped layer. Since SparseProp is on by default, that made every exported artifact unloadable.
         and not is_exported_lcqat_state(model_data)
     ):
-        from nanochat.models.quant.sparseprop import inject_sparseprop_layers
-
-        # No pruning: the mask built here is a placeholder that the strict load
-        # immediately overwrites with the checkpoint's own.
-        inject_sparseprop_layers(
-            model,
-            sparsity=float(sparseprop_meta.get("sparsity", 0.75)),
-            with_lcqat=lcqat_active is not None,
+        from nanochat.models.quant.sparseprop import (
+            SparsePropLinear,
+            inject_sparseprop_layers,
         )
+
+        # Wrap exactly the base modules the checkpoint recorded as sparse, not every nn.Linear. The generic injection skips modules that are not plain nn.Linear (a FourBitLinear base under `--qat-4bit`, or an LCQATLinear under `--no-lcqat`), so a mixed checkpoint -- e.g. lm_head/smear_gate wrapped while the transformer stayed FourBit -- would otherwise gain buffers for modules the checkpoint never saved and the strict base load would reject them as missing. Per the SparseProp paper (Sec. 3.2), the CSR structures exist only to route gradients; the forward function is the dense linear with pruned weights zeroed, so wrapping only the recorded modules reproduces the trained function exactly.
+        sparse_base_modules = sorted(
+            k[: -len(".sparsity_mask")]
+            for k in model_data
+            if not k.startswith(DB_PREFIXES) and k.endswith(".sparsity_mask")
+        )
+        already_sparse = {
+            name
+            for name, module in model.named_modules()
+            if isinstance(module, SparsePropLinear)
+        }
+        targets = [m for m in sparse_base_modules if m not in already_sparse]
+        if targets:
+            # No pruning: the mask built here is a placeholder that the strict load immediately overwrites with the checkpoint's own.
+            inject_sparseprop_layers(
+                model,
+                sparsity=float(sparseprop_meta.get("sparsity", 0.75)),
+                with_lcqat=lcqat_active is not None,
+                target_modules=targets,
+            )
     if is_exported_lcqat_state(model_data):
-        # An exported artifact keeps the D9 `LearnableIndexLut` parameters
-        # (`logits` / `initial_table`) that `--lcqat-lut-relaxation` attached
-        # during training, but `_prepare_exported_buffers` registers the baked
-        # `activation_lut` table instead and never builds the learnable module,
-        # so the strict load rejected them as unexpected. They are redundant
-        # here, not lost: the function they parameterize is the baked table
-        # beside them, and an exported artifact is inference-only by contract
-        # (the `phase == "train"` guard above rejects it outright).
+        # An exported artifact keeps the D9 `LearnableIndexLut` parameters (`logits` / `initial_table`) that `--lcqat-lut-relaxation` attached during training, but `_prepare_exported_buffers` registers the baked `activation_lut` table instead and never builds the learnable module, so the strict load rejected them as unexpected. They are redundant here, not lost: the function they parameterize is the baked table beside them, and an exported artifact is inference-only by contract (the `phase == "train"` guard above rejects it outright).
         model_data = {
             k: v for k, v in model_data.items() if "learnable_activation_lut" not in k
         }
@@ -378,17 +360,9 @@ def build_model(
                 )
             engine.apply_lcqat(lcqat_active)
             if exported:
-                # The exported counterpart of the reshape `prepare_lcqat_before_load`
-                # applied to the bare GPT, which it could not do for these: it was
-                # handed `model`, and the engine is constructed here, after it ran.
-                # Without it the engine's adapters and heads keep their shadow
-                # weights, every db_* index buffer misses its module and is dropped
-                # by the `strict=False` load, and inference serves float adapters
-                # out of an artifact that looks fully quantized on disk.
+                # The exported counterpart of the reshape `prepare_lcqat_before_load` applied to the bare GPT, which it could not do for these: it was handed `model`, and the engine is constructed here, after it ran. Without it the engine's adapters and heads keep their shadow weights, every db_* index buffer misses its module and is dropped by the `strict=False` load, and inference serves float adapters out of an artifact that looks fully quantized on disk.
                 _prepare_exported_db_buffers(engine, model_data)
-        # Same rule as the base GPT above: an exported artifact is already in its
-        # final shape, and `apply_sparseprop` reads the shadow weight that export
-        # deleted.
+        # Same rule as the base GPT above: an exported artifact is already in its final shape, and `apply_sparseprop` reads the shadow weight that export deleted.
         if _db_keys_need(model_data, "sparsity_mask") and not exported:
             engine.apply_sparseprop(
                 sparsity=float((sparseprop_meta or {}).get("sparsity", 0.75)),

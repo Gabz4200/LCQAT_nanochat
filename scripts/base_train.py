@@ -417,15 +417,13 @@ else:
         )
     print0("!" * 80)
 
-# -----------------------------------------------------------------------------
-# Tokenizer will be useful for evaluation and also we need the vocab size to init the model
+# ----------------------------------------------------------------------------- Tokenizer will be useful for evaluation and also we need the vocab size to init the model
 tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
-# -----------------------------------------------------------------------------
-# Initialize the Model
+# ----------------------------------------------------------------------------- Initialize the Model
 
 base = build_base_model(args, vocab_size, device, ddp_rank, sparse_schedule)
 model = base.model

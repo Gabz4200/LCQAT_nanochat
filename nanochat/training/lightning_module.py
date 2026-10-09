@@ -326,6 +326,8 @@ class MeZoJointTrainableModule(LightningModule):
         # MeZO-specific hyperparameters (PRD 2.1/2.2/2.5).
         epsilon: float = 1e-3,
         K: int = 4,
+        # Intra-step multi-probe batch size (PRD v2.1).
+        M: int = 1,
         delta_q: float = 0.0625,
         a_base: float = 1.5,
         a_min: float = 0.1,
@@ -356,58 +358,50 @@ class MeZoJointTrainableModule(LightningModule):
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
         opts = self.optimizers()
         opt = opts[0] if isinstance(opts, list) else opts
-        # ``self.optimizers()`` returns Lightning's
-        # ``LightningOptimizer`` wrapper, which delegates
-        # attribute access to the inner optimizer but is a
-        # distinct object. The MeZO optimizer stages its
-        # scalar SPSA estimate between the two forward passes
-        # as instance state, so the perturbation, staging, and
-        # step must all run on the *inner* optimizer --
-        # otherwise the wrapper holds the staged estimate
-        # while the inner optimizer's ``step`` sees None.
+        # ``self.optimizers()`` returns Lightning's ``LightningOptimizer`` wrapper, which delegates attribute access to the inner optimizer but is a distinct object. The MeZO optimizer stages its scalar SPSA estimate between the two forward passes as instance state, so the perturbation, staging, and step must all run on the *inner* optimizer -- otherwise the wrapper holds the staged estimate while the inner optimizer's ``step`` sees None.
         inner = getattr(opt, "_optimizer", opt)
         assert isinstance(inner, MeZo_MinExpLstm_Optimizer)
         x, y = batch
-        seed = self._next_seed()
+        M = inner.M
 
-        # 1. MeZO dual forward passes (Algorithm 1): perturb
-        # (+eps), evaluate, perturb (-2eps -> negative point),
-        # evaluate, perturb (+eps -> restore baseline).
-        inner.perturb(seed, scaling=1.0)
-        logits_pos = self(x)
-        loss_pos = self.loss_fn(
-            logits_pos.reshape(-1, logits_pos.size(-1)), y.reshape(-1)
-        )
-        inner.perturb(seed, scaling=-2.0)
-        logits_neg = self(x)
-        loss_neg = self.loss_fn(
-            logits_neg.reshape(-1, logits_neg.size(-1)), y.reshape(-1)
-        )
-        inner.perturb(seed, scaling=1.0)
+        # 1. MeZO dual forward passes. Single-probe (M=1, the v2.0 default): one perturb(+eps) -> evaluate -> perturb(-2eps) -> evaluate -> perturb(+eps) cycle. Multi-probe (M>1, PRD v2.1): M independent dual-forward cycles, one per probe seed, so the batch samples M directions around the same base state. Each cycle restores the baseline exactly, so the probes are independent and the estimator variance drops by 1/M (PRD v2.1 section 4.1).
+        probe_seeds: list[int] = []
+        losses_pos: list[torch.Tensor] = []
+        losses_neg: list[torch.Tensor] = []
+        for m in range(M):
+            seed = self._next_seed()
+            probe_seeds.append(seed)
+            inner.perturb(seed, scaling=1.0)
+            logits_pos = self(x)
+            losses_pos.append(
+                self.loss_fn(
+                    logits_pos.reshape(-1, logits_pos.size(-1)),
+                    y.reshape(-1),
+                )
+            )
+            inner.perturb(seed, scaling=-2.0)
+            logits_neg = self(x)
+            losses_neg.append(
+                self.loss_fn(
+                    logits_neg.reshape(-1, logits_neg.size(-1)),
+                    y.reshape(-1),
+                )
+            )
+            inner.perturb(seed, scaling=1.0)
 
-        # 2. Stage the scalar SPSA estimate and apply the
-        # FiLM-modulated MeZO update. No ``manual_backward``:
-        # MeZO is zeroth-order -- the perturbation already
-        # mutated the parameters in place, so the forward
-        # graph is stale and backward would raise. The
-        # scalar ``(loss_pos - loss_neg) / (2 * epsilon)``
-        # is the gradient surrogate; ``step`` consumes it.
-        # ``opt.step()`` (the Lightning wrapper) rather
-        # than ``inner.step()``: Lightning's manual-
-        # optimization loop signals step completion through
-        # the wrapper, and the wrapper delegates to the
-        # inner optimizer's ``step`` -- which sees the
-        # staged estimate because staging ran on ``inner``.
-        inner.stage_mezo_estimate(seed, loss_pos, loss_neg)
+        # 2. Stage the SPSA estimate(s) and apply the FiLM-modulated MeZO update. No ``manual_backward``: MeZO is zeroth-order -- the perturbation already mutated the parameters in place, so the forward graph is stale and backward would raise. The scalar ``(loss_pos - loss_neg) / (2 * epsilon)`` (single-probe) or its batch mean (multi-probe) is the gradient surrogate; ``step`` consumes it. ``opt.step()`` (the Lightning wrapper) rather than ``inner.step()``: Lightning's manual- optimization loop signals step completion through the wrapper, and the wrapper delegates to the inner optimizer's ``step`` -- which sees the staged estimate because staging ran on ``inner``.
+        if M == 1:
+            inner.stage_mezo_estimate(probe_seeds[0], losses_pos[0], losses_neg[0])
+        else:
+            # The multi-probe staging averages the per-probe estimates (PRD v2.1 section 3.1, Option B): stack the M scalar losses into [M] and stage the batch mean.
+            inner.stage_mezo_estimate_multi(
+                probe_seeds,
+                torch.stack(losses_pos),
+                torch.stack(losses_neg),
+            )
         opt.step()
 
-        # 3. Online meta-optimization pass every N steps: rebuild
-        # the loss differentiably from the updated parameters so
-        # the cell's (gamma, beta) sit on the gradient path. The
-        # closure's backward populates the model gradients (the
-        # rebuilt update is on the graph); clear them so they do
-        # not accumulate across steps -- MeZO never consumes them
-        # (the primary update is zeroth-order, no manual_backward).
+        # 3. Online meta-optimization pass every N steps: rebuild the loss differentiably from the updated parameters so the cell's (gamma, beta) sit on the gradient path. The closure's backward populates the model gradients (the rebuilt update is on the graph); clear them so they do not accumulate across steps -- MeZO never consumes them (the primary update is zeroth-order, no manual_backward).
         if (batch_idx + 1) % self.meta_interval == 0:
             loss_fn = self.loss_fn
 
@@ -418,10 +412,13 @@ class MeZoJointTrainableModule(LightningModule):
             inner.meta_step(self.target_model, _closure)
             inner.zero_grad()
 
-        self.log("train_loss", loss_pos.detach(), prog_bar=True)
-        self.log("mezo_loss_pos", loss_pos.detach(), prog_bar=False)
-        self.log("mezo_loss_neg", loss_neg.detach(), prog_bar=False)
-        return loss_pos
+        # Log the batch-mean losses (the multi-probe estimate averages the per-probe scalars, so the logged loss is comparable across probe counts).
+        mean_pos = torch.stack(losses_pos).mean()
+        mean_neg = torch.stack(losses_neg).mean()
+        self.log("train_loss", mean_pos.detach(), prog_bar=True)
+        self.log("mezo_loss_pos", mean_pos.detach(), prog_bar=False)
+        self.log("mezo_loss_neg", mean_neg.detach(), prog_bar=False)
+        return mean_pos
 
     def configure_optimizers(self):  # type: ignore[override]
         opt = MeZo_MinExpLstm_Optimizer(

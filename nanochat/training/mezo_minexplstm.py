@@ -173,6 +173,8 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
         # MeZO-specific hyperparameters (PRD 2.1/2.2/2.5).
         epsilon: float = 1e-3,
         K: int = DEFAULT_K,
+        # Intra-step multi-probe batch size (PRD v2.1).
+        M: int = 1,
         delta_q: float = 0.0625,
         a_base: float = 1.5,
         a_min: float = 0.1,
@@ -202,6 +204,7 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
         super().__init__(params, defaults)
         self.epsilon = epsilon
         self.K = K
+        self.M = M
         self.delta_q = delta_q
         self.a_base = a_base
         self.a_min = a_min
@@ -280,6 +283,80 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
         self._staged = (seed, float(mu.item()))
         return float(mu.item())
 
+    @torch.no_grad()
+    def perturb_probes(self, probe_seeds: list[int], scaling: float = 1.0) -> None:
+        """Apply a batch of M seed-replayed perturbations in place.
+
+        The multi-probe twin of :meth:`perturb` (PRD v2.1
+        section 2.1). Each probe ``m`` is perturbed along its own
+        direction ``z^{(m)}`` replayed from ``probe_seeds[m]``, so
+        the M probes sample the loss landscape around the same base
+        state. ``scaling=+1`` adds ``eps * z^{(m)}``; ``scaling=-2``
+        moves to the negative point; ``scaling=+1`` restores the
+        baseline. The round trip is exact (the perturbations are
+        added and subtracted in place), which is what makes the
+        SPSA estimate unbiased.
+
+        All M probes apply their perturbation simultaneously -- the
+        resulting parameter state is the base plus the *sum* of the
+        M perturbations, so the batch can be evaluated with a
+        single forward pass per scaling side when the caller
+        wants the aggregate; the per-probe estimates come from M
+        separate dual-forward cycles.
+        """
+        if len(probe_seeds) != self.M:
+            raise ValueError(
+                f"probe_seeds has {len(probe_seeds)} entries but M={self.M}"
+            )
+        idx = 0
+        for group in self.param_groups:
+            for p in group["params"]:
+                for seed in probe_seeds:
+                    z = self._replay(_derive_seed(seed, idx), p.shape, p.device)
+                    p.data.add_(z, alpha=scaling * self.epsilon)
+                idx += 1
+
+    def stage_mezo_estimate_multi(
+        self, probe_seeds: list[int], loss_pos: Tensor, loss_neg: Tensor
+    ) -> float:
+        """Stage the multi-probe SPSA batch for the next ``step``.
+
+        The multi-probe twin of :meth:`stage_mezo_estimate` (PRD
+        v2.1 section 3.1, Option B). ``loss_pos``/``loss_neg``
+        are *batched* scalars (one per probe, shape [M] or [M,1]);
+        the staged estimate is the arithmetic mean of the per-probe
+        SPSA estimates, the order-invariant aggregation that makes
+        the step permutation-equivariant. Returns the mean estimate
+        so the loop can log it without a second reduction.
+
+        The per-probe seeds and estimates are both staged so
+        ``step`` replays each probe's FIR/MeZO contribution with
+        its own ``mu_m`` (the FIR and MeZO vectors are linear in
+        ``mu``, so the mean of the vectors equals the vector built
+        from the mean mu -- the equivariance the tests pin).
+        """
+        if len(probe_seeds) != self.M:
+            raise ValueError(
+                f"probe_seeds has {len(probe_seeds)} entries but M={self.M}"
+            )
+        if not isinstance(loss_pos, Tensor) or not isinstance(loss_neg, Tensor):
+            raise TypeError("loss_pos/loss_neg must be tensors")
+        # Flatten to [M]; a scalar loss is broadcast to M probes (the single-probe spelling reused for M>1).
+        pos = loss_pos.detach().reshape(-1)
+        neg = loss_neg.detach().reshape(-1)
+        if pos.numel() == 1 and self.M > 1:
+            pos = pos.expand(self.M)
+        if neg.numel() == 1 and self.M > 1:
+            neg = neg.expand(self.M)
+        if pos.numel() != self.M or neg.numel() != self.M:
+            raise ValueError(
+                f"loss_pos/loss_neg must hold M={self.M} scalar estimates, "
+                f"got {pos.numel()}/{neg.numel()}"
+            )
+        mus = ((pos - neg) / (2.0 * self.epsilon)).tolist()
+        self._staged = (list(probe_seeds), [float(m) for m in mus])
+        return float(sum(mus) / len(mus))
+
     # The MeZO step (PRD 2.2-2.5)
 
     def _clip_bound(self, lr: float) -> float:
@@ -319,17 +396,23 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
                 "estimate: call stage_mezo_estimate(seed, loss_pos, "
                 "loss_neg) between the two forward passes"
             )
-        seed, mu = self._staged
+        staged = self._staged
         self._staged = None
+        # Normalize the staged batch. Single-probe (M=1): the (seed, mu) pair is used as-is. Multi-probe (M>1, PRD v2.1): the batch (probe_seeds, mus) is aggregated with the arithmetic mean -- the FIR and MeZO vectors are linear in mu, so the mean of the per-probe vectors equals the vector built from the mean mu. The FIR history keeps the batch's canonical (first) seed, so the replayed FIR signal stays deterministic and the step is permutation-equivariant.
+        if isinstance(staged[0], list):
+            probe_seeds = staged[0]
+            mus = staged[1]
+            seed = probe_seeds[0]
+            mu = sum(mus) / len(mus)
+        else:
+            seed, mu = staged
         self.seed_history.append(seed)
         self.mu_history.append(mu)
         if len(self.seed_history) > self.K:
             self.seed_history.pop(0)
             self.mu_history.pop(0)
 
-        # Canonical parameter indices: both ``perturb`` and this step
-        # derive per-parameter seeds from (seed, index), so the two
-        # traversals must agree on the ordering.
+        # Canonical parameter indices: both ``perturb`` and this step derive per-parameter seeds from (seed, index), so the two traversals must agree on the ordering.
         idx_of: dict[int, int] = {}
         idx = 0
         for group in self.param_groups:

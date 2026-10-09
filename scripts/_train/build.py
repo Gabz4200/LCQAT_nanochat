@@ -718,6 +718,7 @@ def make_optimizer(param_groups, device_type: str, args):
             f"(epsilon={getattr(args, 'mezo_epsilon', 1e-3)}, "
             f"K={getattr(args, 'mezo_K', 4)}, "
             f"backend={getattr(args, 'mezo_backend', 'cpu')})"
+            f"M={getattr(args, 'mezo_probes', 1)}, "
         )
         optimizer = MeZo_MinExpLstm_Optimizer(
             param_groups,
@@ -728,6 +729,7 @@ def make_optimizer(param_groups, device_type: str, args):
             meta_lr=getattr(args, "minexp_meta_lr", 1e-3),
             epsilon=getattr(args, "mezo_epsilon", 1e-3),
             K=getattr(args, "mezo_K", 4),
+            M=getattr(args, "mezo_probes", 1),
             qat_4bit=getattr(args, "qat_4bit", False),
             delta_q=getattr(args, "mezo_delta_q", 0.0625),
             a_base=getattr(args, "mezo_a_base", 1.5),

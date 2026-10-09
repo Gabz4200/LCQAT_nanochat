@@ -79,8 +79,7 @@ elif dataset_tag == "climbmix":
 else:
     raise ValueError(f"Unknown dataset tag: {dataset_tag}")
 
-# Source dataset
-# `split` is always given, so load_dataset returns a single Dataset (not a DatasetDict)
+# Source dataset `split` is always given, so load_dataset returns a single Dataset (not a DatasetDict)
 ds = load_dataset(dataset_path, name=dataset_name, split=dataset_split)
 
 # Shuffle to scramble the order

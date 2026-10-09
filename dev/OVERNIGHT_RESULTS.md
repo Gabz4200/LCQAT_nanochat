@@ -1,4 +1,4 @@
-# Overnight Combined Run — Results
+# Overnight Combined Run: Results
 
 Run tag: `d8_s256_b4_db2_sp0.7`
 Log: `~/.cache/nanochat/d8_s256_b4_db2_sp0.7.log`

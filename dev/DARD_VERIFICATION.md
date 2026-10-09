@@ -175,6 +175,6 @@ an RNG artifact.
 |---|---|
 | `ruff check .` | clean |
 | `ruff format --check .` | 219 files already formatted |
-| `pyrefly check` | 615 errors — exactly the baseline |
+| `pyrefly check` | 615 errors, exactly the baseline |
 | `pytest -m "not slow"` | 6 failed + 28 errors = 34, exactly baseline; **0 new** |
 | `pytest tests/test_dard_diffusion_blocks.py` | 29 passed |

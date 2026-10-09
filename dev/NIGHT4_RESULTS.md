@@ -11,7 +11,7 @@ and confirmed active in the log.
 | CPU | Intel i5-8250U, 4 cores / 8 threads, 7 GB RAM |
 | bf16 matmul ceiling | **0.7 TFLOP/s** |
 | full-depth AR micro-step (depth 6) | 5.2 s |
-| DiffusionBlocks B=2 / B=3 | 2.9 s / **2.0 s**, a real 1.8–2.7× win |
+| DiffusionBlocks B=2 / B=3 | 2.9 s / **2.0 s**, a real 1.8-2.7× win |
 | with LC-QAT + SparseProp on top | 8.2 s per micro-step |
 | end-to-end | **127 s/step**, ~258 tok/s |
 | total | 100 steps in **188 min** (3h08) |
@@ -34,7 +34,7 @@ compute-optimal ~9M for 24M tokens.
 | train loss | 4.52 → **0.55** |
 | trainer val "bpb" | 3.208 → **3.679** |
 | nats/byte on fresh text (correct metric) | **3.06** |
-| bits/char | **2.12** (random ≈ 11.5, good English 1.0–1.5) |
+| bits/char | **2.12** (random ≈ 11.5, good English 1.0-1.5) |
 | 4-gram repetition | **0.00** |
 | DARD penalty | 0.069326 → 0.069321, live throughout |
 | rules | 353, 98% violable |
@@ -80,7 +80,7 @@ so nothing isolates DARD's contribution. What holds:
 - overhead is +6% to +10% marginal (PRD budget ≤15%).
 
 What does **not** hold: that this accelerates convergence. On AML's argument
-that needs ~20–100× fewer tokens; at 0.09 tokens/param there was no headroom
+that needs ~20-100× fewer tokens; at 0.09 tokens/param there was no headroom
 for it to show, and a single arm cannot separate it from noise.
 
 The next experiment to run: the same config with `--no-dard`, same seed and

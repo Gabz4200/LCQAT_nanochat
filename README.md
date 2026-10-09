@@ -87,6 +87,7 @@ Entry points live in `scripts/` and share the global `COMPUTE_DTYPE` and the `--
 | RL | `scripts/chat_rl.py` | PPO-style RL finetune; LC-QAT/SparseProp on |
 | Chat eval | `scripts/chat_eval.py` | ChatCore score for an SFT/RL checkpoint |
 | Export | `scripts/export_lcqat.py` | Freeze an LC-QAT checkpoint into a stripped quantized inference artifact |
+| LM-head tune | `scripts/lm_head_tune.py` | Secondary fine-tune: freeze the backbone, train only `lm_head` (recovers generation from an EDM checkpoint trained with `--db-aux-lm-weight 0`) |
 | DARD mining | `scripts/dard_mine.py` | Mine AML rules from the corpus and save a compiled rule set (not a stage) |
 | Chat | `scripts/chat_cli.py` | Talk to a trained model over CLI |
 
@@ -141,13 +142,13 @@ It passes `--db-blocks=2` instead of the default 4. On a toy depth the per-block
 
 | Area | Where | Note |
 |---|---|---|
-| SGD_MinExpLstm_Optimizer | `nanochat/training/minexp_lstm.py` | Default optimizer (`--optimizer minexplstm`): elementwise SGDMinExpLSTMCellFiLM4D predicts FiLM gain/shift on top of SGD, lambda-coupled dual-EMA horizons, INT8 fast/slow/hidden states (3 bytes/param), joint online co-training via `meta_step` (AdamW over the cell + the learnable LR predictor). The LR is a **learnable, data-dependent** value: a tiny predictor maps the RMS-normalized gradient magnitude through a sigmoid to (0, 1), co-trained by the meta-optimizer; the AdamW meta-optimizer's own LR (`meta_lr`) stays a plain hyperparameter, tuned by Lightning's LR finder before training starts. `--optimizer adamw` keeps the baseline |
-| MeZo_MinExpLstm_Optimizer | `nanochat/training/mezo_minexplstm.py` | Zeroth-order variant (`--optimizer mezo`): the same cell and FiLM head, but the update direction is a SPSA estimate `(L(θ+εz) - L(θ-εz)) / (2ε)` from dual forward passes, so no gradient is materialized. `--mezo-probes M` (default 1) runs M independent probes per step, averaged order-invariantly (PRD v2.1); M=4 is the target. `naive`/`cpu`/`gpu` backends with three-way parity |
+| SGD_MinExpLstm_Optimizer | `nanochat/training/minexp_lstm.py` | First-order joint online learned optimizer (`--optimizer minexplstm`): elementwise SGDMinExpLSTMCellFiLM4D predicts FiLM gain/shift on top of SGD, lambda-coupled dual-EMA horizons, INT8 fast/slow/hidden states (3 bytes/param), joint online co-training via `meta_step` (AdamW over the cell + the learnable LR predictor). The LR is a **learnable, data-dependent** value: a tiny predictor maps the RMS-normalized gradient magnitude through a sigmoid to (0, 1), co-trained by the meta-optimizer; the AdamW meta-optimizer's own LR (`meta_lr`) stays a plain hyperparameter, tuned by Lightning's LR finder before training starts. `--optimizer adamw` keeps the baseline |
+| MeZo_MinExpLstm_Optimizer | `nanochat/training/mezo_minexplstm.py` | Zeroth-order variant, the **default** (`--optimizer mezo`): the same cell and FiLM head, but the update direction is a SPSA estimate `(L(θ+εz) - L(θ-εz)) / (2ε)` from dual forward passes, so no gradient is materialized. `--mezo-probes M` (default 1) runs M independent probes per step, averaged order-invariantly (PRD v2.1); M=4 is the target. `naive`/`cpu`/`gpu` backends with three-way parity |
 | Fused AdamW | `nanochat/training/optim.py`, `cpu_adamw_for` | `fused=True`. Non-fused AdamW walks the parameter list in Python, a real cost at this size |
 | Thread pools | `configure_cpu_training(num_threads)` | Sets intra- and inter-op pools; the inter-op pool is the one people forget |
-| ISA dispatch | `ops/native/cpu/gemv.cpp` | AVX-512 / AVX2 / scalar chosen at runtime via cpuid, so the extension builds and runs without AVX-512 |
-| Storage-bound kernels | `ops/native/cpu/index_linear.cpp`, `quant_attn.cpp` | Deliberately `-O3` scalar. Both read packed indices in place with no materialized fp32 matrix, so LUT gathers and memory set the pace, not FMA throughput |
-| Zero-skip | `ops/sparse_index_linear.py` | A stored slot of exactly `0.0` is skipped, not accumulated; it sits on the hot path because the LC-QAT zero anchor makes `0.0` a common weight |
+| ISA dispatch | `nanochat/ops/native/cpu/gemv.cpp` | AVX-512 / AVX2 / scalar chosen at runtime via cpuid, so the extension builds and runs without AVX-512 |
+| Storage-bound kernels | `nanochat/ops/native/cpu/index_linear.cpp`, `quant_attn.cpp` | Deliberately `-O3` scalar. Both read packed indices in place with no materialized fp32 matrix, so LUT gathers and memory set the pace, not FMA throughput |
+| Zero-skip | `nanochat/ops/sparse_index_linear.py` | A stored slot of exactly `0.0` is skipped, not accumulated; it sits on the hot path because the LC-QAT zero anchor makes `0.0` a common weight |
 | Sparse training path | `nanochat/models/quant/sparseprop.py` | Measured crossover per layer: masked dense GEMM below 80% sparsity (the default regime), `nnz` walk above. See [docs/sparseprop.md](docs/sparseprop.md) |
 | KV cache | `QuantizedKVCache` | K/V stay nibble-packed uint8 codebook indices, resolved through per-(layer, head) FP32 codebooks inside the kernel, so the cache never materializes as bf16 |
 
@@ -190,6 +191,8 @@ step 00199/00200 (99.50%) | loss: 0.109227 | lrm: 0.06 | dt: 757.69ms | tok/sec:
 ```
 
 Per-step loss jumps by design: sigma is resampled each step and `w(sigma)` reweights it, which is the EDM objective working as specified, not instability (see [docs/diffusionblocks.md](docs/diffusionblocks.md)). The overfit test pins the loss-decreases assertion; do not eyeball a three-step trace.
+
+The default objective is `--db-objective edm`, which score-matches denoised embeddings and never produces next-token logits. `lm_head` learns only through the auxiliary per-block next-token term (`--db-aux-lm-weight`, default 0.1) plus DARD's small penalty; pass `--db-aux-lm-weight 0` and it goes back to receiving no gradient at all. Any run with generation or coherence as an acceptance criterion should use `--db-objective ce` instead. A checkpoint already trained without the auxiliary term can recover generation with `scripts/lm_head_tune.py`, which freezes the backbone and trains only `lm_head`.
 
 Two steps of the same 200 decode as prose:
 
@@ -278,7 +281,7 @@ The ablation harness (`scripts/lcqat_ablation.py`) tests nine claims from this r
 
 Two sweeps cover capability rather than mechanisms: [`runs/scaling_laws.sh`](runs/scaling_laws.sh) and [`runs/miniseries.sh`](runs/miniseries.sh). Both read depth-dependent flags from [`runs/lib_depth.sh`](runs/lib_depth.sh), so a threshold change lands once and the sweeps stay comparable. Upstream's [miniseries discussion](https://github.com/karpathy/nanochat/discussions/420) gives background.
 
-Run history and negative results live in [`dev/LOG.md`](dev/LOG.md).
+Run history and negative results live in [`dev/`](dev/LEADERBOARD.md): [`dev/LOG.md`](dev/LOG.md) is the training experiment log, [`dev/STACK_COMPARE.md`](dev/STACK_COMPARE.md) is the four-arm LC-QAT / SparseProp / DiffusionBlocks sweep, and the `*_RESULTS.md` / verification notes record individual sessions.
 
 ---
 

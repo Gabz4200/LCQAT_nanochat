@@ -22,22 +22,22 @@ Layout follows a functional-core / imperative-shell split:
 | `nanochat/training/` | DiffusionBlocks engine and optimizers |
 | `nanochat/data/` | Ingestion boundary: dataloader, dataset, tokenizer |
 | `nanochat/callbacks/` | Side-effect observers: W&B logging, GC, run summary |
-| `nanochat/utils/` | `COMPUTE_DTYPE` and misc helpers |
+| `nanochat/utils/` | Shell convenience re-exports (`COMPUTE_DTYPE` lives in `nanochat/models/dtype.py`) and misc helpers |
 
 Key files:
 
-- Transformer backbone: `nanochat/models/backbone.py` (`GPT`, `GPTConfig`, `Linear`)
+- Transformer backbones: `nanochat/models/backbone.py` (`GPT`, `GPTConfig`, `Linear`), `nanochat/models/lfm2.py` (LFM2 hybrid), dtype policy in `nanochat/models/dtype.py` (`COMPUTE_DTYPE`)
 - Typed contracts: `nanochat/models/io.py` (`LayerQuantSpec`, `CodebookSpec`)
-- Training entry points: `scripts/{base_train,chat_sft,chat_rl,base_eval,chat_eval,chat_cli}.py`
-- `base_train` internals: `scripts/_train/{build,loop,eval}.py`
-- Quantization core: `nanochat/models/quant/{retrofit,linear,codebook,kd,efqat,lut,packing,export,sparseprop}.py`
+- Training entry points: `scripts/{base_train,chat_sft,chat_rl,base_eval,chat_eval,chat_cli}.py`, plus `scripts/{lm_head_tune,dard_mine,export_lcqat}.py`
+- `base_train` internals: `scripts/_train/{build,loop,eval}.py`, shared flags in `scripts/_cli.py`
+- Quantization core: `nanochat/models/quant/{retrofit,linear,codebook,kd,efqat,lut,learnable_lut,product_lut,activation,sigma_codebook,per_channel,packing,export,sparseprop,pruning,fourbit,bias_quant}.py`
 - DARD: `nanochat/models/dard/{shard,atomize,weighting,compile,loss,cli,engine_hook}.py` plus `nanochat/ops/references/dard_reference.py` (parity oracle)
 - EDM loss kernel: `nanochat/ops/{db_denoise,dispatch}.py`, `nanochat/ops/references/db_denoise_reference.py`, `nanochat/ops/native/cpu/db_denoise.cpp`
 - Ablation experiments: `nanochat/modules/experiments/` (one module each)
-- Native kernels: `nanochat/ops/native/cpu/{gemv,index_linear,quant_attn,sparseprop,db_denoise}.cpp`
-- Op dispatch: `nanochat/ops/{dispatch,gemv,index_linear,quant_attn,sparseprop,db_denoise}.py` plus `references/` oracles
-- Kernel loaders: `nanochat/ops/kernels/{cpu_loader,gpu_loader}.py`
-- DiffusionBlocks: `nanochat/training/diffusion_blocks.py` (`DiffusionBlockEngine`, `EquiProbabilityPartitioner`)
+- Native kernels: `nanochat/ops/native/cpu/{gemv,index_linear,quant_attn,sparseprop,db_denoise,sgd_minexplstm,mezo_minexplstm}.cpp`
+- Op dispatch: `nanochat/ops/{dispatch,gemv,index_linear,sparse_index_linear,quant_attn,sparseprop,db_denoise,sgd_minexplstm,mezo_minexplstm}.py` plus `references/` oracles
+- Kernel loaders: `nanochat/ops/kernels/{cpu_loader,gpu_loader,registration}.py`
+- DiffusionBlocks + optimizers: `nanochat/training/diffusion_blocks.py` (`DiffusionBlockEngine`, `EquiProbabilityPartitioner`), `nanochat/training/{minexp_lstm,mezo_minexplstm,optim,cell,batched_step,lightning_module}.py` (default `--optimizer mezo`)
 
 ## Setup Commands
 
@@ -85,7 +85,7 @@ pytest tests/test_<name>.py -q
 
 Write the failing test first (RED), then the minimal implementation (GREEN), then clean up (REFACTOR). A test that passes on first run proves nothing. Bug fixes start with a reproduction test. Name tests as specifications: `test_when_<condition>_then_<outcome>`.
 
-For a new kernel or objective, pin `naive == cpu == gpu` parity against an independent oracle (plain Python loops, not tensor ops that could share the bug), plus `torch.library` opcheck, `torch.compile` composition, the unknown-backend error, and input-validation errors. For the DB engine, assert behavior, not implementation: gradient reach (`lm_head` untouched by EDM, trained by AR), block and noise ownership, mask semantics row-by-row.
+For a new kernel or objective, pin `naive == cpu == gpu` parity against an independent oracle (plain Python loops, not tensor ops that could share the bug), plus `torch.library` opcheck, `torch.compile` composition, the unknown-backend error, and input-validation errors. For the DB engine, assert behavior, not implementation: gradient reach (`denoise_step` alone leaves `lm_head` untouched while `train_step`/AR trains it — pinned in `tests/test_db_edm_behavior.py`; note the loop-level `--db-aux-lm-weight` term, default 0.1, trains `lm_head` on top of the EDM term, so scope lm_head-no-gradient assertions to `denoise_step` with `aux_lm_weight=0`), block and noise ownership, mask semantics row-by-row.
 
 Test models need active blocks: nanochat zero-initializes `attn.c_proj`/`mlp.c_proj`, so untouched tiny models have no-op blocks and parity assertions pass vacuously. Build test models with `tests.conftest.build_active_tiny_gpt` (or `make_engine(..., active=True)`). Keep new DB tests in `tests/test_db_denoise_kernel.py` (kernel stack) and `tests/test_db_edm_behavior.py` (mapping, masking, EDM-vs-AR); do not open a new file per slice (`test_dbcpu_objective.py` already merged into `test_dbcpu_denoise.py`).
 
@@ -100,7 +100,7 @@ uv run pytest
 uv run aislop scan .
 ```
 
-Known test files: `tests/test_lcqat_*` (parity, opcheck, runtime), `tests/test_sparseprop*`, `tests/test_dard_{mining,loss,diffusion_blocks,smoke,overhead}.py`, `tests/test_dbcpu_*`, `tests/test_db_{denoise_kernel,edm_behavior}.py`, `tests/test_numerical_fingerprint.py` (behavior gate), `tests/test_architecture_boundary.py` (core-to-shell import rule), `tests/test_adamw_cpu.py`, `tests/test_calculator.py`.
+Known test files: `tests/test_lcqat_*` (parity, opcheck, runtime), `tests/test_sparseprop*`, `tests/test_dard_{mining,loss,diffusion_blocks,smoke,overhead,checkpoint,violability}.py`, `tests/test_dbcpu_*`, `tests/test_db_{denoise_kernel,edm_behavior,objective_generates}` (+ `test_dbcpu_{generate,quantized_generate,packing,cpu}`), `tests/test_{fourbit_qat,learnable_lr,mezo_multiprobe,minexplstm_kernel,mezo_minexplstm_kernel,lm_mode,execution}` + `test_{w0,w2}_*` workstream suites, `tests/test_numerical_fingerprint.py` (behavior gate), `tests/test_architecture_boundary.py` (core-to-shell import rule), `tests/test_adamw_cpu.py`, `tests/test_calculator.py`.
 
 ## Code Style
 
@@ -133,7 +133,7 @@ Quantization and sparsity rules:
 - `nanochat/models/dard/atomize.py` is integer set algebra for offline mining; never call it from a training step. The loop sees only the compiled `DardRuleSet` (two binary CSR matrices plus fp32 weights). If online code needs a rule's token sets, the compilation misses a field.
 - A DARD conclusion never contains its premise; `_successors` enforces disjoint token sets. A conclusion containing its premise forces `v(conclusion) >= v(premise)`, pins every penalty at its floor, and silences the feature while the loss looks healthy.
 - DARD weights stay fp32: `eps_floor = 1e-6` sits below fp8 E5M2's smallest subnormal (`2^-16`), so bf16/fp8 autocast rounds the floor to zero and kills tail rules. `DardRuleLoss` runs its block under `autocast(enabled=False)`, and `DardRuleSet.__post_init__` rejects non-fp32 weights.
-- DARD gives `lm_head` a gradient under EDM (it otherwise has none because its target is embeddings). The penalty attaches at the same `lm_head` projection `generate()` samples from. The engine publishes `last_dard_logits` and does not add the penalty itself; the loop owns balancing, so apply the lambda in exactly one place.
+- DARD gives `lm_head` a gradient under EDM alongside the auxiliary per-block LM term (`--db-aux-lm-weight`, default 0.1): the bare EDM term score-matches embeddings and touches no logits, so with `--db-aux-lm-weight 0` and `--no-dard` the head stays at random init. The penalty attaches at the same `lm_head` projection `generate()` samples from. The engine publishes `last_dard_logits` and does not add the penalty itself; the loop owns balancing, so apply the lambda in exactly one place.
 
 ## Build/Deploy
 
@@ -149,13 +149,13 @@ A mapping or objective change breaks checkpoints: bump the version stamp, reject
 - Keep the body short. Three to five lines, and only for what the diff cannot show: the measurement that justifies the change, the defect it fixes, the trade-off it accepts. A body that restates the diff, narrates the edit, or hedges about the tooling is noise. Put rationale in `docs/`, not in the log.
 - Never `--force` push, never `--no-verify`, never touch git config. When a hook-gated commit fails, fix and create a new commit.
 - Include behavior docs in the change: `docs/diffusionblocks.md` and README `--help` text ship with the code, not after it.
-- EDM does not train `lm_head`. Under `--db-objective edm` the loss does score-matching on denoised embeddings, so `lm_head` gets no gradient (`.grad is None`). `tests/test_db_edm_behavior.py` pins this. `lm_head` is ~23% of a small model's parameters and the only map from hidden state to token ids, so an EDM-trained checkpoint cannot generate text; it projects through random-weight logits. Any run with generation or coherence as an acceptance criterion must use `--db-objective ce`. DiffusionBlocks applies in both modes; only the block objective differs.
+- The bare EDM term does not train `lm_head`. Under `--db-objective edm`, `denoise_step` with `aux_lm_weight=0` does score-matching on denoised embeddings, so `lm_head` gets no gradient (`.grad is None`) — `tests/test_db_edm_behavior.py` pins this at the step level. At run level the head IS trained by the auxiliary per-block next-token term (`--db-aux-lm-weight`, default 0.1) plus DARD's penalty; only `--db-aux-lm-weight 0` with `--no-dard` restores the old no-gradient behavior. `lm_head` is ~23% of a small model's parameters and the only map from hidden state to token ids, so a checkpoint trained that way cannot generate text; it projects through random-weight logits. Any run with generation or coherence as an acceptance criterion must use `--db-objective ce` (or recover via `scripts/lm_head_tune.py`, which freezes the backbone and trains only `lm_head`). DiffusionBlocks applies in both modes; only the block objective differs.
 
 ## Debugging/Troubleshooting
 
 - Expect post-edit churn: the hook reformats and runs aislop on every edit.
 - Taichi/Vulkan silently computes garbage on directly passed host tensors. Stage through `from_numpy`/`to_numpy` (`_to_ti` in `gpu_loader.py`).
-- An EDM checkpoint that cannot generate text is usually not a bug: EDM leaves `lm_head` untrained (see PR Guidelines). Switch acceptance runs to `--db-objective ce`.
+- An EDM checkpoint that cannot generate text is usually not a bug: with `--db-aux-lm-weight 0` and `--no-dard`, EDM leaves `lm_head` untrained (see PR Guidelines). Switch acceptance runs to `--db-objective ce`, or recover an existing checkpoint with `scripts/lm_head_tune.py`. If the aux term is at its default 0.1 and generation is still incoherent, that is a training-quality issue, not the missing-head-gradient issue.
 - A healthy-looking DARD loss with no effect often means premise/conclusion overlap; check `_successors` before tuning the lambda.
 - A `uint8` export that will not resume training is expected; export artifacts are inference-only by design.
 - Version-stamp rejections on load mean the checkpoint predates the current noise map or objective; do not bypass the loader check, rebuild or migrate the checkpoint.

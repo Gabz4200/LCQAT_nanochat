@@ -132,9 +132,7 @@ class MeZoMinExpLSTMCellFiLM4D(SGDMinExpLSTMCellFiLM4D):
         if K < 1:
             raise ValueError(f"Invalid K: {K}")
         self.K = K
-        # PRD 2.2: the K-tap Conv1d kernel, initialized to a uniform
-        # average so the FIR signal starts as the mean of the last K
-        # perturbations.
+        # PRD 2.2: the K-tap Conv1d kernel, initialized to a uniform average so the FIR signal starts as the mean of the last K perturbations.
         self.conv_w = nn.Parameter(torch.ones(K) / float(K))
 
 
@@ -195,6 +193,8 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
             raise ValueError(f"Invalid delta_q: {delta_q}")
         if not 0.0 < a_min <= a_base:
             raise ValueError(f"Invalid a_min/a_base: {a_min}/{a_base}")
+        if M < 1:
+            raise ValueError(f"Invalid M: {M}")
         defaults = dict(
             lr=lr,
             weight_decay=weight_decay,
@@ -212,22 +212,14 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
         self.lr_max = lr if lr_max is None else lr_max
         # The MeZO cell: the shared MinExpLSTM cell plus the FIR kernel.
         self.cell = MeZoMinExpLSTMCellFiLM4D(K=K)
-        # The optimizer's optimizer (PRD principle 5): AdamW over the
-        # cell's own parameters is < 1KB of state. One instance is
-        # reused across meta-steps so its moments persist.
+        # The optimizer's optimizer (PRD principle 5): AdamW over the cell's own parameters is < 1KB of state. One instance is reused across meta-steps so its moments persist.
         self.meta_optimizer = torch.optim.AdamW(self.cell.parameters(), lr=meta_lr)
-        # Rolling seed / scalar-estimate history (PRD 2.2). Seeds and
-        # mu are scalars, so the history is O(K) memory regardless of
-        # the parameter count -- MeZO's whole point.
+        # Rolling seed / scalar-estimate history (PRD 2.2). Seeds and mu are scalars, so the history is O(K) memory regardless of the parameter count -- MeZO's whole point.
         self.seed_history: list[int] = []
         self.mu_history: list[float] = []
-        # The staged (seed, mu) pair between the dual forward passes
-        # and ``step``. Staged on the optimizer, not per param group:
-        # the SPSA estimate is a global scalar (PRD 2.1).
-        self._staged: tuple[int, float] | None = None
-        # Backend selection for the fused step (the same
-        # "naive"/"cpu"/"gpu" contract the SGD-MinExpLSTM
-        # dispatcher uses).
+        # The staged probe batch between the dual forward passes and ``step``. Staged on the optimizer, not per param group: the SPSA estimate is a global scalar (PRD 2.1). Single-probe (M=1): ``(seed, mu)``. Multi-probe (M>1, PRD v2.1): ``(probe_seeds, mus)`` -- the batch of per-probe seeds and their SPSA estimates, aggregated by the mean.
+        self._staged: tuple[int, float] | tuple[list[int], list[float]] | None = None
+        # Backend selection for the fused step (the same "naive"/"cpu"/"gpu" contract the SGD-MinExpLSTM dispatcher uses).
         self.backend: Literal["naive", "cpu", "gpu"] = backend
         # QAT on the 4-bit main-model layout (see __init__ docstring): refresh the FourBitLinear mirrors after each step so the persistent weight form stays 4-bit.
         self.qat_4bit = qat_4bit
@@ -480,12 +472,7 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
         film_w = cell.film_proj.weight.reshape(-1)
         film_b = cell.film_proj.bias
 
-        # FIR pre-filter (PRD 2.2) and MeZO vector, per
-        # parameter: replay the seed history and weight the
-        # perturbations with the learned conv_w kernels and
-        # the scalar mu history. K_curr < K during warmup --
-        # the oldest seeds are simply absent, matching the
-        # PRD's rolling-window semantics.
+        # FIR pre-filter (PRD 2.2) and MeZO vector, per parameter: replay the seed history and weight the perturbations with the learned conv_w kernels and the scalar mu history. K_curr < K during warmup -- the oldest seeds are simply absent, matching the PRD's rolling-window semantics.
         K_curr = len(self.seed_history)
         conv_w = cell.conv_w
         for p in params:
@@ -511,8 +498,7 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
                 state["scale_h"] = torch.ones(())
             state["step"] += 1
 
-            # Fused step: naive, CPU or GPU backend. The op
-            # mutates p, h_int8 and scale_h in place.
+            # Fused step: naive, CPU or GPU backend. The op mutates p, h_int8 and scale_h in place.
             dispatch_mezo_minexplstm_step(
                 fir.reshape(-1),
                 mezo.reshape(-1),
@@ -601,8 +587,7 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
         ``c_j`` stay tensors so the AdamW gradient reaches
         ``conv_w``, and the replayed perturbations are constants.
         """
-        # Canonical index of every optimizer-owned parameter,
-        # for the per-parameter seed derivation.
+        # Canonical index of every optimizer-owned parameter, for the per-parameter seed derivation.
         idx_of: dict[int, int] = {}
         idx = 0
         for group in self.param_groups:
@@ -615,9 +600,7 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
             shape = tuple(p.shape)
             device = p.device
             p_idx = idx_of[id(p)]
-            # Rebuild the FIR signal and MeZO vector
-            # differentiably through the same replay arithmetic
-            # the step uses.
+            # Rebuild the FIR signal and MeZO vector differentiably through the same replay arithmetic the step uses.
             K_curr = len(opt.seed_history)
             conv_w = opt.cell.conv_w
             m_fir = torch.zeros(shape, dtype=torch.float32, device=device)
@@ -628,8 +611,7 @@ class MeZo_MinExpLstm_Optimizer(torch.optim.Optimizer):
                     shape,
                     device,
                 )
-                # c_j is a 0-dim tensor (conv_w[j] is a Parameter),
-                # so the FIR accumulates via tensor multiply-add.
+                # c_j is a 0-dim tensor (conv_w[j] is a Parameter), so the FIR accumulates via tensor multiply-add.
                 m_fir = m_fir + z_j * c_j
             z_curr = opt._replay(
                 _derive_seed(opt.seed_history[-1], p_idx), shape, device

@@ -189,15 +189,10 @@ def make_lightning_trainer(
     pick the LR before ``fit``.
     """
     cbs = list(callbacks or [])
-    # LearningRateMonitor needs a logger to write to; without one it
-    # raises on_train_start. `logger=False` still yields a
-    # DummyLogger that LRMonitor rejects, so only attach the
-    # monitor when a real logger was passed.
+    # LearningRateMonitor needs a logger to write to; without one it raises on_train_start. `logger=False` still yields a DummyLogger that LRMonitor rejects, so only attach the monitor when a real logger was passed.
     if logger not in (None, False):
         cbs.append(LearningRateMonitor(logging_interval="step"))
-    # Only forward the flags the caller actually set: Lightning
-    # rejects `strategy=None` / `accelerator=None` as literal
-    # values, so a None means "let Lightning autodetect".
+    # Only forward the flags the caller actually set: Lightning rejects `strategy=None` / `accelerator=None` as literal values, so a None means "let Lightning autodetect".
     kwargs = dict(
         max_steps=max_steps,
         devices=devices,
@@ -248,8 +243,7 @@ class JointTrainableModule(LightningModule):
         self.loss_fn = nn.CrossEntropyLoss()
         self.save_hyperparameters(ignore=["target_model"])
         self.meta_interval = meta_interval
-        # Manual optimization: the meta-pass interleaves two
-        # backward/step pairs per training_step.
+        # Manual optimization: the meta-pass interleaves two backward/step pairs per training_step.
         self.automatic_optimization = False
 
     def forward(self, x):
@@ -257,8 +251,7 @@ class JointTrainableModule(LightningModule):
 
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
         opts = self.optimizers()
-        # `optimizers()` may hand back the singleton or a one-list;
-        # this module configures exactly one.
+        # `optimizers()` may hand back the singleton or a one-list; this module configures exactly one.
         opt = opts[0] if isinstance(opts, list) else opts
         assert isinstance(opt, SGD_MinExpLstm_Optimizer)
         x, y = batch
@@ -269,14 +262,7 @@ class JointTrainableModule(LightningModule):
         self.manual_backward(loss)
         opt.step()
 
-        # 2. Online meta-optimization pass every N steps. This MUST
-        # run before ``zero_grad``: the closure rebuilds each updated
-        # parameter from ``p.grad``, so a zeroed gradient leaves the
-        # closure with nothing to rebuild (the optimizer raises rather
-        # than silently skipping). The closure's own ``backward``
-        # populates the model gradients, so clear them afterwards --
-        # the next step's ``manual_backward`` would otherwise
-        # accumulate onto stale gradients.
+        # 2. Online meta-optimization pass every N steps. This MUST run before ``zero_grad``: the closure rebuilds each updated parameter from ``p.grad``, so a zeroed gradient leaves the closure with nothing to rebuild (the optimizer raises rather than silently skipping). The closure's own ``backward`` populates the model gradients, so clear them afterwards -- the next step's ``manual_backward`` would otherwise accumulate onto stale gradients.
         if (batch_idx + 1) % self.meta_interval == 0:
             loss_fn = self.loss_fn
 
@@ -346,12 +332,9 @@ class MeZoJointTrainableModule(LightningModule):
         self.loss_fn = nn.CrossEntropyLoss()
         self.save_hyperparameters(ignore=["target_model"])
         self.meta_interval = meta_interval
-        # Manual optimization: the MeZO pass interleaves two
-        # forward evaluations and one meta-backward per step.
+        # Manual optimization: the MeZO pass interleaves two forward evaluations and one meta-backward per step.
         self.automatic_optimization = False
-        # The step seed counter: each training step draws a fresh
-        # seed, which both the perturbation replay and the FIR
-        # history consume (PRD 2.2).
+        # The step seed counter: each training step draws a fresh seed, which both the perturbation replay and the FIR history consume (PRD 2.2).
         self._step_seed = 0
 
     def forward(self, x):
@@ -436,6 +419,7 @@ class MeZoJointTrainableModule(LightningModule):
             meta_lr=self.hparams["meta_lr"],
             epsilon=self.hparams["epsilon"],
             K=self.hparams["K"],
+            M=self.hparams["M"],
             delta_q=self.hparams["delta_q"],
             a_base=self.hparams["a_base"],
             a_min=self.hparams["a_min"],

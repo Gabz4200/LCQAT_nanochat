@@ -57,13 +57,10 @@ from scripts._train.loop import LoopContext, load_dard_sidecar, train_loop
 
 print_banner()
 
-# -----------------------------------------------------------------------------
-# CLI arguments
+# ----------------------------------------------------------------------------- CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
 add_common_cli_args(parser)
-# Logging
-# Runtime
-# FP8 training
+# Logging Runtime FP8 training
 parser.add_argument(
     "--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)"
 )
@@ -111,8 +108,7 @@ parser.add_argument(
     default=-1,
     help="freeze middle-layer codebook+weight grads after N steps (PRD 3.2), -1 = disabled",
 )
-# Scope / gradual schedule / dense-below-threshold. Registered through the
-# shared helper so base_train, chat_sft and chat_rl cannot drift apart.
+# Scope / gradual schedule / dense-below-threshold. Registered through the shared helper so base_train, chat_sft and chat_rl cannot drift apart.
 from nanochat.models.quant.pruning import (  # noqa: E402
     add_sparseprop_pruning_args,
     schedule_from_args,
@@ -126,21 +122,13 @@ parser.add_argument(
     default=0.5,
     help="fraction of middle transformer layers to freeze (PRD 3.2)",
 )
-# W6 DiffusionBlocks features (sigma codebooks / EfQAT per-block latching /
-# denoiser KD) plus --lcqat-channel-center. Registered through the shared
-# helper so base_train, chat_sft and chat_rl cannot drift apart on the same
-# hardware knob, the same argument add_sparseprop_pruning_args makes above.
+# W6 DiffusionBlocks features (sigma codebooks / EfQAT per-block latching / denoiser KD) plus --lcqat-channel-center. Registered through the shared helper so base_train, chat_sft and chat_rl cannot drift apart on the same hardware knob, the same argument add_sparseprop_pruning_args makes above.
 from nanochat.models.quant.w6 import add_w6_args  # noqa: E402
 
-# `--kd-denoiser-alpha` and `--efqat-latch-blocks` arrive with this block.
-# Denoiser distillation is the EDM-native form of the same KD anchor: --kd-alpha
-# needs logits, which the denoising objective never produces, so it is a separate
-# opt-in path rather than a reuse of it.
+# `--kd-denoiser-alpha` and `--efqat-latch-blocks` arrive with this block. Denoiser distillation is the EDM-native form of the same KD anchor: --kd-alpha needs logits, which the denoising objective never produces, so it is a separate opt-in path rather than a reuse of it.
 add_w6_args(parser)
 
-# DARD (Differentiable Algebraic Rule Distillation). Always-on auxiliary loss
-# over AML-mined algebraic rules; `--no-dard` disables it. Registered through
-# its own helper for the same no-drift reason as the two helpers above.
+# DARD (Differentiable Algebraic Rule Distillation). Always-on auxiliary loss over AML-mined algebraic rules; `--no-dard` disables it. Registered through its own helper for the same no-drift reason as the two helpers above.
 from nanochat.models.dard.cli import (  # noqa: E402
     add_dard_args,
     build_dard,
@@ -251,6 +239,16 @@ parser.add_argument(
     type=int,
     default=4,
     help="MeZO FIR history length (PRD 2.3)",
+)
+parser.add_argument(
+    "--mezo-probes",
+    type=int,
+    default=1,
+    help="MeZO intra-step multi-probe batch size M (PRD v2.1 "
+    "section 2.1): M independent directional probes per step, "
+    "aggregated with the order-invariant arithmetic mean. "
+    "M=1 is the single-probe v2.0 default; M=4 is the PRD "
+    "target (variance reduction 1/M, 2M forward passes)",
 )
 parser.add_argument(
     "--mezo-delta-q",
@@ -439,13 +437,11 @@ resumed_sparse = base.resumed_sparse
 meta_data = base.meta_data
 optimizer_data = base.optimizer_data
 
-# -----------------------------------------------------------------------------
-# FP8 training initialization and management (this has to be done before torch.compile)
+# ----------------------------------------------------------------------------- FP8 training initialization and management (this has to be done before torch.compile)
 
 convert_to_fp8(model, args, device_type, lcqat_active)
 
-# -----------------------------------------------------------------------------
-# Compile the model
+# ----------------------------------------------------------------------------- Compile the model
 
 # Initialize DiffusionBlocks Engine for block-wise training.
 db = build_engine(
@@ -463,8 +459,7 @@ engine = db.engine
 float_twin = db.float_twin
 n_twin_stripped = db.n_twin_stripped
 
-# -----------------------------------------------------------------------------
-# Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
+# ----------------------------------------------------------------------------- Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
 
 run_config = assemble_run_config(args, model, model_config, vocab_size)
 total_batch_size = run_config.total_batch_size
@@ -476,8 +471,7 @@ num_flops_per_token = run_config.num_flops_per_token
 num_scaling_params = run_config.num_scaling_params
 target_tokens = run_config.target_tokens
 
-# -----------------------------------------------------------------------------
-# Initialize the Optimizer (AdamW-only for DiffusionBlocks engine)
+# ----------------------------------------------------------------------------- Initialize the Optimizer (AdamW-only for DiffusionBlocks engine)
 
 optimizer, trainable_root = build_optimizer(
     args,
@@ -490,30 +484,18 @@ optimizer, trainable_root = build_optimizer(
     optimizer_data,
 )
 
-# The `--kd-alpha` / `--db-objective edm` incompatibility is checked inside
-# build_kd_loss_fn, before the teacher is loaded.
+# The `--kd-alpha` / `--db-objective edm` incompatibility is checked inside build_kd_loss_fn, before the teacher is loaded.
 kd_loss_fn = build_kd_loss_fn(args, device, lcqat_active)
 
-# -----------------------------------------------------------------------------
-# EfQAT selective layer freezing (PRD 3.2): freeze middle-layer codebook +
-# weight gradients after a warmup window, keeping only critical outlier
-# layers (embeddings, attn q/k, output) trainable.
+# ----------------------------------------------------------------------------- EfQAT selective layer freezing (PRD 3.2): freeze middle-layer codebook + weight gradients after a warmup window, keeping only critical outlier layers (embeddings, attn q/k, output) trainable.
 efqat_freezer = build_efqat_freezer(
     args, model, engine, use_diffusion_blocks, lcqat_active
 )
 
-# -----------------------------------------------------------------------------
-# Denoiser distillation (PRD 3.1, EDM form): hand the frozen float twin to the
-# engine, which adds the KD term to the EDM objective inside `denoise_step`.
+# ----------------------------------------------------------------------------- Denoiser distillation (PRD 3.1, EDM form): hand the frozen float twin to the engine, which adds the KD term to the EDM objective inside `denoise_step`.
 kd_denoiser = build_kd_denoiser(args, engine, float_twin)
 
-# -----------------------------------------------------------------------------
-# EfQAT per-block permanent latching (PRD 3.2). The middle-band freezer above
-# is global and one-shot; this one is per diffusion block and, crucially,
-# *permanent*: once a block's noise range is specialized, its quantization
-# parameters must never move again, however many later steps resample it. That
-# only holds if the veto runs inside `_requires_grad_for`, i.e. before
-# `_activate_block` re-enables the block -- which `set_freezer` arranges.
+# ----------------------------------------------------------------------------- EfQAT per-block permanent latching (PRD 3.2). The middle-band freezer above is global and one-shot; this one is per diffusion block and, crucially, *permanent*: once a block's noise range is specialized, its quantization parameters must never move again, however many later steps resample it. That only holds if the veto runs inside `_requires_grad_for`, i.e. before `_activate_block` re-enables the block -- which `set_freezer` arranges.
 block_latch_freezer, efqat_latch_targets = build_latch_freezer(
     args,
     engine,
@@ -524,14 +506,10 @@ block_latch_freezer, efqat_latch_targets = build_latch_freezer(
     meta_data,
 )
 
-# -----------------------------------------------------------------------------
-# GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
+# ----------------------------------------------------------------------------- GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
 scaler = build_grad_scaler()
 
-# -----------------------------------------------------------------------------
-# Initialize the DataLoaders for train/val
-# `meta_data` is only loaded when resuming, so the subscript is
-# guarded by the same branch that makes it non-None.
+# ----------------------------------------------------------------------------- Initialize the DataLoaders for train/val `meta_data` is only loaded when resuming, so the subscript is guarded by the same branch that makes it non-None.
 if not resuming:
     dataloader_resume_state_dict = None
 else:
@@ -557,20 +535,11 @@ x, y, dataloader_state_dict = next(
     train_loader
 )  # kick off load of the very first batch of data
 
-# -----------------------------------------------------------------------------
-# DARD rule set: mined from the first batch's tokens, or loaded from
-# --dard-rules. Built *after* the dataloader because mining needs real tokens,
-# and *before* the loop because the rule penalty is attached to the engine once
-# and then reused every step. `--no-dard` leaves both None and every downstream
-# branch computes exactly the objective it did before this feature existed.
+# ----------------------------------------------------------------------------- DARD rule set: mined from the first batch's tokens, or loaded from --dard-rules. Built *after* the dataloader because mining needs real tokens, and *before* the loop because the rule penalty is attached to the engine once and then reused every step. `--no-dard` leaves both None and every downstream branch computes exactly the objective it did before this feature existed.
 validate_dard_args(args)
 dard_loss_fn, dard_balancer = (None, None)
 if args.dard:
-    # A resume must reuse the checkpoint's rule set, not re-mine. Mining
-    # depends on whichever batch is in hand, so re-mining here would silently
-    # swap the objective mid-run -- the rules being enforced at step N+1 would
-    # not be the ones the loss curve up to step N was measured against. The
-    # checkpoint is authoritative whenever it carries DARD state.
+    # A resume must reuse the checkpoint's rule set, not re-mine. Mining depends on whichever batch is in hand, so re-mining here would silently swap the objective mid-run -- the rules being enforced at step N+1 would not be the ones the loss curve up to step N was measured against. The checkpoint is authoritative whenever it carries DARD state.
     saved_dard = load_dard_sidecar(base.checkpoint_dir, args.resume_from_step, device)
     if saved_dard:
         dard_loss_fn, dard_balancer = saved_dard
@@ -596,8 +565,7 @@ if args.dard:
     if engine is not None:
         engine.set_dard(dard_loss_fn)
 
-# -----------------------------------------------------------------------------
-# Calculate the number of iterations we will train for and set up the various schedulers
+# ----------------------------------------------------------------------------- Calculate the number of iterations we will train for and set up the various schedulers
 
 # num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
 assert (
@@ -628,8 +596,7 @@ print0(
 )  # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
-# -----------------------------------------------------------------------------
-# Training loop
+# ----------------------------------------------------------------------------- Training loop
 
 eval_ctx = EvalContext(
     model=model,

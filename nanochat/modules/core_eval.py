@@ -14,10 +14,7 @@ from jinja2 import Template
 
 from nanochat.utils.common import is_ddp_initialized
 
-# Compiled once at import. These template strings are constants, and `Template()`
-# costs ~1.7 ms against ~0.11 ms for all four renders it serves -- so building
-# one per example made compilation ~94% of the function, repeated for every CORE
-# example in the eval.
+# Compiled once at import. These template strings are constants, and `Template()` costs ~1.7 ms against ~0.11 ms for all four renders it serves -- so building one per example made compilation ~94% of the function, repeated for every CORE example in the eval.
 _TEMPLATE_MC = Template(
     """
 {%- for example in fewshot_examples -%}
@@ -79,10 +76,7 @@ def render_prompts_lm(item, continuation_delimiter, fewshot_examples=None):
     context = _render_context(item, continuation_delimiter, fewshot_examples)
     prompt_without = _TEMPLATE_LM.render(include_continuation=False, **context)
     prompt_with = _TEMPLATE_LM.render(include_continuation=True, **context)
-    # Strip trailing whitespace the datasets seem to carry in the
-    # context: it gets absorbed into the next token in prompt_with,
-    # so the prefix would not line up in token space and the
-    # continuation boundary would be undetectable.
+    # Strip trailing whitespace the datasets seem to carry in the context: it gets absorbed into the next token in prompt_with, so the prefix would not line up in token space and the continuation boundary would be undetectable.
     prompt_without = prompt_without.strip()
     return [prompt_without, prompt_with]
 
@@ -93,8 +87,7 @@ def find_common_length(token_sequences, direction="left"):
     - direction: 'left' for prefix, 'right' for suffix
     """
     min_len = min(len(seq) for seq in token_sequences)
-    # Built conditionally, not via a dict literal: the original constructed a
-    # fresh `range` for both directions on every call and discarded one.
+    # Built conditionally, not via a dict literal: the original constructed a fresh `range` for both directions on every call and discarded one.
     indices = range(min_len) if direction == "left" else range(-1, -min_len - 1, -1)
     base = token_sequences[0]
     others = token_sequences[1:]
@@ -191,8 +184,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
 
-    # Some models can't forward sequences beyond a certain length (e.g. GPT-2)
-    # In these cases, we have to truncate sequences to max length and adjust the indices
+    # Some models can't forward sequences beyond a certain length (e.g. GPT-2) In these cases, we have to truncate sequences to max length and adjust the indices
     if hasattr(model, "max_seq_len") and model.max_seq_len is not None:
         max_tokens = model.max_seq_len
         new_tokens, new_start_idxs, new_end_idxs = [], [], []
@@ -228,10 +220,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         actual_tokens = input_ids[0, si:ei]
         is_correct = torch.all(predicted_tokens == actual_tokens).item()
     elif task_type in ["multiple_choice", "schema"]:
-        # For MC/schema: find the option with lowest average loss
-        # One host sync instead of one per choice: the reductions are
-        # independent, so stacking them first changes nothing but the round
-        # trips. `tolist()` then gives the same floats the `.item()`s gave.
+        # For MC/schema: find the option with lowest average loss One host sync instead of one per choice: the reductions are independent, so stacking them first changes nothing but the round trips. `tolist()` then gives the same floats the `.item()`s gave.
         mean_losses = torch.stack(
             [
                 losses[i, si - 1 : ei - 1].mean()

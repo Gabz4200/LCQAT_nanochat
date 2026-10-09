@@ -12,14 +12,7 @@ import torch
 import torch.distributed as dist
 from filelock import FileLock
 
-# The compute-dtype policy is a model-layer decision (every `Linear` casts to
-# it in forward), so it is defined in `nanochat/models/dtype.py`. Re-exported
-# here for the shell's convenience; the shell does not own it. A bare `import x
-# is unused` heuristic flags this as dead; it is a deliberate re-export (the
-# shell imports COMPUTE_DTYPE from here in checkpoint_manager, engine, and
-# scripts/_train/build, and COMPUTE_DTYPE_REASON in scripts/base_train,
-# scripts/chat_sft, and tests/test_architecture_boundary).
-# aislop-ignore-next-line ai-slop/unused-import -- deliberate re-export consumed across the shell (checkpoint_manager, engine, scripts/base_train, scripts/chat_sft, tests/test_architecture_boundary)
+# The compute-dtype policy is a model-layer decision (every `Linear` casts to it in forward), so it is defined in `nanochat/models/dtype.py`. Re-exported here for the shell's convenience; the shell does not own it. A bare `import x is unused` heuristic flags this as dead; it is a deliberate re-export (the shell imports COMPUTE_DTYPE from here in checkpoint_manager, engine, and scripts/_train/build, and COMPUTE_DTYPE_REASON in scripts/base_train, scripts/chat_sft, and tests/test_architecture_boundary). aislop-ignore-next-line ai-slop/unused-import -- deliberate re-export consumed across the shell (checkpoint_manager, engine, scripts/base_train, scripts/chat_sft, tests/test_architecture_boundary)
 from nanochat.models.dtype import COMPUTE_DTYPE, COMPUTE_DTYPE_REASON  # noqa: F401
 
 
@@ -107,8 +100,7 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
         return file_path
 
     with FileLock(lock_path):
-        # Only a single rank can acquire this lock
-        # All other ranks block until it is released
+        # Only a single rank can acquire this lock All other ranks block until it is released
 
         # Recheck after acquiring lock
         if os.path.exists(file_path):
@@ -135,10 +127,7 @@ def print0(s="", **kwargs):
     """Print on rank 0 only (the distributed-training console)."""
     ddp_rank = int(os.environ.get("RANK", 0))
     if ddp_rank == 0:
-        # Route through sys.stdout rather than the builtin
-        # print: this function *is* the rank-0 console sink
-        # the codebase prints through, so the write here is
-        # the point, not a leftover debug statement.
+        # Route through sys.stdout rather than the builtin print: this function *is* the rank-0 console sink the codebase prints through, so the write here is the point, not a leftover debug statement.
         end = kwargs.pop("end", "\n")
         sep = kwargs.pop("sep", " ")
         flush = kwargs.pop("flush", False)
@@ -182,8 +171,7 @@ def is_ddp_initialized() -> bool:
 
 def get_dist_info():
     if is_ddp_requested():
-        # We rely on torchrun's env to decide if we SHOULD init.
-        # (Initialization itself happens in compute init.)
+        # We rely on torchrun's env to decide if we SHOULD init. (Initialization itself happens in compute init.)
         assert all(var in os.environ for var in ["RANK", "LOCAL_RANK", "WORLD_SIZE"])
         ddp_rank = int(os.environ["RANK"])
         ddp_local_rank = int(os.environ["LOCAL_RANK"])
@@ -218,14 +206,11 @@ def compute_init(device_type="cuda"):  # cuda|cpu|mps
             "Your PyTorch installation is not configured for MPS but device_type is 'mps'"
         )
 
-    # Reproducibility
-    # Note that we set the global seeds here, but most of the code uses explicit rng objects.
-    # The only place where global rng might be used is nn.Module initialization of the model weights.
+    # Reproducibility Note that we set the global seeds here, but most of the code uses explicit rng objects. The only place where global rng might be used is nn.Module initialization of the model weights.
     torch.manual_seed(42)
     if device_type == "cuda":
         torch.cuda.manual_seed(42)
-    # skipping full reproducibility for now, possibly investigate slowdown later
-    # torch.use_deterministic_algorithms(True)
+    # skipping full reproducibility for now, possibly investigate slowdown later torch.use_deterministic_algorithms(True)
 
     # Precision
     if device_type == "cuda":
@@ -268,9 +253,7 @@ class DummyWandb:
         pass
 
 
-# hardcoded BF16 peak flops for various GPUs
-# inspired by torchtitan: https://github.com/pytorch/torchtitan/blob/main/torchtitan/tools/utils.py
-# and PR: https://github.com/karpathy/nanochat/pull/147
+# hardcoded BF16 peak flops for various GPUs inspired by torchtitan: https://github.com/pytorch/torchtitan/blob/main/torchtitan/tools/utils.py and PR: https://github.com/karpathy/nanochat/pull/147
 def get_peak_flops(device_name: str) -> float:
     name = device_name.lower()
 

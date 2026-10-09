@@ -29,10 +29,7 @@ from nanochat.models.quant.retrofit import PRESETS, retrofit_model
 from nanochat.modules.experiments.common import VARIANT_PRESET, codebook_of
 from tests.conftest import build_active_tiny_gpt
 
-#: `SmoothPWL`'s default knot-grid half-width. The class does not retain its
-#: `init_range` argument as an attribute, so the default is restated here for the
-#: `act_lut` fit grid, which has to score both bodies over the domain the RBF fit
-#: is actually run on.
+#: `SmoothPWL`'s default knot-grid half-width. The class does not retain its `init_range` argument as an attribute, so the default is restated here for the `act_lut` fit grid, which has to score both bodies over the domain the RBF fit is actually run on.
 SMOOTHPWL_DEFAULT_INIT_RANGE = 1.0
 
 
@@ -64,11 +61,7 @@ def build_activation_lut(
     )
 
 
-#: The matched-budget K the handoff's parameter-reduction claim is stated at
-#: (HANDOFF §10.2.1, "at a matched 15 floats"). Measured separately from the
-#: model's own codebooks, whose K_in and K_out are not equal, so the
-#: K_in x K_out vs K_in + K_out comparison has to be posed at a K where both
-#: sides are stated on the same budget.
+#: The matched-budget K the handoff's parameter-reduction claim is stated at (HANDOFF §10.2.1, "at a matched 15 floats"). Measured separately from the model's own codebooks, whose K_in and K_out are not equal, so the K_in x K_out vs K_in + K_out comparison has to be posed at a K where both sides are stated on the same budget.
 K_MATCHED_BUDGET = 15
 
 
@@ -146,31 +139,18 @@ def run_act_lut(args: argparse.Namespace) -> list[AblationRow]:
     retrofit_model(model, PRESETS[VARIANT_PRESET])
     proj = model.transformer.h[0].attn.c_proj
     fc = model.transformer.h[0].mlp.c_fc
-    # `mlp.c_fc`'s *output* quantizer feeds the activation between the two
-    # layers, so its codebook is the table's index domain; `attn.c_proj`'s
-    # activation (input) quantizer supplies the table's value range. Both are
-    # the roles the quantized-inference path actually uses.
+    # `mlp.c_fc`'s *output* quantizer feeds the activation between the two layers, so its codebook is the table's index domain; `attn.c_proj`'s activation (input) quantizer supplies the table's value range. Both are the roles the quantized-inference path actually uses.
     input_codebook = codebook_of(fc, "out")
     output_codebook = codebook_of(proj, "act")
     k_in, k_out = int(input_codebook.numel()), int(output_codebook.numel())
     act = get_activation("relu2")
-    # Both bodies are scored on one common grid over the `SmoothPWL` body's own
-    # init span, because that is the domain the RBF fit is actually run over.
-    # `SmoothPWL` does not retain `init_range` as an attribute, so the default
-    # is restated here; it is the same constant the handoff's 1.02 / 0.48 /
-    # 0.67 figures were measured on ("relu^2 over [-1, 1]", activation.py's
-    # module docstring). Scoring the PWL body over the *codebook's* span instead
-    # would put the two bodies on different ranges, and a `relu^2` probe over a
-    # one-sided codebook scores an artefact of that range rather than a fit.
+    # Both bodies are scored on one common grid over the `SmoothPWL` body's own init span, because that is the domain the RBF fit is actually run over. `SmoothPWL` does not retain `init_range` as an attribute, so the default is restated here; it is the same constant the handoff's 1.02 / 0.48 / 0.67 figures were measured on ("relu^2 over [-1, 1]", activation.py's module docstring). Scoring the PWL body over the *codebook's* span instead would put the two bodies on different ranges, and a `relu^2` probe over a one-sided codebook scores an artefact of that range rather than a fit.
     body_range = SMOOTHPWL_DEFAULT_INIT_RANGE
     grid = torch.linspace(-body_range, body_range, 400)
 
     rows: list[AblationRow] = []
 
-    # The parameter-reduction claim is stated at a *matched* budget, where
-    # K_in == K_out so both relaxations are compared on the same number of
-    # floats. The model's own codebooks have K_in != K_out, so that comparison is
-    # posed on a matched pair instead of being asserted from the real one.
+    # The parameter-reduction claim is stated at a *matched* budget, where K_in == K_out so both relaxations are compared on the same number of floats. The model's own codebooks have K_in != K_out, so that comparison is posed on a matched pair instead of being asserted from the real one.
     matched_in, matched_out = matched_budget_codebooks(K_MATCHED_BUDGET)
     matched_logits = build_activation_lut(
         matched_in, matched_out, RELAXATION_LOGITS, ACT_BODY_PWL
@@ -180,9 +160,7 @@ def run_act_lut(args: argparse.Namespace) -> list[AblationRow]:
     )
     matched_logits_params = sum(p.numel() for p in matched_logits.parameters())
     matched_proximity_params = sum(p.numel() for p in matched_proximity.parameters())
-    # The fp8 identity is re-checked on the matched pair too, so the row
-    # carries both of the exact claims it is the natural home for rather than
-    # leaving one of them to be read off a per-preset row with a different K.
+    # The fp8 identity is re-checked on the matched pair too, so the row carries both of the exact claims it is the natural home for rather than leaving one of them to be read off a per-preset row with a different K.
     with torch.no_grad():
         table_before = matched_proximity.resolved_table()
         live_knots = matched_proximity.knots.detach().clone()
@@ -228,16 +206,7 @@ def run_act_lut(args: argparse.Namespace) -> list[AblationRow]:
             )
             n_params = sum(p.numel() for p in lut.parameters())
 
-            # fp8 identity: resolve, then swap in the fp8 round trip of the
-            # stored knots and resolve again. `resolved_table()` reads levels
-            # only, so the two must be bit-identical for any knot dtype.
-            #
-            # Only the proximity relaxation *has* knots -- the free-logit matrix
-            # stores no knot positions at all, so there is nothing to export and
-            # the claim does not apply to it. That is reported as such rather
-            # than skipped silently, because a blanket "bit-identical: True" on
-            # an arm that exported nothing would be asserting a result the run
-            # never produced.
+            # fp8 identity: resolve, then swap in the fp8 round trip of the stored knots and resolve again. `resolved_table()` reads levels only, so the two must be bit-identical for any knot dtype. Only the proximity relaxation *has* knots -- the free-logit matrix stores no knot positions at all, so there is nothing to export and the claim does not apply to it. That is reported as such rather than skipped silently, because a blanket "bit-identical: True" on an arm that exported nothing would be asserting a result the run never produced.
             has_knots = hasattr(lut, "knots")
             if has_knots:
                 with torch.no_grad():
@@ -256,12 +225,7 @@ def run_act_lut(args: argparse.Namespace) -> list[AblationRow]:
                     "preset"
                 )
 
-            # The fit is measured on the *table's* (x, y) pairs: the input
-            # codebook entries are the knots, and the resolved table picks the
-            # output level each knot lands on. Scoring `act(table_values)` would
-            # be circular -- it would compare relu^2 against itself at the output
-            # codebook -- so the curve is reconstructed from those pairs and
-            # compared to the true activation over the knot span.
+            # The fit is measured on the *table's* (x, y) pairs: the input codebook entries are the knots, and the resolved table picks the output level each knot lands on. Scoring `act(table_values)` would be circular -- it would compare relu^2 against itself at the output codebook -- so the curve is reconstructed from those pairs and compared to the true activation over the knot span.
             knots, _order = torch.sort(input_codebook)
             y_at_knots = output_codebook[table_fp32]
             with torch.no_grad():
@@ -274,9 +238,7 @@ def run_act_lut(args: argparse.Namespace) -> list[AblationRow]:
                     ).fit_from_callable()
                     body_error = float((body(grid) - act(grid)).abs().max())
                 else:
-                    # The frozen PWL body *is* that piecewise-linear curve, so
-                    # both arms are scored through the same reconstruction and
-                    # the comparison is like-for-like.
+                    # The frozen PWL body *is* that piecewise-linear curve, so both arms are scored through the same reconstruction and the comparison is like-for-like.
                     body_error = table_error
 
             rows.append(

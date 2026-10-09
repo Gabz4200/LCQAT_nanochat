@@ -112,11 +112,7 @@ def resize_to(model: GPT, n_layer: int) -> None:
     only thing that depends on depth, so this is a one-line fixup rather than a
     model rebuild.
     """
-    # Blocks are rebuilt when growing, because a Block's `ve_gate` exists only on
-    # layers that carry a value embedding (`has_ve(layer_idx, n_layer)`), and
-    # that predicate depends on the total depth. Cloning a block to a new index
-    # therefore has to re-derive the gate, not copy it -- otherwise the
-    # gate/value-embedding pairing breaks and GPT.forward calls `None`.
+    # Blocks are rebuilt when growing, because a Block's `ve_gate` exists only on layers that carry a value embedding (`has_ve(layer_idx, n_layer)`), and that predicate depends on the total depth. Cloning a block to a new index therefore has to re-derive the gate, not copy it -- otherwise the gate/value-embedding pairing breaks and GPT.forward calls `None`.
     existing = list(model.transformer.h)
     n_old = len(existing)
     if n_layer < n_old:
@@ -126,9 +122,7 @@ def resize_to(model: GPT, n_layer: int) -> None:
         for i in range(n_old, n_layer):
             rebuilt.append(_fresh_block_like(model, i))
         model.transformer.h = BlockList(rebuilt)
-    # `GPT.forward` indexes several per-layer structures by index, so a depth
-    # change has to resize all of them, not just the lambdas. These are lists /
-    # ModuleDicts built in `__init__`, so they are cheap to extend or truncate.
+    # `GPT.forward` indexes several per-layer structures by index, so a depth change has to resize all of them, not just the lambdas. These are lists / ModuleDicts built in `__init__`, so they are cheap to extend or truncate.
     for attr, fill in (("resid_lambdas", 1.0), ("x0_lambdas", 0.0)):
         setattr(
             model,
@@ -137,15 +131,7 @@ def resize_to(model: GPT, n_layer: int) -> None:
         )
     window = model.window_sizes[0]
     model.window_sizes = [window for _ in range(n_layer)]
-    # Value embeddings are keyed by layer index string. Copy the shape from an
-    # existing one rather than recomputing it: the ResFormer value embedding is
-    # sized off the *vocab* dimension, so the correct width is not derivable from
-    # n_embd / n_head alone, and getting it wrong fails deep inside GPT.forward
-    # with a shape error rather than at construction. Which layers get one is
-    # re-derived from the same `has_ve` rule via `_fresh_block_like`. Keep one
-    # surviving template to copy shapes from *before* pruning, then prune: a
-    # depth change can leave zero eligible layers, and taking the template first
-    # means the copy source always exists.
+    # Value embeddings are keyed by layer index string. Copy the shape from an existing one rather than recomputing it: the ResFormer value embedding is sized off the *vocab* dimension, so the correct width is not derivable from n_embd / n_head alone, and getting it wrong fails deep inside GPT.forward with a shape error rather than at construction. Which layers get one is re-derived from the same `has_ve` rule via `_fresh_block_like`. Keep one surviving template to copy shapes from *before* pruning, then prune: a depth change can leave zero eligible layers, and taking the template first means the copy source always exists.
     template = next((m for k, m in model.value_embeds.items() if k.isdigit()), None)
     for i in list(model.value_embeds.keys()):
         if not i.isdigit() or int(i) >= n_layer:
@@ -159,11 +145,7 @@ def resize_to(model: GPT, n_layer: int) -> None:
                 del model.value_embeds[str(i)]
     assert model.resid_lambdas.shape[0] == n_layer
     assert len(model.window_sizes) == n_layer
-    # Value embeddings and their gates must agree. GPT.forward calls `ve_gate`
-    # whenever `ve` is not None, so a layer with a value embedding but no gate
-    # fails at forward time with `NoneType is not callable`. Retained blocks keep
-    # whatever gate the *original* depth gave them, which is wrong after a depth
-    # change (`has_ve` depends on n_layer), so re-derive it for every layer.
+    # Value embeddings and their gates must agree. GPT.forward calls `ve_gate` whenever `ve` is not None, so a layer with a value embedding but no gate fails at forward time with `NoneType is not callable`. Retained blocks keep whatever gate the *original* depth gave them, which is wrong after a depth change (`has_ve` depends on n_layer), so re-derive it for every layer.
     for i, block in enumerate(model.transformer.h):
         has_ve = i % 2 == (n_layer - 1) % 2
         block.attn.ve_gate = _fresh_like(_ve_gate_like(model)) if has_ve else None

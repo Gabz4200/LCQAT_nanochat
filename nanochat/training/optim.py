@@ -47,9 +47,7 @@ def adamw_step_fused(
     bias2 = 1 - beta2_t**step_t
     denom = (exp_avg_sq32 / bias2).sqrt() + eps_t
     step_size = lr_t / bias1
-    # `step_size` is a 0-D tensor; `add_`'s `alpha` stub only
-    # admits scalars, so pass the Python float (the fused kernel
-    # runs the whole step in fp32 either way).
+    # `step_size` is a 0-D tensor; `add_`'s `alpha` stub only admits scalars, so pass the Python float (the fused kernel runs the whole step in fp32 either way).
     p32.add_(exp_avg32 / denom, alpha=-float(step_size))
     p.copy_(p32)
     exp_avg.copy_(exp_avg32)
@@ -91,8 +89,7 @@ class AdamW(torch.optim.Optimizer):
                 )
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
-                # `async_op=True` returns a `Work`, never `None`
-                # (the `None` arm is the synchronous path).
+                # `async_op=True` returns a `Work`, never `None` (the `None` arm is the synchronous path).
                 work = dist.reduce_scatter_tensor(
                     grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True
                 )
@@ -113,9 +110,7 @@ class AdamW(torch.optim.Optimizer):
     ) -> None:
         """Wait for reduce, compute AdamW updates, launch gather."""
         param_infos = info["param_infos"]
-        # The five group-level scalars are the same for every parameter in this
-        # group, so they are filled once here rather than per parameter: only
-        # `step` below is per-parameter.
+        # The five group-level scalars are the same for every parameter in this group, so they are filled once here rather than per parameter: only `step` below is per-parameter.
         self._adamw_lr_t.fill_(group["lr"])
         self._adamw_beta1_t.fill_(group["betas"][0])
         self._adamw_beta2_t.fill_(group["betas"][1])
@@ -169,8 +164,7 @@ class AdamW(torch.optim.Optimizer):
                     self._adamw_eps_t,
                     self._adamw_wd_t,
                 )
-                # Same contract as `reduce_scatter_tensor` above:
-                # `async_op=True` returns a `Work`, never `None`.
+                # Same contract as `reduce_scatter_tensor` above: `async_op=True` returns a `Work`, never `None`.
                 work = dist.all_gather_into_tensor(p, p_slice, async_op=True)
                 assert work is not None
                 future = work.get_future()
@@ -206,10 +200,7 @@ class AdamW(torch.optim.Optimizer):
         return loss
 
 
-# The joint online learned optimizer lives in
-# nanochat.training.minexp_lstm; re-exported here so existing
-# `from nanochat.training.optim import ...` call sites keep
-# working.
+# The joint online learned optimizer lives in nanochat.training.minexp_lstm; re-exported here so existing `from nanochat.training.optim import ...` call sites keep working.
 from nanochat.training.minexp_lstm import (
     MinExpLSTMCell,
     SGD_MinExpLstm_Optimizer,

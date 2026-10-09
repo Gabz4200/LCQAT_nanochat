@@ -63,8 +63,7 @@ def load_hub_dataset(repo_id, subset="default", split="train"):
     if not os.path.exists(manifest_path):
         os.makedirs(shards_dir, exist_ok=True)
         with FileLock(manifest_path + ".lock"):
-            # only a single rank acquires the lock and downloads, the others block
-            # here and then skip the download because they recheck the manifest
+            # only a single rank acquires the lock and downloads, the others block here and then skip the download because they recheck the manifest
             if not os.path.exists(manifest_path):
                 # aislop-ignore-next-line ai-slop/hardcoded-url -- HF datasets API endpoint, not a secret
                 listing_url = f"https://huggingface.co/api/datasets/{repo_id}/parquet/{subset}/{split}"
@@ -89,11 +88,7 @@ def load_hub_dataset(repo_id, subset="default", split="train"):
     return HubDataset(table)
 
 
-#: The two evaluation shapes a task can have. `generative` tasks score free
-#: text; `categorical` tasks constrain the answer to a fixed letter set. They
-#: are constants rather than bare strings because `scripts/chat_eval.py`
-#: dispatches on this value: a typo in a subclass otherwise surfaces only at
-#: eval time, as an "Unsupported task evaluation type".
+#: The two evaluation shapes a task can have. `generative` tasks score free text; `categorical` tasks constrain the answer to a fixed letter set. They are constants rather than bare strings because `scripts/chat_eval.py` dispatches on this value: a typo in a subclass otherwise surfaces only at eval time, as an "Unsupported task evaluation type".
 EVAL_TYPE_GENERATIVE: typing.Literal["generative"] = "generative"
 EVAL_TYPE_CATEGORICAL: typing.Literal["categorical"] = "categorical"
 EvalType = typing.Literal["generative", "categorical"]

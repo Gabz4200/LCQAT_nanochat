@@ -69,8 +69,7 @@ def run_grad_scale(
             value_baseline=base_avg,
             value_variant=inv_avg,
             delta=inv_avg - base_avg,
-            # Lower codebook gradient is the point of the scaling, so the
-            # variant "wins" when it is strictly smaller.
+            # Lower codebook gradient is the point of the scaling, so the variant "wins" when it is strictly smaller.
             better="variant" if inv_avg < base_avg else "baseline",
             seeds=list(range(args.seeds)),
             n_seeds=args.seeds,

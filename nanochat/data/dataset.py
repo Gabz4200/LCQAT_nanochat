@@ -18,8 +18,7 @@ import requests
 
 from nanochat.utils.common import get_base_dir
 
-# The URL on the internet where the data is hosted and downloaded from on demand
-# aislop-ignore-next-line ai-slop/hardcoded-url -- the dataset's canonical HF URL, not a secret endpoint
+# The URL on the internet where the data is hosted and downloaded from on demand aislop-ignore-next-line ai-slop/hardcoded-url -- the dataset's canonical HF URL, not a secret endpoint
 BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
 MAX_SHARD = 6542  # the last datashard is shard_06542.parquet
 index_to_filename = lambda index: (
@@ -39,8 +38,7 @@ def list_parquet_files(data_dir=None, warn_on_legacy=False):
     """Looks into a data dir and returns full paths to all parquet files."""
     data_dir = DATA_DIR if data_dir is None else data_dir
 
-    # Legacy-supporting code due to the upgrade from FinewebEdu-100B to ClimbMix-400B
-    # This code will eventually be deleted.
+    # Legacy-supporting code due to the upgrade from FinewebEdu-100B to ClimbMix-400B This code will eventually be deleted.
     if not os.path.exists(data_dir):
         if warn_on_legacy:
             print()
@@ -170,8 +168,7 @@ if __name__ == "__main__":
     # Prepare the output directory
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    # The way this works is that the user specifies the number of train shards to download via the -n flag.
-    # In addition to that, the validation shard is *always* downloaded and is pinned to be the last shard.
+    # The way this works is that the user specifies the number of train shards to download via the -n flag. In addition to that, the validation shard is *always* downloaded and is pinned to be the last shard.
     num_train_shards = (
         MAX_SHARD if args.num_files == -1 else min(args.num_files, MAX_SHARD)
     )

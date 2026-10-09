@@ -142,13 +142,11 @@ class SGD_MinExpLstm_Optimizer(torch.optim.Optimizer):
         super().__init__(params, defaults)
         self.cell = SGDMinExpLSTMCellFiLM4D(input_size=3, hidden_size=1, latent_dim=4)
         if alpha_residual is not None and alpha_residual == 0.0:
-            # The old "disable the residual" spelling: pin the FiLM
-            # head at its zero init so the update stays pure SGD.
+            # The old "disable the residual" spelling: pin the FiLM head at its zero init so the update stays pure SGD.
             for q in self.cell.film_proj.parameters():
                 q.requires_grad_(False)
         if not learnable_beta:
-            # The old fixed-decay spelling: freeze the predictor with
-            # b_beta solved so beta_slow(g_norm=0) == beta.
+            # The old fixed-decay spelling: freeze the predictor with b_beta solved so beta_slow(g_norm=0) == beta.
             with torch.no_grad():
                 sigma = (beta - 2.0 * lam) / (0.999 - 2.0 * lam)
                 sigma = min(max(sigma, 0.0), 1.0)
@@ -340,15 +338,7 @@ class SGD_MinExpLstm_Optimizer(torch.optim.Optimizer):
                 s["scale_h"] = scale_h
             return
 
-        # Fused-kernel path: one dispatch_sgd_minexplstm_step
-        # per parameter, matching the MeZO optimizer's
-        # per-parameter fused step. The fused kernel runs the
-        # identical pipeline the naive path runs (dequantize
-        # -> RMS -> beta prediction -> EMA blending -> cell
-        # forward -> FiLM update -> requantize), so the two
-        # backends agree by construction (pinned by the
-        # parity tests). The states were initialized in the
-        # dequantize loop above, so each entry is populated.
+        # Fused-kernel path: one dispatch_sgd_minexplstm_step per parameter, matching the MeZO optimizer's per-parameter fused step. The fused kernel runs the identical pipeline the naive path runs (dequantize -> RMS -> beta prediction -> EMA blending -> cell forward -> FiLM update -> requantize), so the two backends agree by construction (pinned by the parity tests). The states were initialized in the dequantize loop above, so each entry is populated.
         from nanochat.ops.sgd_minexplstm import dispatch_sgd_minexplstm_step
 
         cell = self.cell
@@ -368,10 +358,7 @@ class SGD_MinExpLstm_Optimizer(torch.optim.Optimizer):
         for i, p in enumerate(params):
             grad = p.grad
             if grad is None:
-                # No gradient for this parameter (e.g.
-                # a frozen submodule): skip the fused
-                # step, matching the naive path which
-                # only steps parameters with gradients.
+                # No gradient for this parameter (e.g. a frozen submodule): skip the fused step, matching the naive path which only steps parameters with gradients.
                 continue
             fused_state: dict = state_list[i]
             dispatch_sgd_minexplstm_step(

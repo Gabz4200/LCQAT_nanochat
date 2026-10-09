@@ -37,8 +37,7 @@ def extract_program(completion):
 
     Returns the first code block if found, otherwise returns the whole completion.
     """
-    # Try to find markdown code blocks (```python or just ```)
-    # Match ```python\n...\n``` or ```\n...\n```
+    # Try to find markdown code blocks (```python or just ```) Match ```python\n...\n``` or ```\n...\n```
     pattern = r"```(?:python)?\s*\n(.*?)\n```"
     matches = re.findall(pattern, completion, re.DOTALL)
 
@@ -87,8 +86,7 @@ class HumanEval(Task):
         """Given (problem, completion), return boolean success of the completion."""
         # the prompt will contain the imports and the function signature
         imports = extract_imports(problem["messages"][0]["content"])
-        # the completion will usually contain the whole function
-        # but not always with the needed imports, so we manually append them
+        # the completion will usually contain the whole function but not always with the needed imports, so we manually append them
         completion_code = extract_program(completion)
         program = (
             imports

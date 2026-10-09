@@ -47,18 +47,14 @@ def _run_objective_arm(
     for step in range(args.objective_steps):
         block = step % args.ablation_blocks
         if objective == OBJECTIVE_EDM:
-            # `denoise_step` returns `(loss, sigma)`; sigma is a 0-dim tensor
-            # (`sample_sigma` draws one per call, not one per batch row), and is
-            # not used here -- only the loss is.
+            # `denoise_step` returns `(loss, sigma)`; sigma is a 0-dim tensor (`sample_sigma` draws one per call, not one per batch row), and is not used here -- only the loss is.
             loss, _sigma = engine.denoise_step(
                 idx,
                 block_idx=block,
                 generator=torch.Generator().manual_seed(seed * 1000 + step),
             )
         else:
-            # `train_step` returns the CE loss directly, not a `(loss, sigma)`
-            # pair, and requires real targets: `GPT.forward` returns logits when
-            # `targets is None`, which has no scalar to read.
+            # `train_step` returns the CE loss directly, not a `(loss, sigma)` pair, and requires real targets: `GPT.forward` returns logits when `targets is None`, which has no scalar to read.
             loss = engine.train_step(idx, targets, block_idx=block)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -66,12 +62,7 @@ def _run_objective_arm(
         losses.append(float(loss.detach()))
 
     with torch.no_grad():
-        # The block-output measurement. `probe` is the block's clean target; the
-        # residual identity is what makes it the right reference for both arms.
-        # Under EDM the input is the preconditioned clean stream, and the
-        # preconditioner is applied to the sigma *tensor* rather than a Python
-        # float, so the scaling matches what `denoise_step` did. Under CE there
-        # is no noise level at all, so the probe is fed directly.
+        # The block-output measurement. `probe` is the block's clean target; the residual identity is what makes it the right reference for both arms. Under EDM the input is the preconditioned clean stream, and the preconditioner is applied to the sigma *tensor* rather than a Python float, so the scaling matches what `denoise_step` did. Under CE there is no noise level at all, so the probe is fed directly.
         sigma = torch.ones(())
         c_in, _c_out, _w = edm_preconditioning(sigma, engine.partitioner.sigma_data)
         block_input = probe if objective == OBJECTIVE_CE else c_in * probe

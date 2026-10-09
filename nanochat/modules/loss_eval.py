@@ -41,8 +41,7 @@ def evaluate_bpb(model, batches, steps, token_bytes):
         if (
             y.int() < 0
         ).any():  # mps does not currently have kernel for < 0 for int64, only int32
-            # slightly more complex code path if some target tokens are ignore_index (e.g. -1)
-            # any target token < 0 is to be ignored: do NOT index token_bytes with negatives
+            # slightly more complex code path if some target tokens are ignore_index (e.g. -1) any target token < 0 is to be ignored: do NOT index token_bytes with negatives
             valid = y >= 0
             y_safe = torch.where(valid, y, torch.zeros_like(y))
             # map valid targets to their byte length; ignored targets contribute 0 bytes
@@ -52,8 +51,7 @@ def evaluate_bpb(model, batches, steps, token_bytes):
         else:
             # fast path: no ignored targets, safe to index directly
             num_bytes2d = token_bytes[y]
-        # Both arms reduce identically; only how `num_bytes2d` is obtained
-        # differs, so the accumulation is written once.
+        # Both arms reduce identically; only how `num_bytes2d` is obtained differs, so the accumulation is written once.
         total_nats += (loss2d * (num_bytes2d > 0)).sum()
         total_bytes += num_bytes2d.sum()
     # sum reduce across all ranks

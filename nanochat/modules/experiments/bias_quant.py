@@ -23,9 +23,7 @@ from nanochat.modules.experiments.common import (
 )
 from tests.conftest import build_active_tiny_gpt
 
-#: Marker for the "bias codebook parameters moved" flag in the notes. Checked
-#: by string, like the `sparsity` and `act_lut` rows do, so the rendered
-#: leaderboard stays readable and the check needs no side channel.
+#: Marker for the "bias codebook parameters moved" flag in the notes. Checked by string, like the `sparsity` and `act_lut` rows do, so the rendered leaderboard stays readable and the check needs no side channel.
 BIAS_CODEBOOK_LIVE = "codebook gradient live: True"
 BIAS_CODEBOOK_DEAD = "codebook gradient live: False"
 
@@ -67,22 +65,7 @@ def bias_probe(preset: str, k_bias: int) -> LCQATLinear:
     """
     model = build_active_tiny_gpt()
     float_proj = model.transformer.h[0].mlp.c_proj
-    # `gpt.py` builds every projection with `bias=False`, so `float_proj.bias`
-    # is None and there is nothing to give the bias codebook to quantize. A
-    # fresh float Linear carrying *this* layer's weight plus a real bias is
-    # built here, so the weight and activation codebooks still span the real
-    # `c_proj` ranges and only the bias term is new.
-    #
-    # The bias is drawn at the `std` `build_active_tiny_gpt` itself uses for the
-    # zero-initialized projections, off the *global* RNG the caller has already
-    # seeded for this sweep -- a dedicated generator seeded to a constant here
-    # would hand every seed the identical bias and quietly turn a paired sweep
-    # into five copies of one measurement.
-    #
-    # It must not be left at zero: `BiasQuantizer.init_from_tensor` returns early
-    # on an all-identical vector and keeps the codebook on its default span,
-    # which for a bias is wider than the data -- the silent, permanent failure
-    # its docstring warns about.
+    # `gpt.py` builds every projection with `bias=False`, so `float_proj.bias` is None and there is nothing to give the bias codebook to quantize. A fresh float Linear carrying *this* layer's weight plus a real bias is built here, so the weight and activation codebooks still span the real `c_proj` ranges and only the bias term is new. The bias is drawn at the `std` `build_active_tiny_gpt` itself uses for the zero-initialized projections, off the *global* RNG the caller has already seeded for this sweep -- a dedicated generator seeded to a constant here would hand every seed the identical bias and quietly turn a paired sweep into five copies of one measurement. It must not be left at zero: `BiasQuantizer.init_from_tensor` returns early on an all-identical vector and keeps the codebook on its default span, which for a bias is wider than the data -- the silent, permanent failure its docstring warns about.
     float_with_bias = torch.nn.Linear(
         float_proj.in_features, float_proj.out_features, bias=True
     )
@@ -165,20 +148,10 @@ def run_bias_quant(args: argparse.Namespace) -> list[AblationRow]:
         out_features = int(bias.numel())
         in_features = int(layer.in_features)
 
-        # MANDATORY, and the reason this probe measures anything at all: fit the
-        # table to the bias's own range. Without it the span is the layer's
-        # `act_init`, which spans relu^2 outputs and therefore overshoots a
-        # std-0.02 bias by orders of magnitude -- every entry lands on the zero
-        # anchor, the gradient is identically zero, and the error sits at
-        # exactly 1.0 forever. `from_float` already did this; doing it again is
-        # the probe stating the precondition it depends on rather than trusting
-        # a constructor call to have survived.
+        # MANDATORY, and the reason this probe measures anything at all: fit the table to the bias's own range. Without it the span is the layer's `act_init`, which spans relu^2 outputs and therefore overshoots a std-0.02 bias by orders of magnitude -- every entry lands on the zero anchor, the gradient is identically zero, and the error sits at exactly 1.0 forever. `from_float` already did this; doing it again is the probe stating the precondition it depends on rather than trusting a constructor call to have survived.
         quantizer.init_from_tensor(bias)
 
-        # Baseline: the FP32 bias, which round-trips through nothing. Its error
-        # is zero by construction, and that is the point of pairing against it
-        # -- the question is not "is the quantized bias bad" but "how much does
-        # quantizing it cost".
+        # Baseline: the FP32 bias, which round-trips through nothing. Its error is zero by construction, and that is the point of pairing against it -- the question is not "is the quantized bias bad" but "how much does quantizing it cost".
         base_mse, _base_max, base_power = quantization_error(bias, bias.clone())
 
         indices = quantizer.bucketize(bias)
@@ -190,13 +163,7 @@ def run_bias_quant(args: argparse.Namespace) -> list[AblationRow]:
         used_levels += int(torch.unique(indices).numel())
         k_total += int(quantizer.K)
 
-        # Liveness: a real backward pass through the STE, then the codebook's own
-        # parameters (never the derived `get_codebook()` tensor, which carries no
-        # optimizer state) for `steps` SGD steps. Fixed target, so the loss is a
-        # genuine signal in the same way `observe_grad_scale` makes it one.
-        # Built once and reused across the SGD steps: `non_negative_probe`
-        # seeds its own generator, so every call returned a bit-identical
-        # tensor and the loop was allocating one per step to throw away.
+        # Liveness: a real backward pass through the STE, then the codebook's own parameters (never the derived `get_codebook()` tensor, which carries no optimizer state) for `steps` SGD steps. Fixed target, so the loss is a genuine signal in the same way `observe_grad_scale` makes it one. Built once and reused across the SGD steps: `non_negative_probe` seeds its own generator, so every call returned a bit-identical tensor and the loop was allocating one per step to throw away.
         probe = non_negative_probe(layer.in_features, args.n, seed)
         layer.zero_grad(set_to_none=True)
         out = layer(probe)
@@ -225,16 +192,7 @@ def run_bias_quant(args: argparse.Namespace) -> list[AblationRow]:
                 for p, b in zip(target, before, strict=True)
             )
         )
-        # `moved > 0` is the wrong liveness test on its own, and it is exactly
-        # the test that made a single-seed sweep report a live codebook as dead.
-        # A non-zero gradient does not guarantee a representable update: these
-        # latents sit at magnitude ~5, where one fp32 ULP is ~5e-7, so an SGD
-        # step of `lr * grad` with `grad` around 1e-5 at the default lr of 1e-2
-        # lands at ~1e-7 -- below the spacing between representable values. The
-        # parameter is then bit-identical before and after and `moved` is
-        # exactly 0.0, which reads as "dead" when the gradient is in fact live
-        # and the codebook merely cannot move at that learning rate. Recording
-        # the representable floor alongside lets the two cases be told apart.
+        # `moved > 0` is the wrong liveness test on its own, and it is exactly the test that made a single-seed sweep report a live codebook as dead. A non-zero gradient does not guarantee a representable update: these latents sit at magnitude ~5, where one fp32 ULP is ~5e-7, so an SGD step of `lr * grad` with `grad` around 1e-5 at the default lr of 1e-2 lands at ~1e-7 -- below the spacing between representable values. The parameter is then bit-identical before and after and `moved` is exactly 0.0, which reads as "dead" when the gradient is in fact live and the codebook merely cannot move at that learning rate. Recording the representable floor alongside lets the two cases be told apart.
         ulp_floor += max(
             float(torch.finfo(p.dtype).eps) * float(p.detach().abs().max())
             for p in target
@@ -246,18 +204,10 @@ def run_bias_quant(args: argparse.Namespace) -> list[AblationRow]:
     nmse_variant /= seeds
     avg_moved = moved / seeds
     avg_ulp = ulp_floor / seeds
-    # Live means both: a real gradient arrived, AND it moved the table by at
-    # least the representable floor. Requiring both is what keeps this check
-    # able to fail -- `moved` alone reported a live codebook as dead whenever a
-    # single-seed sweep's update landed below one fp32 ULP, while
-    # `gradient alone` would report the §9.8 dead-codebook case as live, since
-    # that trap has a non-zero *gradient* that is too small to matter for a
-    # different reason. Neither half substitutes for the other.
+    # Live means both: a real gradient arrived, AND it moved the table by at least the representable floor. Requiring both is what keeps this check able to fail -- `moved` alone reported a live codebook as dead whenever a single-seed sweep's update landed below one fp32 ULP, while `gradient alone` would report the §9.8 dead-codebook case as live, since that trap has a non-zero *gradient* that is too small to matter for a different reason. Neither half substitutes for the other.
     live = non_zero_grads == seeds and avg_moved >= avg_ulp > 0.0
     live_flag = BIAS_CODEBOOK_LIVE if live else BIAS_CODEBOOK_DEAD
-    # `fp32` scores 0 by construction and cannot be beaten, so "better" names
-    # the arm with the lower error honestly instead of pretending the quantized
-    # arm won. The interesting reading is the *size* of the gap next to the cost.
+    # `fp32` scores 0 by construction and cannot be beaten, so "better" names the arm with the lower error honestly instead of pretending the quantized arm won. The interesting reading is the *size* of the gap next to the cost.
     better = "variant" if nmse_variant < nmse_baseline else "baseline"
     baseline_label = "fp32 bias"
     variant_label = f"bias_quant@{args.bias_quant_k_bias}"

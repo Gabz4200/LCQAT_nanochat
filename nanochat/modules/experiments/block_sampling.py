@@ -21,17 +21,11 @@ from nanochat.modules.experiments.common import (
     engine_named_parameters,
 )
 
-#: Parameter families the `block_sampling` metric is reported over, counted
-#: separately and never pooled. The engine's denoise heads and the GPT's own
-#: transformer layers are different parameters with different owners; a pooled
-#: fraction hides whichever of the two a change broke.
+#: Parameter families the `block_sampling` metric is reported over, counted separately and never pooled. The engine's denoise heads and the GPT's own transformer layers are different parameters with different owners; a pooled fraction hides whichever of the two a change broke.
 SAMPLING_FAMILIES = ("transformer.h.", "db_denoise_heads.")
 
 
-#: The block the `step` arm holds for a whole optimizer step. It is block 0,
-#: because `_per_block_reference` also runs block 0 in isolation: the two arms
-#: are then comparable against the same reference, and the `micro` arm differs
-#: from the reference only in that it redraws the block each micro-step.
+#: The block the `step` arm holds for a whole optimizer step. It is block 0, because `_per_block_reference` also runs block 0 in isolation: the two arms are then comparable against the same reference, and the `micro` arm differs from the reference only in that it redraws the block each micro-step.
 STEP_ARM_BLOCK = 0
 
 
@@ -121,22 +115,15 @@ def _accumulate_one_step(
     engine.zero_grad(set_to_none=True)
     for micro in range(micro_steps):
         if mode == SAMPLING_STEP:
-            # One block held for the whole optimizer step -- the same block the
-            # reference ran. Rotating `micro % n_blocks` here instead would
-            # reproduce exactly what the `micro` arm does and make the two arms
-            # indistinguishable by construction. The noise generator is still
-            # re-seeded per micro-step, so both arms draw the same sigma
-            # sequence; only the *block* is held, not the sigma.
+            # One block held for the whole optimizer step -- the same block the reference ran. Rotating `micro % n_blocks` here instead would reproduce exactly what the `micro` arm does and make the two arms indistinguishable by construction. The noise generator is still re-seeded per micro-step, so both arms draw the same sigma sequence; only the *block* is held, not the sigma.
             block = STEP_ARM_BLOCK
         else:
-            # The engine's own sampler, so the arm uses the real draw rather
-            # than a reimplementation of it.
+            # The engine's own sampler, so the arm uses the real draw rather than a reimplementation of it.
             block = engine.sample_block(
                 generator=torch.Generator().manual_seed(seed * 7919 + micro)
             )
         loss, _sigma = engine.denoise_step(
-            # `clean` is supplied, so `idx` is read only for its sequence
-            # length; the values are never used.
+            # `clean` is supplied, so `idx` is read only for its sequence length; the values are never used.
             _length_only_idx(probe_seq_len=clean.size(1)),
             block_idx=block,
             generator=torch.Generator().manual_seed(seed * 104729 + micro),
@@ -229,11 +216,7 @@ def run_block_sampling(args: argparse.Namespace) -> list[AblationRow]:
         micro_vals = per_family[(SAMPLING_MICRO, family)]
         base = sum(step_vals) / len(step_vals)
         var = sum(micro_vals) / len(micro_vals)
-        # The seed spread is reported because this metric is strongly
-        # seed-dependent, and hiding that would let a reader mistake one
-        # seed's ratio for a stable constant. It varies with the sigma lottery
-        # more than with the sampling mode: the same configuration measured
-        # 42.7 at one seed and 11.9 at eight.
+        # The seed spread is reported because this metric is strongly seed-dependent, and hiding that would let a reader mistake one seed's ratio for a stable constant. It varies with the sigma lottery more than with the sampling mode: the same configuration measured 42.7 at one seed and 11.9 at eight.
         step_spread = _spread(step_vals)
         micro_spread = _spread(micro_vals)
         rows.append(

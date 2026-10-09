@@ -149,9 +149,7 @@ def count_codebook_cost(module) -> tuple[int, int]:
     twice would overstate the artifact.
     """
     params = sum(p.numel() for p in module.parameters())
-    # Persistence has to be read off `state_dict`, not off `named_buffers`:
-    # the latter yields non-persistent buffers too, so filtering by it is a
-    # tautology and every derived buffer gets priced as if it shipped.
+    # Persistence has to be read off `state_dict`, not off `named_buffers`: the latter yields non-persistent buffers too, so filtering by it is a tautology and every derived buffer gets priced as if it shipped.
     persistent = set(module.state_dict())
     buffers = sum(
         b.numel() * b.element_size()

@@ -57,16 +57,12 @@ def differentiable_cell_step(
     same layout. The caller reshapes and applies the FiLM update
     (:func:`film_sgd_update`).
     """
-    # Layer-wise RMS normalization (PRD 3.1): one RMS per
-    # tensor. A batched [B, N] input normalizes per row; a
-    # flat [N] input normalizes by a scalar (the closure's
-    # per-parameter layout).
+    # Layer-wise RMS normalization (PRD 3.1): one RMS per tensor. A batched [B, N] input normalizes per row; a flat [N] input normalizes by a scalar (the closure's per-parameter layout).
     batched = grad.dim() == 2
     rms_g = rms_batch(grad) if batched else scalar_rms(grad)
     g_norm = grad / (rms_g.unsqueeze(-1) if batched else rms_g + 1e-8)
 
-    # Lambda-coupled per-coordinate betas from the normalized
-    # gradient (PRD 3.2). The predictor broadcasts: g_norm.
+    # Lambda-coupled per-coordinate betas from the normalized gradient (PRD 3.2). The predictor broadcasts: g_norm.
     beta_fast, beta_slow = cell.predict_betas(g_norm, lam=lam)
 
     # Dynamic EMA IIR blending (PRD 3.3).
@@ -195,10 +191,7 @@ def differentiable_mezo_cell_step(
     Returns ``(gamma, delta, next_h)`` in the ``[-1]`` layout.
     The caller applies the FiLM update (:func:`film_mezo_update`).
     """
-    # Scale-invariant cell inputs (PRD 2.3): each input is
-    # RMS-normalized over its own tensor (a scalar RMS, not
-    # the SGD cell's per-row RMS), so the cell sees
-    # direction, not magnitude.
+    # Scale-invariant cell inputs (PRD 2.3): each input is RMS-normalized over its own tensor (a scalar RMS, not the SGD cell's per-row RMS), so the cell sees direction, not magnitude.
     fir_norm = fir / (scalar_rms(fir) + eps)
     mezo_norm = mezo / (scalar_rms(mezo) + eps)
     h_norm = h_fp32 / (scalar_rms(h_fp32) + eps)
@@ -250,8 +243,7 @@ def meta_step_closure(
             params[name_of[id(p)]] = updated
             rebuilt += 1
 
-    # A zero rebuild means the caller zeroed grads before
-    # meta_step (the historical bug) or owns no trained params.
+    # A zero rebuild means the caller zeroed grads before meta_step (the historical bug) or owns no trained params.
     if rebuilt == 0:
         raise RuntimeError(
             "meta_step(model, closure) rebuilt 0 parameters: every "

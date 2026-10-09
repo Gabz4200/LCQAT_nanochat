@@ -21,9 +21,7 @@ SPECIAL_TOKENS = [
     "<|output_end|>",
 ]
 
-# NOTE: this split pattern deviates from GPT-4 in that we use \p{N}{1,2} instead of \p{N}{1,3}
-# I did this because I didn't want to "waste" too many tokens on numbers for smaller vocab sizes.
-# I verified that 2 is the sweet spot for vocab size of 32K. 1 is a bit worse, 3 was worse still.
+# NOTE: this split pattern deviates from GPT-4 in that we use \p{N}{1,2} instead of \p{N}{1,3} I did this because I didn't want to "waste" too many tokens on numbers for smaller vocab sizes. I verified that 2 is the sweet spot for vocab size of 32K. 1 is a bit worse, 3 was worse still.
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
 import pickle
@@ -69,8 +67,7 @@ class RustBPETokenizer:
 
     @classmethod
     def from_directory(cls, tokenizer_dir):
-        # tokenizer.pkl is written by our own scripts/tok_train.py on this machine;
-        # same trust boundary as the torch.load calls in checkpoint_manager.py
+        # tokenizer.pkl is written by our own scripts/tok_train.py on this machine; same trust boundary as the torch.load calls in checkpoint_manager.py
         pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
         with open(pickle_path, "rb") as f:
             # aislop-ignore-next-line security/pickle-load -- local self-trained artifact, never loaded from untrusted input
@@ -81,10 +78,7 @@ class RustBPETokenizer:
     def from_pretrained(cls, tiktoken_name):
         # https://github.com/openai/tiktoken/blob/eedc8563/tiktoken_ext/openai_public.py
         enc = tiktoken.get_encoding(tiktoken_name)
-        # tiktoken calls the special document delimiter token "<|endoftext|>"
-        # yes this is confusing because this token is almost always PREPENDED to the beginning of the document
-        # it most often is used to signal the start of a new sequence to the LLM during inference etc.
-        # so in nanoChat we always use "<|bos|>" short for "beginning of sequence", but historically it is often called "<|endoftext|>".
+        # tiktoken calls the special document delimiter token "<|endoftext|>" yes this is confusing because this token is almost always PREPENDED to the beginning of the document it most often is used to signal the start of a new sequence to the LLM during inference etc. so in nanoChat we always use "<|bos|>" short for "beginning of sequence", but historically it is often called "<|endoftext|>".
         return cls(enc, "<|endoftext|>")
 
     def get_vocab_size(self):
@@ -94,10 +88,7 @@ class RustBPETokenizer:
         return self.enc.special_tokens_set
 
     def encode_special(self, text):
-        # Resolved once per instance in __init__ rather than memoized on the
-        # method: an `lru_cache` on a method is keyed by `self`, so a hit needs
-        # a strong reference to the instance and therefore pins every tokenizer
-        # (and its `tiktoken.Encoding`) for the life of the process.
+        # Resolved once per instance in __init__ rather than memoized on the method: an `lru_cache` on a method is keyed by `self`, so a hit needs a strong reference to the instance and therefore pins every tokenizer (and its `tiktoken.Encoding`) for the life of the process.
         return self.enc.encode_single_token(text)
 
     def get_bos_token_id(self):
@@ -164,8 +155,7 @@ class RustBPETokenizer:
             ids.extend(token_ids)
             mask.extend([mask_val] * len(token_ids))
 
-        # sometimes the first message is a system message...
-        # => just merge it with the second (user) message
+        # sometimes the first message is a system message... => just merge it with the second (user) message
         if conversation["messages"][0]["role"] == "system":
             # some conversation surgery is necessary here for now...
             conversation = copy.deepcopy(conversation)  # avoid mutating the original
@@ -238,8 +228,7 @@ class RustBPETokenizer:
                             add_tokens(value_ids, 1)
                             add_tokens(python_end, 1)
                         elif part["type"] == "python_output":
-                            # python output => add the tokens inside <|output_start|> and <|output_end|>
-                            # none of these tokens are supervised because the tokens come from Python at test time
+                            # python output => add the tokens inside <|output_start|> and <|output_end|> none of these tokens are supervised because the tokens come from Python at test time
                             add_tokens(output_start, 0)
                             add_tokens(value_ids, 0)
                             add_tokens(output_end, 0)
@@ -306,9 +295,7 @@ def get_token_bytes(device="cpu"):
     try:
         f = open(path, "rb")
     except FileNotFoundError:
-        # Operate-and-handle rather than pre-check: the assert form tested
-        # existence and then `open` re-tested it, so the TOCTOU window bought
-        # nothing and a race still surfaced as a bare FileNotFoundError.
+        # Operate-and-handle rather than pre-check: the assert form tested existence and then `open` re-tested it, so the TOCTOU window bought nothing and a race still surfaced as a bare FileNotFoundError.
         raise AssertionError(
             f"Token bytes not found at {path}? It gets written by tok_train.py"
         ) from None

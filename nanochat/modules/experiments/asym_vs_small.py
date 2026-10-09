@@ -45,18 +45,14 @@ def run_asym_vs_small(args: argparse.Namespace) -> AblationRow:
         layer_base = probe_layer(BASELINE_PRESET)
         layer_var = probe_layer(VARIANT_PRESET)
 
-        # One probe tensor, shared: the input is held fixed across arms so the
-        # measurement isolates the codebook, not the data.
+        # One probe tensor, shared: the input is held fixed across arms so the measurement isolates the codebook, not the data.
         probe = non_negative_probe(layer_base.in_features, args.n, seed)
 
         base = measure_reconstruction(layer_base, probe, BASELINE_PRESET, which="act")
         variant = measure_reconstruction(layer_var, probe, VARIANT_PRESET, which="act")
         measurements.append((base, variant))
 
-    # The deciding metric is the fraction of the alphabet actually used.
-    # Absolute level count *ties* at 8 for both arms -- the difference is that
-    # `small` spends 15 levels to do it (8 used, 7 stranded below the data's
-    # minimum) while `asym` spends 8. So the win is headroom, not resolution.
+    # The deciding metric is the fraction of the alphabet actually used. Absolute level count *ties* at 8 for both arms -- the difference is that `small` spends 15 levels to do it (8 used, 7 stranded below the data's minimum) while `asym` spends 8. So the win is headroom, not resolution.
     base_eff = sum(b.level_utilization for b, _ in measurements) / len(measurements)
     var_eff = sum(v.level_utilization for _, v in measurements) / len(measurements)
     return AblationRow(

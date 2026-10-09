@@ -23,9 +23,7 @@ from nanochat.models.quant.sparseprop import (
 from nanochat.modules.experiments.common import VARIANT_PRESET
 from tests.conftest import build_active_tiny_gpt
 
-#: Sparsity levels the `sparsity` experiment sweeps, below and at the target.
-#: The dense 0.0 arm is not swept: at zero sparsity `layer` and `global` are
-#: the same mask by construction, so the pair would be a tautology.
+#: Sparsity levels the `sparsity` experiment sweeps, below and at the target. The dense 0.0 arm is not swept: at zero sparsity `layer` and `global` are the same mask by construction, so the pair would be a tautology.
 SPARSITY_FLOORS = (0.5,)
 
 
@@ -75,22 +73,14 @@ def pruned_lcqat_layers(
         model, sparsity=sparsity, target_modules=["c_proj", "c_fc"], with_lcqat=True
     )
     layers = [
-        # `inject_sparseprop_layers(..., with_lcqat=True)` replaced these two
-        # projections with `SparsePropLinearLCQAT` (a `SparsePropLinear`)
-        # above; the cast states that post-injection type. Unchecked at
-        # runtime, and it must stay in sync with the injection call.
+        # `inject_sparseprop_layers(..., with_lcqat=True)` replaced these two projections with `SparsePropLinearLCQAT` (a `SparsePropLinear`) above; the cast states that post-injection type. Unchecked at runtime, and it must stay in sync with the injection call.
         typing.cast(SparsePropLinear, model.transformer.h[0].attn.c_proj),
         typing.cast(SparsePropLinear, model.transformer.h[0].mlp.c_fc),
     ]
     schedule = schedule_from_args(args)
     schedule.target_sparsity = sparsity
     schedule.scope = scope
-    # `apply` returns None off a prune event, and `enabled` is False whenever
-    # `every == 0` -- which is `--sparseprop-every`'s default. `every = 1` makes
-    # every step an event so the ramp actually runs; the step passed is the last
-    # one, so the ramp completes to its target instead of leaving the model at
-    # the start fraction. Skipping this would prune nothing and the whole sweep
-    # would report the NMSE of an unpruned layer.
+    # `apply` returns None off a prune event, and `enabled` is False whenever `every == 0` -- which is `--sparseprop-every`'s default. `every = 1` makes every step an event so the ramp actually runs; the step passed is the last one, so the ramp completes to its target instead of leaving the model at the start fraction. Skipping this would prune nothing and the whole sweep would report the NMSE of an unpruned layer.
     schedule.every = 1
     schedule.apply(model, schedule.ramp_steps, layers=layers)
     return layers
@@ -147,9 +137,7 @@ def measure_sparsity_nmse(
         with torch.no_grad():
             original = layer.weight.detach().clone()
             pruned = ~layer.sparsity_mask
-            # Round-trip through the quantizer, which is what the exported
-            # artifact does. Recomputed once, used for both the error and the
-            # zero check.
+            # Round-trip through the quantizer, which is what the exported artifact does. Recomputed once, used for both the error and the zero check.
             dequantized = reconstruct_layer(layer, original, "weight")
             if bool(pruned.any()):
                 exact = exact and bool(
@@ -217,11 +205,7 @@ def run_sparsity(args: argparse.Namespace) -> list[AblationRow]:
                 ),
             )
         )
-    # The two scopes prune the two layers to the same *fraction* at every
-    # setting, so the NMSE rows above cannot separate them. This row reports
-    # the thing that does differ -- which weights each scope keeps -- so the
-    # `layer` vs `global` claim rests on a measurement rather than on a
-    # tautology.
+    # The two scopes prune the two layers to the same *fraction* at every setting, so the NMSE rows above cannot separate them. This row reports the thing that does differ -- which weights each scope keeps -- so the `layer` vs `global` claim rests on a measurement rather than on a tautology.
     pooled_disagreement, worst_layer = scope_mask_disagreement(
         args, VARIANT_PRESET, target
     )

@@ -25,13 +25,7 @@ import torch.nn.functional as F
 from nanochat.models.quant.packing import pack_nibbles, unpack_nibbles
 from nanochat.utils.common import COMPUTE_DTYPE
 
-# Restricted expression evaluator for the calculator tool: parses the formula
-# as an AST and only executes whitelisted nodes, so model-generated formulas can
-# never reach arbitrary code execution (replaces a direct eval() call).
-# Typed as `Callable[..., typing.Any]`: `operator.add`'s own stub is a
-# parameterised overload (`SupportsAdd`), which makes the dict's value type
-# too narrow to index by `type[node.op]`. The evaluator only needs a
-# callable; the whitelist itself is what provides the safety.
+# Restricted expression evaluator for the calculator tool: parses the formula as an AST and only executes whitelisted nodes, so model-generated formulas can never reach arbitrary code execution (replaces a direct eval() call). Typed as `Callable[..., typing.Any]`: `operator.add`'s own stub is a parameterised overload (`SupportsAdd`), which makes the dict's value type too narrow to index by `type[node.op]`. The evaluator only needs a callable; the whitelist itself is what provides the safety.
 _SAFE_BINOPS: dict[type[ast.operator], typing.Callable[..., typing.Any]] = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -117,8 +111,7 @@ def use_calculator(expr):
             return None
         return eval_with_timeout(expr)
 
-    # Check if it's a string operation we support
-    # Allow: strings (single/double quotes), .count(), letters, numbers, spaces, parens
+    # Check if it's a string operation we support Allow: strings (single/double quotes), .count(), letters, numbers, spaces, parens
     allowed_chars = (
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'\"()._ "
     )
@@ -231,18 +224,12 @@ class KVCache:
             and self.head_dim == other.head_dim
         )
         assert self.max_seq_len >= other.max_seq_len
-        # Branch on `self`'s layout: `self.k_idx` only exists on a
-        # `QuantizedKVCache`, and `other` is typed as the union so it
-        # cannot be indexed either way. The engine always pairs a prefill
-        # cache with a decode cache of the same type, so a mismatch is a
-        # programming error, not a runtime branch.
+        # Branch on `self`'s layout: `self.k_idx` only exists on a `QuantizedKVCache`, and `other` is typed as the union so it cannot be indexed either way. The engine always pairs a prefill cache with a decode cache of the same type, so a mismatch is a programming error, not a runtime branch.
         assert isinstance(other, type(self)), (
             "prefill source and destination KV caches must be the same type"
         )
         other_pos = other.get_pos()
-        # `other` is typed as the union, so neither branch can index it
-        # directly; read through `getattr` and write through `self`'s own
-        # buffers, which the subclass narrows.
+        # `other` is typed as the union, so neither branch can index it directly; read through `getattr` and write through `self`'s own buffers, which the subclass narrows.
         if isinstance(self, QuantizedKVCache):
             self.k_idx[:, :, :other_pos] = getattr(other, "k_idx")[:, :, :other_pos]
             self.v_idx[:, :, :other_pos] = getattr(other, "v_idx")[:, :, :other_pos]
@@ -292,10 +279,7 @@ class QuantizedKVCache:
                     f"{label} must be [n_layers, num_heads, K] = "
                     f"[{num_layers}, {num_heads}, K], got {tuple(cb.shape)}"
                 )
-            # Even K is legal: the asymmetric split K = m_neg + 1 + m_pos is
-            # what makes one-sided codebooks (and therefore K=4, K=8, K=16)
-            # possible. The storage limit is still K <= 15, because the cache is
-            # nibble-packed (2 indices per byte).
+            # Even K is legal: the asymmetric split K = m_neg + 1 + m_pos is what makes one-sided codebooks (and therefore K=4, K=8, K=16) possible. The storage limit is still K <= 15, because the cache is nibble-packed (2 indices per byte).
             if cb.shape[-1] < 3 or cb.shape[-1] > 15:
                 raise ValueError(
                     f"{label} last dim must be a K in [3, 15] (nibble-packed), "
@@ -412,8 +396,7 @@ class QuantizedKVCache:
             and self.head_dim == other.head_dim
         )
         assert self.max_seq_len >= other.max_seq_len
-        # `other` is typed as the union, so read its packed buffers through
-        # `getattr` rather than attribute access.
+        # `other` is typed as the union, so read its packed buffers through `getattr` rather than attribute access.
         other_pos = other.get_pos()
         self.k_idx[:, :, :other_pos] = getattr(other, "k_idx")[:, :, :other_pos]
         self.v_idx[:, :, :other_pos] = getattr(other, "v_idx")[:, :, :other_pos]
@@ -437,9 +420,7 @@ def kv_codebooks_from_model(model) -> tuple[torch.Tensor, torch.Tensor]:
     n_kv_head: int | None = None
     for block in model.transformer.h:
         n_kv_head = block.attn.n_kv_head
-        # `out_quantizer` is Optional on the layer: assert before reading
-        # rather than `getattr`, because a projection without one has no
-        # codebook to export and the artifact would silently be wrong.
+        # `out_quantizer` is Optional on the layer: assert before reading rather than `getattr`, because a projection without one has no codebook to export and the artifact would silently be wrong.
         k_quantizer = getattr(block.attn.c_k, "out_quantizer", None)
         v_quantizer = getattr(block.attn.c_v, "out_quantizer", None)
         assert k_quantizer is not None and v_quantizer is not None, (

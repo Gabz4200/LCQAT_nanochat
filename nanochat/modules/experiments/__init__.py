@@ -90,8 +90,7 @@ __all__ = [
     "SPARSITY_FLOORS",
     "STEP_ARM_BLOCK",
     "VARIANT_PRESET",
-    # Underscore-prefixed, and re-exported only so `scripts.lcqat_ablation`
-    # keeps the attribute it had before the split. Nothing here imports them.
+    # Underscore-prefixed, and re-exported only so `scripts.lcqat_ablation` keeps the attribute it had before the split. Nothing here imports them.
     "_accumulate_one_step",
     "_act_kwargs",
     "_length_only_idx",

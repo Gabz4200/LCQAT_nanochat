@@ -61,9 +61,6 @@ def print_run_summary(
     """
     print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
     print0(f"Total training time: {total_training_time / 60:.2f}m")
-    # Gated on `val_bpb` and prints `min_val_bpb`. Preserved verbatim from the
-    # original: the guard reads as though it should be `min_val_bpb is not None`,
-    # but changing it would alter when the line appears, which is a behavior
-    # change, not a refactor.
+    # Gated on `val_bpb` and prints `min_val_bpb`. Preserved verbatim from the original: the guard reads as though it should be `min_val_bpb is not None`, but changing it would alter when the line appears, which is a behavior change, not a refactor.
     if val_bpb is not None:
         print0(f"Minimum validation bpb: {min_val_bpb:.{bpb_places}f}")

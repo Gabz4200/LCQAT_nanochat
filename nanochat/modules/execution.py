@@ -43,10 +43,7 @@ class ExecutionResult:
     memory_exceeded: bool = False
 
 
-# The guard runs in the subprocess before the untrusted code. It applies the
-# resource limits and disables destructive functions to protect against
-# accidents (a fork bomb, deleting files, killing other processes, ...).
-# It is trivially bypassable by adversarial code, see docstring above.
+# The guard runs in the subprocess before the untrusted code. It applies the resource limits and disables destructive functions to protect against accidents (a fork bomb, deleting files, killing other processes, ...). It is trivially bypassable by adversarial code, see docstring above.
 GUARD = r"""
 import faulthandler, builtins, os, shutil, subprocess, sys
 maximum_memory_bytes = {maximum_memory_bytes}

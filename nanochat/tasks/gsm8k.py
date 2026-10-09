@@ -60,8 +60,7 @@ class GSM8K(Task):
         answer = row[
             "answer"
         ]  # string of the full solution and the answer after #### marker
-        # Create and return the Conversation object
-        # This is tricky because GSM8K uses tool calls, which we need to parse here.
+        # Create and return the Conversation object This is tricky because GSM8K uses tool calls, which we need to parse here.
         assistant_message_parts = []
         parts = re.split(r"(<<[^>]+>>)", answer)
         for part in parts:

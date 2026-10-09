@@ -124,8 +124,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         for tokens in token_lists:
             doc_buffer.append(tokens)
 
-    # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
-    # This gives us contiguous views and a single HtoD transfer
+    # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)] This gives us contiguous views and a single HtoD transfer
     use_cuda = device == "cuda"
     row_buffer = torch.empty(
         (B, row_capacity), dtype=torch.long

@@ -13,10 +13,7 @@ import torch
 from nanochat.models.quant.ablation_metrics import AblationRow
 from nanochat.training.diffusion_blocks import EquiProbabilityPartitioner
 
-#: Overlap settings the `overlap` experiment sweeps. The disjoint partition
-#: (0.0) is the baseline; the rest are the values DiffusionBlocks App. C quotes
-#: for text (0.1) rounded up, plus `--db-overlap` so the operator's choice is
-#: swept too. Deduped and sorted by `sorted_overlap_sweep`.
+#: Overlap settings the `overlap` experiment sweeps. The disjoint partition (0.0) is the baseline; the rest are the values DiffusionBlocks App. C quotes for text (0.1) rounded up, plus `--db-overlap` so the operator's choice is swept too. Deduped and sorted by `sorted_overlap_sweep`.
 OVERLAP_FLOORS = (0.0, 0.125)
 
 

@@ -64,13 +64,11 @@ class SGDMinExpLSTMCellFiLM4D(nn.Module):
         self.h_proj = nn.Linear(input_size, hidden_size)
         # 1D -> 4D latent feature projection (PRD 3.5).
         self.out_proj = nn.Linear(hidden_size, latent_dim)
-        # 4D -> 2D FiLM head (PRD 3.5), zero-initialized: the step-0
-        # fallback safeguard (PRD principle 2).
+        # 4D -> 2D FiLM head (PRD 3.5), zero-initialized: the step-0 fallback safeguard (PRD principle 2).
         self.film_proj = nn.Linear(latent_dim, 2)
         nn.init.zeros_(self.film_proj.weight)
         nn.init.zeros_(self.film_proj.bias)
-        # Lambda-coupled beta predictor (PRD 3.2): a single shared
-        # scalar affine map, one gate evaluation for both horizons.
+        # Lambda-coupled beta predictor (PRD 3.2): a single shared scalar affine map, one gate evaluation for both horizons.
         self.w_beta = nn.Parameter(torch.tensor([0.1]))
         self.b_beta = nn.Parameter(torch.tensor([0.0]))
 
@@ -113,8 +111,7 @@ class SGDMinExpLSTMCellFiLM4D(nn.Module):
         return gamma, delta, h_next
 
 
-# Historical name from the pre-PRD-v3.2 design (single EMA + BetaNet
-# MLP). It now names this cell; prefer ``SGDMinExpLSTMCellFiLM4D``.
+# Historical name from the pre-PRD-v3.2 design (single EMA + BetaNet MLP). It now names this cell; prefer ``SGDMinExpLSTMCellFiLM4D``.
 MinExpLSTMCell = SGDMinExpLSTMCellFiLM4D
 
 __all__ = ["MinExpLSTMCell", "SGDMinExpLSTMCellFiLM4D"]

@@ -76,8 +76,7 @@ class EngineSetup:
     use_diffusion_blocks: bool
     num_db_blocks: int
     engine: DiffusionBlockEngine | None
-    # The KD teacher is a float copy of the engine (the
-    # denoiser's own model tree), not the bare GPT.
+    # The KD teacher is a float copy of the engine (the denoiser's own model tree), not the bare GPT.
     float_twin: DiffusionBlockEngine | None
     n_twin_stripped: int
 
@@ -167,13 +166,11 @@ def build_base_model(args, vocab_size, device, ddp_rank, sparse_schedule):
     output_dirname = args.model_tag if args.model_tag else f"d{args.depth}"  # e.g. d12
     checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
     resuming = args.resume_from_step != -1
-    # Unbound on the plain-float fresh-run path (no resume, no LC-QAT retrofit);
-    # the two branches below assign them.
+    # Unbound on the plain-float fresh-run path (no resume, no LC-QAT retrofit); the two branches below assign them.
     resumed_sparse = False
     meta_data = None
     optimizer_data = None
-    # Only the resume branch below reads the partition out of the
-    # checkpoint; a fresh run has none to read.
+    # Only the resume branch below reads the partition out of the checkpoint; a fresh run has none to read.
     resumed_db_blocks: int | None = None
     if resuming:
         print0(f"Resuming optimization from step {args.resume_from_step}")
@@ -187,15 +184,7 @@ def build_base_model(args, vocab_size, device, ddp_rank, sparse_schedule):
         lcqat_active = prepare_lcqat_before_load(
             model, model_data, meta_data.get("lcqat"), lcqat_requested
         )
-        # The diffusion engine owns db_adapters.* / db_denoise_head.* on top of the
-        # bare GPT; those keys do not belong in the base model's state_dict.
-        # checkpoint_manager.build_model does the same strip.
-        # SparseProp must be injected BEFORE the load, not after: the checkpoint
-        # carries `sparsity_mask` / `w_ptr` / `w_col` / `w_ptr_csc` / `w_row` as
-        # persistent buffers, so loading into a model that has not been injected yet
-        # fails with "unexpected key(s)". Injecting here also means the saved mask is
-        # what gets used -- previously the mask was non-persistent, so a resume
-        # silently re-rolled a random pattern while reusing the checkpoint's weights.
+        # The diffusion engine owns db_adapters.* / db_denoise_head.* on top of the bare GPT; those keys do not belong in the base model's state_dict. checkpoint_manager.build_model does the same strip. SparseProp must be injected BEFORE the load, not after: the checkpoint carries `sparsity_mask` / `w_ptr` / `w_col` / `w_ptr_csc` / `w_row` as persistent buffers, so loading into a model that has not been injected yet fails with "unexpected key(s)". Injecting here also means the saved mask is what gets used -- previously the mask was non-persistent, so a resume silently re-rolled a random pattern while reusing the checkpoint's weights.
         if args.sparseprop:
             from nanochat.models.quant.sparseprop import inject_sparseprop_layers
 
@@ -204,10 +193,7 @@ def build_base_model(args, vocab_size, device, ddp_rank, sparse_schedule):
                 sparsity=args.sparseprop_sparsity,
                 with_lcqat=lcqat_active is not None,
             )
-            # No pruning here: the mask built above is a placeholder that
-            # load_state_dict immediately overwrites with the checkpoint's own. A
-            # gradual ramp resumes from its position in the global step counter, so
-            # it needs no per-layer state either.
+            # No pruning here: the mask built above is a placeholder that load_state_dict immediately overwrites with the checkpoint's own. A gradual ramp resumes from its position in the global step counter, so it needs no per-layer state either.
             resumed_sparse = True
         else:
             resumed_sparse = False
@@ -221,20 +207,13 @@ def build_base_model(args, vocab_size, device, ddp_rank, sparse_schedule):
         model.load_state_dict(base_model_data, strict=True, assign=True)
         if lcqat_active is None:
             lcqat_active = finish_lcqat_after_load(model, lcqat_requested)
-        # The block partition is checkpoint provenance, not a fresh choice: resuming
-        # with a different --db-blocks would silently re-partition the model and
-        # change which parameters receive gradients every micro-step.
+        # The block partition is checkpoint provenance, not a fresh choice: resuming with a different --db-blocks would silently re-partition the model and change which parameters receive gradients every micro-step.
         db_meta = meta_data.get("db") if meta_data is not None else None
         resumed_db_blocks = db_meta.get("num_blocks") if db_meta is not None else None
         del model_data, base_model_data  # free up this memory after the copy
     elif lcqat_requested is not None:
         retrofit_model(model, lcqat_requested)
-        # D9: attach the learned activation tables. Must run after `retrofit_model`
-        # (it walks the LCQATLinear pairs) and *unconditionally* -- gating on
-        # "are the flags non-default" would skip the table when both flags are at
-        # their defaults, which is exactly the case that needs a trainable table to
-        # exist at all. Attaching with the defaults is a value no-op: the table
-        # starts at the same bake export would have produced.
+        # D9: attach the learned activation tables. Must run after `retrofit_model` (it walks the LCQATLinear pairs) and *unconditionally* -- gating on "are the flags non-default" would skip the table when both flags are at their defaults, which is exactly the case that needs a trainable table to exist at all. Attaching with the defaults is a value no-op: the table starts at the same bake export would have produced.
         from nanochat.models.quant.export import attach_learnable_activation_luts
 
         n_luts = attach_learnable_activation_luts(
@@ -244,9 +223,7 @@ def build_base_model(args, vocab_size, device, ddp_rank, sparse_schedule):
         )
         print0(f"Learned activation LUTs attached: {n_luts}")
         lcqat_active = lcqat_requested
-        # Fresh run: inject SparseProp into the base transformer here so the two
-        # retrofit passes are symmetric with the resume branch above. Must run after
-        # the LC-QAT retrofit, since `with_lcqat=True` wraps the LCQATLinears.
+        # Fresh run: inject SparseProp into the base transformer here so the two retrofit passes are symmetric with the resume branch above. Must run after the LC-QAT retrofit, since `with_lcqat=True` wraps the LCQATLinears.
         if args.sparseprop:
             from nanochat.models.quant.sparseprop import inject_sparseprop_layers
 
@@ -256,10 +233,24 @@ def build_base_model(args, vocab_size, device, ddp_rank, sparse_schedule):
                 with_lcqat=True,
             )
         resumed_sparse = False
+    elif args.qat_4bit:
+        # 4-bit main-model layout (the PRD's storage pillar): replace the eligible nn.Linear modules with FourBitLinear (packed nibbles + scale, 0.5 bytes/weight). The fp32 weight stays as the optimization surrogate the MinExpLSTM optimizers step; the QAT optimizers refresh the 4-bit mirror after each step (see nanochat/training). Mutually exclusive with LC-QAT (both convert the Linear modules).
+        if lcqat_requested is not None:
+            raise ValueError(
+                "--qat-4bit and --lcqat are mutually exclusive "
+                "(both convert the Linear modules)"
+            )
+        from nanochat.models.quant import FourBitLinear, retrofit_fourbit
+
+        retrofit_fourbit(model, min_linear_dim=128)
+        n_fourbit = sum(1 for m in model.modules() if isinstance(m, FourBitLinear))
+        print0(
+            f"4-bit main-model retrofit (FourBitLinear): "
+            f"{n_fourbit} layers, QAT on 4-bit weights"
+        )
+        resumed_sparse = False
     if resuming and args.sparseprop:
-        # A checkpoint trained without sparsity has no mask buffers to load, so the
-        # freshly-injected mask is what will be used. State that rather than
-        # letting it look like a restored pattern.
+        # A checkpoint trained without sparsity has no mask buffers to load, so the freshly-injected mask is what will be used. State that rather than letting it look like a restored pattern.
         sp_meta = meta_data.get("sparseprop") if meta_data is not None else None
         ckpt_sparse = sp_meta.get("enabled") if sp_meta is not None else None
         if ckpt_sparse is not True:
@@ -269,8 +260,7 @@ def build_base_model(args, vocab_size, device, ddp_rank, sparse_schedule):
                 "resume from a pre-SparseProp run)"
             )
     elif args.sparseprop:
-        # Fresh run: apply the schedule's initial target (one-shot at the full
-        # sparsity unless --sparseprop-start-frac ramps it in).
+        # Fresh run: apply the schedule's initial target (one-shot at the full sparsity unless --sparseprop-start-frac ramps it in).
         achieved = sparse_schedule.apply(model, 0)
         if achieved is not None:
             print0(
@@ -278,11 +268,7 @@ def build_base_model(args, vocab_size, device, ddp_rank, sparse_schedule):
                 f"(scope={sparse_schedule.scope}, magnitude criterion)"
             )
         else:
-            # `inject_sparseprop_layers` above already masked every layer, so this
-            # is the common case, not an error: the schedule declines to prune only
-            # when it has no event at step 0. Reporting the injected state anyway,
-            # because a run that silently masked 75% of its weights is not something
-            # anyone should have to infer from the absence of a log line.
+            # `inject_sparseprop_layers` above already masked every layer, so this is the common case, not an error: the schedule declines to prune only when it has no event at step 0. Reporting the injected state anyway, because a run that silently masked 75% of its weights is not something anyone should have to infer from the absence of a log line.
             from nanochat.models.quant.pruning import collect as _collect_sparse_layers
 
             masked = _collect_sparse_layers(model)
@@ -324,8 +310,7 @@ def convert_to_fp8(model, args, device_type, lcqat_active):
         if device_type != "cuda":
             print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
         else:
-            # our custom fp8 is simpler than torchao, written for exact API compatibility
-            # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+            # our custom fp8 is simpler than torchao, written for exact API compatibility from torchao.float8 import Float8LinearConfig, convert_to_float8_training
             import torch.nn as nn
 
             from nanochat.models.fp8 import (
@@ -380,8 +365,7 @@ def disable_fp8(model):
         yield  # No FP8 modules, nothing to do
         return
 
-    # Swap Float8Linear -> Linear (our custom class that casts weights to match input dtype)
-    # Use device="meta" to avoid VRAM spike - the weight tensor will be swapped in afterwards
+    # Swap Float8Linear -> Linear (our custom class that casts weights to match input dtype) Use device="meta" to avoid VRAM spike - the weight tensor will be swapped in afterwards
     for parent, attr_name, fp8_module in fp8_locations:
         linear = Linear(
             fp8_module.in_features,
@@ -427,8 +411,7 @@ def build_engine(
             "DiffusionBlocks disabled (--db-blocks<=0): plain next-token LM training, "
             "every layer trains every step"
         )
-        # These are all denoiser-only concepts. Rejecting rather than ignoring them
-        # keeps a flag the user typed from looking like it did something.
+        # These are all denoiser-only concepts. Rejecting rather than ignoring them keeps a flag the user typed from looking like it did something.
         for flag, value in (
             ("--db-objective", args.db_objective),
             ("--db-block-sampling", args.db_block_sampling),
@@ -453,10 +436,7 @@ def build_engine(
                 "blocks to condition on. Drop it or set --db-blocks to a positive count."
             )
 
-    # device/dtype: the engine owns adapters + denoise heads, which are created here.
-    # Without them they land on CPU while their siblings are on `device`, and since
-    # they are in the optimizer but never see a forward on that device, their .grad
-    # stays None and AdamW silently skips them forever.
+    # device/dtype: the engine owns adapters + denoise heads, which are created here. Without them they land on CPU while their siblings are on `device`, and since they are in the optimizer but never see a forward on that device, their .grad stays None and AdamW silently skips them forever.
     engine = None
     float_twin, n_twin_stripped = (None, 0)
     if use_diffusion_blocks:
@@ -477,18 +457,12 @@ def build_engine(
             f"Initialized DiffusionBlocks Engine with {num_db_blocks} independent blocks"
         )
 
-        # PRD: "the only training method that exists must use it" — when LC-QAT is
-        # enabled, retrofit the engine-owned Linear layers (adapters + denoise heads)
-        # too, so the whole training pipeline is LC-QAT.
+        # PRD: "the only training method that exists must use it" — when LC-QAT is enabled, retrofit the engine-owned Linear layers (adapters + denoise heads) too, so the whole training pipeline is LC-QAT.
         if lcqat_active is not None:
             n_lcqat = engine.apply_lcqat(lcqat_active)
             print0(f"LC-QAT retrofitted {n_lcqat} diffusion-engine Linear layers")
 
-        # Sigma-conditioned activation codebooks (PRD 3.2). Opt-in: a DiffusionBlocks
-        # engine's blocks train on disjoint noise ranges, so one activation codebook has
-        # to span all of them, and most of its levels are spent on values that never
-        # occur. Two mechanisms with very different costs, so both are opt-in and the
-        # default recipe is untouched.
+        # Sigma-conditioned activation codebooks (PRD 3.2). Opt-in: a DiffusionBlocks engine's blocks train on disjoint noise ranges, so one activation codebook has to span all of them, and most of its levels are spent on values that never occur. Two mechanisms with very different costs, so both are opt-in and the default recipe is untouched.
         if args.db_sigma_codebook:
             num_anchors = args.db_sigma_anchors or num_db_blocks
             n_conditioned = install_sigma_codebooks(
@@ -500,20 +474,14 @@ def build_engine(
                 + (f", {num_anchors} anchors" if num_anchors > 1 else "")
             )
 
-        # SparseProp on the engine-owned layers (adapters + per-block denoise heads).
-        # The base transformer is handled separately: on a fresh run by the injection
-        # below, and on a resume by the pre-load injection in the resume branch, which
-        # has to happen before load_state_dict can see the checkpoint's mask buffers.
+        # SparseProp on the engine-owned layers (adapters + per-block denoise heads). The base transformer is handled separately: on a fresh run by the injection below, and on a resume by the pre-load injection in the resume branch, which has to happen before load_state_dict can see the checkpoint's mask buffers.
         if args.sparseprop:
             n_sparse = engine.apply_sparseprop(
                 sparsity=args.sparseprop_sparsity,
                 with_lcqat=lcqat_active is not None,
             )
             print0(f"SparseProp injected {n_sparse} sparse Linear layers")
-            # `inject_sparseprop_layers` places a per-layer magnitude mask as a
-            # placeholder. The base transformer's masks were already set above; this
-            # only touches the engine-owned layers (adapters + per-block denoise heads),
-            # and on a resume it is skipped so the checkpoint's masks survive.
+            # `inject_sparseprop_layers` places a per-layer magnitude mask as a placeholder. The base transformer's masks were already set above; this only touches the engine-owned layers (adapters + per-block denoise heads), and on a resume it is skipped so the checkpoint's masks survive.
             if not resuming:
                 engine_achieved = sparse_schedule.apply(engine, 0)
                 if engine_achieved is not None:
@@ -522,17 +490,12 @@ def build_engine(
                         f"sparsity (scope={sparse_schedule.scope})"
                     )
 
-        # Denoiser distillation teacher (PRD 3.1, EDM form). Taken *here*, before the
-        # retrofits below, so on a fresh run the copy is already float: LC-QAT codebooks
-        # and SparseProp sparsity are exactly what --kd-denoiser-alpha measures.
+        # Denoiser distillation teacher (PRD 3.1, EDM form). Taken *here*, before the retrofits below, so on a fresh run the copy is already float: LC-QAT codebooks and SparseProp sparsity are exactly what --kd-denoiser-alpha measures.
         if args.kd_denoiser_alpha > 0.0:
             float_twin, n_twin_stripped = build_denoiser_teacher(
                 engine, args.kd_denoiser_alpha, args.db_objective
             )
-            # w6 annotates the twin as _ModuleTree (a Protocol) because
-            # nanochat/models/ cannot import nanochat/training/; at
-            # runtime it is a deepcopy of the engine, i.e. a real
-            # DiffusionBlockEngine, which is what EngineSetup stores.
+            # w6 annotates the twin as _ModuleTree (a Protocol) because nanochat/models/ cannot import nanochat/training/; at runtime it is a deepcopy of the engine, i.e. a real DiffusionBlockEngine, which is what EngineSetup stores.
             float_twin = typing.cast(DiffusionBlockEngine, float_twin)
             print0(
                 f"KD denoiser twin: float copy of the engine "
@@ -566,9 +529,7 @@ def assemble_run_config(args, model, model_config, vocab_size):
     num_flops_per_token = model.estimate_flops()
     print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-    # 1) Use scaling laws to determine the optimal training horizon in tokens
-    # The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
-    # We've already initialized the model so we have Params. Optimal Tokens is now target-param-data-ratio * Params
+    # 1) Use scaling laws to determine the optimal training horizon in tokens The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis). We've already initialized the model so we have Params. Optimal Tokens is now target-param-data-ratio * Params
     num_scaling_params = get_scaling_params(model)
     target_tokens = int(
         args.target_param_data_ratio * num_scaling_params
@@ -581,9 +542,7 @@ def assemble_run_config(args, model, model_config, vocab_size):
     )  # compute-optimal d12 training horizon in tokens (measured empirically)
     B_REF = 2**19  # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
-    # 2) Now that we have the token horizon, we can calculate the optimal batch size
-    # We follow the Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738
-    # The optimal batch size grows as approximately D^0.383, so e.g. if D doubles from d12 to d24, B should grow by 2^0.383 ≈ 1.3x.
+    # 2) Now that we have the token horizon, we can calculate the optimal batch size We follow the Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738 The optimal batch size grows as approximately D^0.383, so e.g. if D doubles from d12 to d24, B should grow by 2^0.383 ≈ 1.3x.
     total_batch_size = args.total_batch_size  # user-provided override is possible
     if total_batch_size == -1:
         batch_size_ratio = target_tokens / D_REF
@@ -593,9 +552,7 @@ def assemble_run_config(args, model, model_config, vocab_size):
         )  # clamp to nearest power of 2 for efficiency
         print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
 
-    # 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
-    # AdamW LRs scale with 1/sqrt(n_embd), tuned at 768 (same recipe the LC-QAT
-    # optimizer port carries over).
+    # 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates) AdamW LRs scale with 1/sqrt(n_embd), tuned at 768 (same recipe the LC-QAT optimizer port carries over).
     dmodel_lr_scale = (model_config.n_embd / 768) ** -0.5
     print0(
         f"Scaling the AdamW LRs by 1/sqrt({model_config.n_embd}/768) = {dmodel_lr_scale:.6f}"
@@ -610,12 +567,7 @@ def assemble_run_config(args, model, model_config, vocab_size):
             f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})"
         )
 
-    # 4) Knowing the batch size and the token horizon, we can now calculate the appropriate weight decay scaling
-    # We adopt the T_epoch framework from https://arxiv.org/abs/2405.13698
-    # Central idea of the paper is that T_epoch = B/(η·λ·D) should remain constant.
-    # Above, we used learning rate scaling η ∝ √(B/B_ref). So it's a matter of ~10 lines of math to derive that to keep T_epoch constant, we need:
-    # λ = λ_ref · √(B/B_ref) · (D_ref/D)
-    # These papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
+    # 4) Knowing the batch size and the token horizon, we can now calculate the appropriate weight decay scaling We adopt the T_epoch framework from https://arxiv.org/abs/2405.13698 Central idea of the paper is that T_epoch = B/(η·λ·D) should remain constant. Above, we used learning rate scaling η ∝ √(B/B_ref). So it's a matter of ~10 lines of math to derive that to keep T_epoch constant, we need: λ = λ_ref · √(B/B_ref) · (D_ref/D) These papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
     weight_decay_scaled = (
         args.weight_decay
         * math.sqrt(total_batch_size / B_REF)
@@ -670,9 +622,7 @@ def build_optimizer(
         scalar_lr=args.scalar_lr,
         dmodel_lr_scale=run_config.dmodel_lr_scale,
     )
-    # Fail here rather than shipping a run where a whole role silently never trains
-    # (which is what happened to --embedding-lr/--unembedding-lr/--scalar-lr while
-    # the group builder emitted only matrix + codebook).
+    # Fail here rather than shipping a run where a whole role silently never trains (which is what happened to --embedding-lr/--unembedding-lr/--scalar-lr while the group builder emitted only matrix + codebook).
     verify_partition(trainable_root, param_groups)
     optimizer = make_optimizer(param_groups, device_type, args)
 
@@ -711,14 +661,13 @@ def make_optimizer(param_groups, device_type: str, args):
         print0("Optimizer: torch.optim.AdamW (baseline, --optimizer adamw)")
         optimizer = torch.optim.AdamW(param_groups, fused=(device_type == "cpu"))
     elif optimizer_kind == "mezo":
-        # Zeroth-order default: the step materializes no
-        # gradient, so it is memory-flat in batch size.
+        # Zeroth-order default: the step materializes no gradient, so it is memory-flat in batch size.
         print0(
             "Optimizer: MeZo_MinExpLstm_Optimizer "
             f"(epsilon={getattr(args, 'mezo_epsilon', 1e-3)}, "
             f"K={getattr(args, 'mezo_K', 4)}, "
-            f"backend={getattr(args, 'mezo_backend', 'cpu')})"
             f"M={getattr(args, 'mezo_probes', 1)}, "
+            f"backend={getattr(args, 'mezo_backend', 'cpu')})"
         )
         optimizer = MeZo_MinExpLstm_Optimizer(
             param_groups,
@@ -730,12 +679,12 @@ def make_optimizer(param_groups, device_type: str, args):
             epsilon=getattr(args, "mezo_epsilon", 1e-3),
             K=getattr(args, "mezo_K", 4),
             M=getattr(args, "mezo_probes", 1),
-            qat_4bit=getattr(args, "qat_4bit", False),
             delta_q=getattr(args, "mezo_delta_q", 0.0625),
             a_base=getattr(args, "mezo_a_base", 1.5),
             a_min=getattr(args, "mezo_a_min", 0.1),
             lr_max=getattr(args, "mezo_lr_max", None),
             backend=getattr(args, "mezo_backend", "cpu"),
+            qat_4bit=getattr(args, "qat_4bit", False),
         )
     else:
         print0(
@@ -812,10 +761,7 @@ def restore_optimizer_momentum(
         optimizer.load_state_dict(optimizer_data)
         return True
     except ValueError:
-        # Expected, not exceptional: a state saved under a different param
-        # grouping cannot be loaded positionally, and that is one of the two
-        # cases this function exists to handle. Both recovery paths below check
-        # the parameter counts before any momentum is copied.
+        # Expected, not exceptional: a state saved under a different param grouping cannot be loaded positionally, and that is one of the two cases this function exists to handle. Both recovery paths below check the parameter counts before any momentum is copied.
         pass
 
     saved_param_count = sum(
@@ -852,24 +798,9 @@ def build_kd_loss_fn(args, device, lcqat_active):
     a separate checkpoint so it stays float (no codebook deltas)."""
     kd_loss_fn: KDLoss | None = None
     if args.kd_alpha > 0.0:
-        # The objective conflict is checked FIRST, before the teacher prerequisite.
-        # Both are real and both must block the run, but they are not equally
-        # informative: "kd-alpha is incompatible with edm" is a statement about the
-        # two flags the user actually typed, whereas "requires --kd-teacher-source"
-        # asks for a third flag they may not have been thinking about. Checking the
-        # prerequisite first masks the incompatibility behind an unrelated error --
-        # which is exactly what happened: `--kd-alpha 0.5 --db-objective edm`
-        # reported only the missing teacher, and a user who then supplied one was
-        # told about the objective conflict only on the next run.
-        #
-        # It also avoids a pointless checkpoint load for a configuration that is
-        # going to exit regardless.
+        # The objective conflict is checked FIRST, before the teacher prerequisite. Both are real and both must block the run, but they are not equally informative: "kd-alpha is incompatible with edm" is a statement about the two flags the user actually typed, whereas "requires --kd-teacher-source" asks for a third flag they may not have been thinking about. Checking the prerequisite first masks the incompatibility behind an unrelated error -- which is exactly what happened: `--kd-alpha 0.5 --db-objective edm` reported only the missing teacher, and a user who then supplied one was told about the objective conflict only on the next run. It also avoids a pointless checkpoint load for a configuration that is going to exit regardless.
         if args.db_objective == "edm":
-            # Fail loudly at startup. The logit-KD loss is a cross-entropy against
-            # the teacher's softmax over tokens; the EDM objective predicts a
-            # denoised embedding and has no logits, so the two cannot be combined.
-            # Silently skipping would look like KD "not helping" rather than "never
-            # applied".
+            # Fail loudly at startup. The logit-KD loss is a cross-entropy against the teacher's softmax over tokens; the EDM objective predicts a denoised embedding and has no logits, so the two cannot be combined. Silently skipping would look like KD "not helping" rather than "never applied".
             raise SystemExit(
                 "--kd-alpha > 0 (logit KL against an FP teacher) is incompatible with "
                 "--db-objective edm, which predicts denoised embeddings rather than "
@@ -928,13 +859,11 @@ def build_efqat_freezer(args, model, engine, use_diffusion_blocks, lcqat_active)
             f"EfQAT selective freezing enabled: freezing after {args.efqat_freeze_after} steps "
             f"(middle {args.efqat_freeze_frac:.0%} of {len(efqat_freezer.model.transformer.h)} layers)"
         )
-        # The engine consults the freezer before enabling a block, so the freeze
-        # survives; previously `_activate_block` re-enabled everything each step.
+        # The engine consults the freezer before enabling a block, so the freeze survives; previously `_activate_block` re-enabled everything each step.
         if use_diffusion_blocks:
             engine.set_freezer(efqat_freezer)
         else:
-            # No `_activate_block` runs in LM mode, so nothing would otherwise ever
-            # re-enable the frozen band and the veto has to be applied here.
+            # No `_activate_block` runs in LM mode, so nothing would otherwise ever re-enable the frozen band and the veto has to be applied here.
             efqat_freezer.freeze()
             n_frozen_now = sum(1 for p in model.parameters() if not p.requires_grad)
             print0(
@@ -980,9 +909,7 @@ def build_latch_freezer(
             f"EfQAT per-block latch enabled: blocks {efqat_latch_targets} freeze "
             f"permanently at step {max(args.efqat_latch_after, 0)}"
         )
-        # Latches are not recoverable from the state_dict -- a frozen parameter
-        # looks exactly like a converged one -- so a resumed run would silently
-        # start training a block the previous run had retired.
+        # Latches are not recoverable from the state_dict -- a frozen parameter looks exactly like a converged one -- so a resumed run would silently start training a block the previous run had retired.
         if resuming and meta_data:
             block_latch_freezer.load_metadata(meta_data.get("efqat_latch"))
     if block_latch_freezer is not None:

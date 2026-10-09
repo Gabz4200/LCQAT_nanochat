@@ -207,6 +207,32 @@ def add_db_args(parser: argparse.ArgumentParser) -> None:
             "silently falling back."
         ),
     )
+    parser.add_argument(
+        "--db-block-execution",
+        type=str,
+        default="sequential",
+        choices=["sequential", "parallel"],
+        help=(
+            "how diffusion blocks train within one step. 'sequential' "
+            "(default) samples ONE block per step and trains only its "
+            "L/B layers -- the B-fold activation-memory saving that is "
+            "DiffusionBlocks' reason to exist, so this is the right "
+            "choice under a first-order optimizer or on a "
+            "memory-bound host. 'parallel' runs EVERY block's denoiser "
+            "concurrently over the same [clean | noisy] input and sums "
+            "their EDM losses, so all B blocks receive a gradient "
+            "signal each step instead of 1/B. That keeps every block's "
+            "graph live at once (activation memory O(L), not O(L/B)), "
+            "so it is a memory-traffic trade: only safe under MeZO, "
+            "whose SPSA estimate consumes the loss VALUE and never "
+            "backprops the positive-point graph -- the cost is one "
+            "transient forward, not a persistent graph. On CPU the "
+            "concurrent blocks overlap because torch releases the GIL "
+            "inside matmuls, so compute is faster too. Pick "
+            "'parallel' when memory traffic (not peak memory) is the "
+            "bottleneck and the optimizer is MeZO."
+        ),
+    )
 
 
 class EquiProbabilityPartitioner:
@@ -1586,8 +1612,7 @@ class DiffusionBlockEngine:
                 sigma_next = step_sigmas[s + 1]
                 delta_sigma = sigma_curr - sigma_next
 
-                # Block ownership routes through the partitioner (single owner):
-                # block 0 = earliest layers = highest noise (paper Fig.6/App.C).
+                # Block ownership routes through the partitioner (single owner): block 0 = earliest layers = highest noise (paper Fig.6/App.C).
                 b_idx = self.partitioner.block_for_sigma(float(sigma_curr))
 
                 c_in, _, _ = edm_preconditioning(

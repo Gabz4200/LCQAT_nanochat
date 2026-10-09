@@ -459,18 +459,29 @@ def train_loop(ctx):
                 else:
                     loss = ctx.model(x, targets=y, attn_mask=train_attn_mask)
             elif args.db_objective == "edm":
-                # `block_idx=None` under --db-block-sampling micro, which redraws
-                # per micro-step (the ablation arm).
-                loss, sigma = ctx.engine.denoise_step(
-                    x,
-                    block_idx=block_idx,
-                    overlap=args.db_overlap,
-                    attn_mask=train_attn_mask,
-                    clean=clean,
-                    backend=args.db_denoise_backend,
-                    aux_lm_weight=args.db_aux_lm_weight,
-                    targets=y,
-                )
+                # `block_idx=None` under --db-block-sampling micro, which redraws per micro-step (the ablation arm).
+                if getattr(args, "db_block_execution", "sequential") == "parallel":
+                    # Every block's denoiser runs concurrently over the same `[clean | noisy]` input and the per-block EDM losses sum into one scalar. MeZO consumes only the loss VALUE (its SPSA estimate never backprops the positive-point graph), so the B-block activation cost is one transient forward, not a persistent graph -- which is why this path is gated on the flag and recommended under --optimizer mezo.
+                    loss, _sigmas = ctx.engine.denoise_step_parallel(
+                        x,
+                        overlap=args.db_overlap,
+                        attn_mask=train_attn_mask,
+                        clean=clean,
+                        backend=args.db_denoise_backend,
+                        aux_lm_weight=args.db_aux_lm_weight,
+                        targets=y,
+                    )
+                else:
+                    loss, _sigma = ctx.engine.denoise_step(
+                        x,
+                        block_idx=block_idx,
+                        overlap=args.db_overlap,
+                        attn_mask=train_attn_mask,
+                        clean=clean,
+                        backend=args.db_denoise_backend,
+                        aux_lm_weight=args.db_aux_lm_weight,
+                        targets=y,
+                    )
                 if ctx.engine.distiller is not None:
                     step_kd_logged = step_kd_logged + float(ctx.engine.last_kd_loss)
                 if args.db_aux_lm_weight > 0:

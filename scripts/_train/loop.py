@@ -566,6 +566,17 @@ def train_loop(ctx):
                     loss_neg = ctx.model(x, targets=y, attn_mask=train_attn_mask)
                 mezo_opt.perturb(step, scaling=1.0)
                 mezo_opt.stage_mezo_estimate(step, train_loss, loss_neg)
+                # The positive-point forward built a full computation graph (every block's hidden state through lm_head under DARD, plus the EDM term). MeZO uses only the loss VALUE, so the graph is dead weight: MeZO never backprops it. The negative `denoise_step` above already overwrote `last_block_logits` with no-graph tensors (no_grad), but the positive `loss`/`aux` graphs and any per-block logits the engine still holds must be released here, or they stay pinned until the next step's forward -- on a memory-bound host that compounds into the slowdown a long MeZO run otherwise hits. `train_loss` is detached (not deleted): the log line after the micro-step loop reads it, and a `del` would leave it unbound for that reader.
+                del loss, loss_neg
+                train_loss = train_loss.detach()
+                if d_block_logits is not None:
+                    d_block_logits = None
+                if d_logits is not None:
+                    d_logits = None
+                # Drop the engine's published per-block logits: they carry the positive-point graph and the loop owns the balancing, not the engine, so nothing downstream reads them after `stage_mezo_estimate`.
+                if ctx.use_diffusion_blocks and ctx.engine is not None:
+                    ctx.engine.last_block_logits = None
+                    ctx.engine.last_dard_logits = None
             else:
                 # Gradient path (every optimizer but MeZO,
                 # or a MeZO micro-step past the first, which

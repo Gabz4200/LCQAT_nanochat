@@ -140,15 +140,7 @@ def save_step_checkpoint(
     save_checkpoint(
         ctx.checkpoint_dir,
         step,
-        # engine.state_dict(), not orig_model.state_dict(): the engine owns
-        # db_adapters.* / db_denoise_heads.* on top of the bare GPT, and meta
-        # below declares meta["db"]. Saving the bare model writes a
-        # checkpoint that claims a diffusion engine but carries none of its
-        # parameters, so every resume silently reloads zero adapters/heads.
-        # engine.state_dict() when DiffusionBlocks is on, because the engine
-        # owns db_adapters.* / db_denoise_heads.* on top of the bare GPT.
-        # In LM mode there is no engine and the bare model IS the complete
-        # trainable tree.
+        # engine.state_dict(), not orig_model.state_dict(): the engine owns db_adapters.* / db_denoise_heads.* on top of the bare GPT, and meta below declares meta["db"]. Saving the bare model writes a checkpoint that claims a diffusion engine but carries none of its parameters, so every resume silently reloads zero adapters/heads. engine.state_dict() when DiffusionBlocks is on, because the engine owns db_adapters.* / db_denoise_heads.* on top of the bare GPT. In LM mode there is no engine and the bare model IS the complete trainable tree.
         (ctx.engine if ctx.use_diffusion_blocks else ctx.model).state_dict(),
         ctx.optimizer.state_dict(),  # optimizer state
         {  # metadata saved as json
@@ -159,29 +151,17 @@ def save_step_checkpoint(
             "lcqat": ctx.lcqat_active.as_dict()
             if ctx.lcqat_active is not None
             else None,
-            # KD anchoring state. Two independent, incompatible-in-practice
-            # anchors: `alpha` is the logit KL (CE objective), `denoiser_alpha`
-            # is the float-twin denoiser anchor (EDM objective). Both default
-            # to 0.0 = off, and both are recorded so a resume can see that a
-            # run's objective differs from the default rather than silently
-            # changing it.
+            # KD anchoring state. Two independent, incompatible-in-practice anchors: `alpha` is the logit KL (CE objective), `denoiser_alpha` is the float-twin denoiser anchor (EDM objective). Both default to 0.0 = off, and both are recorded so a resume can see that a run's objective differs from the default rather than silently changing it.
             "kd": {
                 "alpha": args.kd_alpha,
                 "tau": args.kd_temperature,
                 "denoiser_alpha": args.kd_denoiser_alpha,
             },
-            # None, not a zeroed dict: `build_model` gates the whole
-            # DiffusionBlocks reconstruction on meta["db"] being present, so
-            # an LM-mode checkpoint loads as a bare GPT with a strict
-            # load and no engine adapters to be silently zero.
+            # None, not a zeroed dict: `build_model` gates the whole DiffusionBlocks reconstruction on meta["db"] being present, so an LM-mode checkpoint loads as a bare GPT with a strict load and no engine adapters to be silently zero.
             "db": (
                 ctx.engine.partitioner.to_meta() if ctx.use_diffusion_blocks else None
             ),
-            # EfQAT per-block latch: which blocks have been permanently
-            # retired. Metadata only -- the tensors themselves are already
-            # in engine.state_dict() -- but the freeze decision is not
-            # recoverable from tensor values, so it has to be written out
-            # or a resume silently restarts training a converged block.
+            # EfQAT per-block latch: which blocks have been permanently retired. Metadata only -- the tensors themselves are already in engine.state_dict() -- but the freeze decision is not recoverable from tensor values, so it has to be written out or a resume silently restarts training a converged block.
             "efqat_latch": (
                 ctx.engine.freezer_metadata() if ctx.use_diffusion_blocks else None
             ),
@@ -189,10 +169,7 @@ def save_step_checkpoint(
             "sparseprop": ctx.sparse_schedule.to_meta(
                 args.sparseprop, args.sparseprop_sparsity
             ),
-            # DARD provenance. The tensors (rule CSR matrices + balancer EMA)
-            # go to a sidecar `.pt`, because this dict is `json.dump`ed and
-            # cannot hold them. What lands in the JSON is only what a resume
-            # needs to decide whether the sidecar applies.
+            # DARD provenance. The tensors (rule CSR matrices + balancer EMA) go to a sidecar `.pt`, because this dict is `json.dump`ed and cannot hold them. What lands in the JSON is only what a resume needs to decide whether the sidecar applies.
             "dard": (
                 {
                     "has_sidecar": True,
@@ -218,11 +195,7 @@ def save_step_checkpoint(
         },
         rank=ctx.ddp_rank,
     )
-    # DARD's tensors go in a sidecar next to the checkpoint. They cannot ride
-    # in the meta dict (that is `json.dump`ed) and they are not part of
-    # engine.state_dict() (the DARD modules are optimizer-side attachments).
-    # Without this file a resume re-mines from whichever batch it sees next and
-    # silently enforces different rules than the loss curve was measured under.
+    # DARD's tensors go in a sidecar next to the checkpoint. They cannot ride in the meta dict (that is `json.dump`ed) and they are not part of engine.state_dict() (the DARD modules are optimizer-side attachments). Without this file a resume re-mines from whichever batch it sees next and silently enforces different rules than the loss curve was measured under.
     if ctx.dard_loss_fn is not None and ctx.dard_balancer is not None:
         save_dard_sidecar(
             ctx.checkpoint_dir, step, ctx.dard_loss_fn, ctx.dard_balancer, ctx.ddp_rank
@@ -263,8 +236,7 @@ def train_loop(ctx):
 
     grad_accum_steps = compute_grad_accum_steps(ctx)
 
-    # Assigned inside the grad-accumulation loop, which runs every
-    # iteration; initialized so the read after it is not unbound.
+    # Assigned inside the grad-accumulation loop, which runs every iteration; initialized so the read after it is not unbound.
     train_loss = torch.tensor(float("nan"))
 
     # Loop state (variables updated by the training loop)
@@ -284,12 +256,7 @@ def train_loop(ctx):
 
     x, y = ctx.x, ctx.y
 
-    # Packed batches arrive as document boundaries; `block_diagonal_mask` turns them
-    # into a causal + same-document mask so a document cannot attend across a
-    # neighbour's tokens. `denoise_step` calls the transformer blocks directly, so
-    # the mask has to be handed to it explicitly (the CE path threads it through
-    # GPT.forward). None means "no packing": the model's attention is already
-    # causal, so a full causal mask would be a no-op.
+    # Packed batches arrive as document boundaries; `block_diagonal_mask` turns them into a causal + same-document mask so a document cannot attend across a neighbour's tokens. `denoise_step` calls the transformer blocks directly, so the mask has to be handed to it explicitly (the CE path threads it through GPT.forward). None means "no packing": the model's attention is already causal, so a full causal mask would be a no-op.
     train_attn_mask: torch.Tensor | None = None
 
     while True:
@@ -308,16 +275,13 @@ def train_loop(ctx):
                 min_val_bpb,
             )
 
-        # once in a while: estimate the CORE metric (all ranks participate)
-        # use the original uncompiled model because the inputs keep changing shape
-        # disable FP8 for evaluation to use BF16 for more consistent/accurate results
+        # once in a while: estimate the CORE metric (all ranks participate) use the original uncompiled model because the inputs keep changing shape disable FP8 for evaluation to use BF16 for more consistent/accurate results
         if args.core_metric_every > 0 and (
             last_step or (step > 0 and step % args.core_metric_every == 0)
         ):
             run_core_metric(ctx.eval_ctx, step, flops_so_far)
 
-        # once in a while: sample from the model (only on master process)
-        # use the original uncompiled model because the inputs keep changing shape
+        # once in a while: sample from the model (only on master process) use the original uncompiled model because the inputs keep changing shape
         if (
             args.sample_every > 0
             and ctx.master_process
@@ -345,26 +309,17 @@ def train_loop(ctx):
         if last_step:
             break
 
-        # ---------------------------------------------------------------------
-        # single training step
-        # evaluate the gradient
+        # --------------------------------------------------------------------- single training step evaluate the gradient
         ctx.synchronize()
         t0 = time.time()
-        # EfQAT: drive the selective freezer from the global step (PRD 3.2), then
-        # hand it to the engine as the single `requires_grad` arbiter. Without the
-        # handoff the engine re-enables every transformer parameter on the next
-        # block activation, silently undoing the freeze.
+        # EfQAT: drive the selective freezer from the global step (PRD 3.2), then hand it to the engine as the single `requires_grad` arbiter. Without the handoff the engine re-enables every transformer parameter on the next block activation, silently undoing the freeze.
         if ctx.efqat_freezer is not None:
             if ctx.efqat_freezer.update(step):
                 n_frozen = sum(
                     1 for p in ctx.trainable_root.parameters() if not p.requires_grad
                 )
                 print0(f"EfQAT froze {n_frozen} parameters at step {step}")
-        # EfQAT per-block latch (PRD 3.2). Fires before the forward, so the retired
-        # block is already frozen in the very step the latch lands; latching after
-        # the forward would let one more update through. `>=` rather than `==` so a
-        # resumed run (which starts above the threshold) still latches, and
-        # `latch_blocks` is idempotent so the re-fire is free.
+        # EfQAT per-block latch (PRD 3.2). Fires before the forward, so the retired block is already frozen in the very step the latch lands; latching after the forward would let one more update through. `>=` rather than `==` so a resumed run (which starts above the threshold) still latches, and `latch_blocks` is idempotent so the re-fire is free.
         if ctx.block_latch_freezer is not None and step >= max(
             args.efqat_latch_after, 0
         ):
@@ -375,17 +330,11 @@ def train_loop(ctx):
                     f"{step} ({n_new} parameters frozen; total latched: "
                     f"{ctx.block_latch_freezer.latched_blocks()})"
                 )
-        # Gradual magnitude pruning. Runs BEFORE the forward so the mask and the
-        # forward agree in the same step, and so the weights it prunes are the ones
-        # the optimizer is about to write into. Mask changes are monotone (a pruned
-        # weight is exactly 0.0, so |W| == 0 and it can never be re-selected), which
-        # is what makes a resumed ramp safe.
+        # Gradual magnitude pruning. Runs BEFORE the forward so the mask and the forward agree in the same step, and so the weights it prunes are the ones the optimizer is about to write into. Mask changes are monotone (a pruned weight is exactly 0.0, so |W| == 0 and it can never be re-selected), which is what makes a resumed ramp safe.
         if args.sparseprop:
             pruned = ctx.sparse_schedule.apply(ctx.trainable_root, step)
             if pruned is not None:
-                # `ctx.trainable_root`, matching the `apply` above: in LM mode
-                # (`--db-blocks=0`) `ctx.engine` is None, and collecting over it
-                # raises instead of reporting a count.
+                # `ctx.trainable_root`, matching the `apply` above: in LM mode (`--db-blocks=0`) `ctx.engine` is None, and collecting over it raises instead of reporting a count.
                 n_sparse_above = len(
                     ctx.sparse_schedule.layers_above_threshold(ctx.trainable_root)
                 )
@@ -394,10 +343,7 @@ def train_loop(ctx):
                     f"{n_sparse_above} layers past the "
                     f"{ctx.sparse_schedule.dense_threshold:.0%} sparse-kernel threshold"
                 )
-        # The block is drawn ONCE per optimizer step, not once per micro-step.
-        # Accumulating gradients from several blocks into one update would preserve
-        # the memory saving but destroy the noise-range specialization that
-        # DiffusionBlocks depends on.
+        # The block is drawn ONCE per optimizer step, not once per micro-step. Accumulating gradients from several blocks into one update would preserve the memory saving but destroy the noise-range specialization that DiffusionBlocks depends on.
         block_idx = (
             ctx.engine.sample_block()
             if ctx.use_diffusion_blocks
@@ -405,50 +351,29 @@ def train_loop(ctx):
             and args.db_block_sampling == "step"
             else None
         )
-        # Hoisted out of the micro-step loop: denoise_step reuses the same (x, y)
-        # across grad_accum_steps, so the embedding lookup + L2 normalization would
-        # otherwise be redone once per micro-step.
+        # Hoisted out of the micro-step loop: denoise_step reuses the same (x, y) across grad_accum_steps, so the embedding lookup + L2 normalization would otherwise be redone once per micro-step.
         clean = None
         if ctx.use_diffusion_blocks and args.db_objective == "edm":
             with torch.no_grad():
                 clean = F.normalize(ctx.engine.model.transformer.wte(x).float(), dim=-1)
 
-        # Reported alongside the total so an enabled anchor is observable in the
-        # log: a KD term that stays at 0.0 for a whole run means the twin is not
-        # actually being compared against, not that the gap vanished.
+        # Reported alongside the total so an enabled anchor is observable in the log: a KD term that stays at 0.0 for a whole run means the twin is not actually being compared against, not that the gap vanished.
         step_kd_logged = 0.0
-        # Reported alongside the total for the same reason as the KD term: the
-        # balanced loss is normalized to ~1 by construction, so the *raw* rule
-        # penalty is the only thing in the log that shows whether DARD is still
-        # doing anything. A run that silently mined zero rules logs 0.0 here
-        # forever and its balanced loss looks perfectly healthy.
+        # Reported alongside the total for the same reason as the KD term: the balanced loss is normalized to ~1 by construction, so the *raw* rule penalty is the only thing in the log that shows whether DARD is still doing anything. A run that silently mined zero rules logs 0.0 here forever and its balanced loss looks perfectly healthy.
         step_dard_logged = 0.0
-        # Auxiliary per-block next-token loss (EDM): the only observable of
-        # whether `lm_head` is actually training under the EDM objective, since
-        # the EDM term itself never touches the head. 0.0 when
-        # --db-aux-lm-weight is 0.
+        # Auxiliary per-block next-token loss (EDM): the only observable of whether `lm_head` is actually training under the EDM objective, since the EDM term itself never touches the head. 0.0 when --db-aux-lm-weight is 0.
         step_aux_lm_logged = 0.0
 
         for micro_step in range(grad_accum_steps):
-            # Zeroth-order MeZO: apply the seed-replayed perturbation
-            # before the forward pass so the loss below is the
-            # positive-point loss. The dual forward runs once per
-            # optimizer step (micro_step == 0): MeZO materializes no
-            # gradient, so later micro-steps only prefetch.
+            # Zeroth-order MeZO: apply the seed-replayed perturbation before the forward pass so the loss below is the positive-point loss. The dual forward runs once per optimizer step (micro_step == 0): MeZO materializes no gradient, so later micro-steps only prefetch.
             if getattr(args, "optimizer", "minexplstm") == "mezo" and micro_step == 0:
                 ctx.optimizer.perturb(step, scaling=1.0)
-            # DARD needs a vocabulary distribution. The CE and KD branches
-            # already hold `logits`; the two branches below do not, so
-            # `d_logits` is filled by the branch that can produce them and the
-            # penalty is evaluated once, after the branch, rather than inside
-            # each of the four.
+            # DARD needs a vocabulary distribution. The CE and KD branches already hold `logits`; the two branches below do not, so `d_logits` is filled by the branch that can produce them and the penalty is evaluated once, after the branch, rather than inside each of the four.
             d_logits = None
             d_block_logits = None
+            loss = None
             if not ctx.use_diffusion_blocks:
-                # Plain autoregressive LM training. `model` here is the LC-QAT
-                # (and possibly SparseProp) retrofitted GPT, so this is the
-                # conventional next-token objective over the same quantized model
-                # the DiffusionBlocks arms train, differing only in the objective.
+                # Plain autoregressive LM training. `model` here is the LC-QAT (and possibly SparseProp) retrofitted GPT, so this is the conventional next-token objective over the same quantized model the DiffusionBlocks arms train, differing only in the objective.
                 if ctx.dard_loss_fn is not None:
                     d_logits = ctx.model(x, targets=None, attn_mask=train_attn_mask)
                     loss = F.cross_entropy(
@@ -489,23 +414,14 @@ def train_loop(ctx):
                         ctx.engine.last_aux_lm_loss
                     )
                 if ctx.dard_loss_fn is not None:
-                    # The denoiser's own logits, from the same lm_head
-                    # projection the Euler sampler uses. Read out of the engine
-                    # rather than recomputed, so the penalty sees exactly the
-                    # distribution the denoiser step was trained on.
+                    # The denoiser's own logits, from the same lm_head projection the Euler sampler uses. Read out of the engine rather than recomputed, so the penalty sees exactly the distribution the denoiser step was trained on.
                     d_logits = ctx.engine.last_dard_logits
-                    # Sum the penalty over EVERY block's distribution, not just
-                    # the final one: each is that block's own hidden state
-                    # through the shared head, so the rules shape all blocks.
+                    # Sum the penalty over EVERY block's distribution, not just the final one: each is that block's own hidden state through the shared head, so the rules shape all blocks.
                     d_block_logits = ctx.engine.last_block_logits
             elif ctx.kd_loss_fn is not None:
-                # KD anchoring needs logits, so the CE objective asks for them
-                # explicitly (targets=None) and computes the CE term here.
-                # `model` is the bare GPT in both modes -- the engine wraps it, and in
-                # LM mode there is no engine at all.
+                # KD anchoring needs logits, so the CE objective asks for them explicitly (targets=None) and computes the CE term here. `model` is the bare GPT in both modes -- the engine wraps it, and in LM mode there is no engine at all.
                 student_logits = ctx.model(x, targets=None, attn_mask=train_attn_mask)
-                # Mirror GPT.forward's loss exactly: the dataloader already shifted
-                # y, so no extra shift here.
+                # Mirror GPT.forward's loss exactly: the dataloader already shifted y, so no extra shift here.
                 loss_ce = F.cross_entropy(
                     student_logits.reshape(-1, student_logits.size(-1)),
                     y.reshape(-1),
@@ -530,16 +446,9 @@ def train_loop(ctx):
                         x, y, block_idx=block_idx, attn_mask=train_attn_mask
                     )
             if d_logits is not None and ctx.dard_loss_fn is not None:
-                # `d_logits` carries the graph; so does `loss`, so the two terms
-                # are balanced *before* the single backward below rather than
-                # summed. Both stay differentiable through the same forward.
-                # When the engine published per-block distributions, the penalty
-                # is summed over them so every block is reached; otherwise it is
-                # the single distribution.
+                # `d_logits` carries the graph; so does `loss`, so the two terms are balanced *before* the single backward below rather than summed. Both stay differentiable through the same forward. When the engine published per-block distributions, the penalty is summed over them so every block is reached; otherwise it is the single distribution.
                 if d_block_logits:
-                    # `sum()` over a 1-element generator returns the element
-                    # itself rather than a tensor, so build the stack
-                    # explicitly and mean over it.
+                    # `sum()` over a 1-element generator returns the element itself rather than a tensor, so build the stack explicitly and mean over it.
                     aux = torch.stack(
                         [ctx.dard_loss_fn(v) for v in d_block_logits.values()]
                     ).mean()
@@ -551,19 +460,40 @@ def train_loop(ctx):
                 else:
                     loss = loss + aux
             train_loss = loss.detach()  # for logging
-            # Zeroth-order MeZO: the optimizer replaces the
-            # materialized gradient with a scalar SPSA
-            # estimate, so the step is a dual forward pass.
-            # `train_loss` above is the positive-point loss;
-            # the negative-point loss is a second forward
-            # with the perturbation moved to its negative side.
+            # Zeroth-order MeZO: the optimizer replaces the materialized gradient with a scalar SPSA estimate, so the step is a dual forward pass. `train_loss` above is the positive-point loss; the negative-point loss is a second forward with the perturbation moved to its negative side.
             if getattr(args, "optimizer", "minexplstm") == "mezo" and micro_step == 0:
-                # `perturb(seed, -2)` moves to the negative
-                # point, `perturb(seed, +1)` restores it.
+                # `perturb(seed, -2)` moves to the negative point, `perturb(seed, +1)` restores it.
                 mezo_opt = ctx.optimizer
                 mezo_opt.perturb(step, scaling=-2.0)
                 with torch.no_grad():
-                    loss_neg = ctx.model(x, targets=y, attn_mask=train_attn_mask)
+                    # The negative point must run the SAME forward the positive point did, so the two loss values are comparable (an SPSA estimate of the same objective). Under DiffusionBlocks the positive point is a `denoise_step`; the negative point is the same `denoise_step` under no_grad. Running a different forward (e.g. the engine's AR `train_step`) would make the estimate a difference of two objectives, not a directional derivative.
+                    if ctx.use_diffusion_blocks and args.db_objective == "edm":
+                        if (
+                            getattr(args, "db_block_execution", "sequential")
+                            == "parallel"
+                        ):
+                            loss_neg, _ = ctx.engine.denoise_step_parallel(
+                                x,
+                                overlap=args.db_overlap,
+                                attn_mask=train_attn_mask,
+                                clean=clean,
+                                backend=args.db_denoise_backend,
+                                aux_lm_weight=args.db_aux_lm_weight,
+                                targets=y,
+                            )
+                        else:
+                            loss_neg, _ = ctx.engine.denoise_step(
+                                x,
+                                block_idx=block_idx,
+                                overlap=args.db_overlap,
+                                attn_mask=train_attn_mask,
+                                clean=clean,
+                                backend=args.db_denoise_backend,
+                                aux_lm_weight=args.db_aux_lm_weight,
+                                targets=y,
+                            )
+                    else:
+                        loss_neg = ctx.model(x, targets=y, attn_mask=train_attn_mask)
                 mezo_opt.perturb(step, scaling=1.0)
                 mezo_opt.stage_mezo_estimate(step, train_loss, loss_neg)
                 # The positive-point forward built a full computation graph (every block's hidden state through lm_head under DARD, plus the EDM term). MeZO uses only the loss VALUE, so the graph is dead weight: MeZO never backprops it. The negative `denoise_step` above already overwrote `last_block_logits` with no-graph tensors (no_grad), but the positive `loss`/`aux` graphs and any per-block logits the engine still holds must be released here, or they stay pinned until the next step's forward -- on a memory-bound host that compounds into the slowdown a long MeZO run otherwise hits. `train_loss` is detached (not deleted): the log line after the micro-step loop reads it, and a `del` would leave it unbound for that reader.
@@ -578,9 +508,7 @@ def train_loop(ctx):
                     ctx.engine.last_block_logits = None
                     ctx.engine.last_dard_logits = None
             else:
-                # Gradient path (every optimizer but MeZO,
-                # or a MeZO micro-step past the first, which
-                # has already staged its estimate).
+                # Gradient path (every optimizer but MeZO, or a MeZO micro-step past the first, which has already staged its estimate).
                 if getattr(args, "optimizer", "minexplstm") != "mezo":
                     loss = (
                         loss / grad_accum_steps
@@ -597,14 +525,11 @@ def train_loop(ctx):
         for group in ctx.optimizer.param_groups:
             group["lr"] = group["initial_lr"] * lrm
         if getattr(args, "optimizer", "minexplstm") == "mezo":
-            # MeZO already consumed the staged estimate in its
-            # own step (no gradients to unscale, no AMP scaler).
+            # MeZO already consumed the staged estimate in its own step (no gradients to unscale, no AMP scaler).
             ctx.optimizer.step()
         elif ctx.scaler is not None:
             ctx.scaler.unscale_(ctx.optimizer)
-            # In distributed training, all ranks must agree on whether to skip the step.
-            # Each rank may independently encounter inf/nan gradients, so we all-reduce
-            # the found_inf flag (MAX = if any rank found inf, all skip).
+            # In distributed training, all ranks must agree on whether to skip the step. Each rank may independently encounter inf/nan gradients, so we all-reduce the found_inf flag (MAX = if any rank found inf, all skip).
             if is_ddp_initialized():
                 for v in ctx.scaler._found_inf_per_device(ctx.optimizer).values():
                     dist.all_reduce(v, op=dist.ReduceOp.MAX)
@@ -612,14 +537,7 @@ def train_loop(ctx):
             ctx.scaler.update()
         else:
             ctx.optimizer.step()
-        # MinExpLSTM joint online co-training: every K optimizer
-        # steps, re-evaluate the loss on the *updated* parameters
-        # (rebuilt differentiably through the cell), backprop to the
-        # cell, and step its AdamW meta-optimizer. The closure
-        # rebuilds the loss from the updated params via
-        # functional_call, so the graph runs cell -> (gamma, delta)
-        # -> theta_new -> loss. Only the MinExpLSTM optimizer
-        # implements meta_step; AdamW baselines skip it.
+        # MinExpLSTM joint online co-training: every K optimizer steps, re-evaluate the loss on the *updated* parameters (rebuilt differentiably through the cell), backprop to the cell, and step its AdamW meta-optimizer. The closure rebuilds the loss from the updated params via functional_call, so the graph runs cell -> (gamma, delta) -> theta_new -> loss. Only the MinExpLSTM optimizer implements meta_step; AdamW baselines skip it.
         meta_every = getattr(args, "minexp_meta_every", 50)
         meta_lr = getattr(args, "minexp_meta_lr", 1e-3)
         if (
@@ -635,28 +553,13 @@ def train_loop(ctx):
             gc.collect()
 
             def _meta_closure(params):
-                # Rebuild the same objective the primary step
-                # optimized, on the updated parameters, and
-                # return a differentiable loss. functional_call
-                # reparametrizes an nn.Module tree. The DiffusionBlocks
-                # engine is NOT an nn.Module (it owns three: model,
-                # adapters, denoise_heads), so the engine is reparametrized
-                # by swapping the *model* subtree's parameters in place
-                # for this closure -- the model is where the learned
-                # optimizer's residual applies and where the meta-gradient
-                # belongs. Adapters and denoise heads (small conditioning
-                # modules) keep their current values.
+                # Rebuild the same objective the primary step optimized, on the updated parameters, and return a differentiable loss. functional_call reparametrizes an nn.Module tree. The DiffusionBlocks engine is NOT an nn.Module (it owns three: model, adapters, denoise_heads), so the engine is reparametrized by swapping the *model* subtree's parameters in place for this closure -- the model is where the learned optimizer's residual applies and where the meta-gradient belongs. Adapters and denoise heads (small conditioning modules) keep their current values.
                 if ctx.use_diffusion_blocks:
                     engine = trainable
                     model_params = {
                         n: p for n, p in params.items() if not n.startswith("db_")
                     }
-                    # functional_call(engine.model, model_params) returns
-                    # a stateless view; the engine's train_step reads the
-                    # real model, so we swap the model's parameters in
-                    # place, run the block objective, and restore. The
-                    # updated tensors carry the cell's graph, so the loss
-                    # backprops to the cell.
+                    # functional_call(engine.model, model_params) returns a stateless view; the engine's train_step reads the real model, so we swap the model's parameters in place, run the block objective, and restore. The updated tensors carry the cell's graph, so the loss backprops to the cell.
                     saved = {n: p.data for n, p in engine.model.named_parameters()}
                     try:
                         for n, p in engine.model.named_parameters():
@@ -676,18 +579,9 @@ def train_loop(ctx):
                 if step % 100 == 0:
                     print0(f"  [minexp] meta_loss: {float(meta_loss.detach()):.6f}")
             except (RuntimeError, TypeError) as exc:
-                # A meta step that cannot close its graph (e.g. an
-                # engine whose forward does not accept functional_call
-                # args) degrades to skipping the co-training step
-                # rather than crashing the run.
+                # A meta step that cannot close its graph (e.g. an engine whose forward does not accept functional_call args) degrades to skipping the co-training step rather than crashing the run.
                 print0(f"  [minexp] meta_step skipped: {exc}")
-        # `trainable_root`, not `model`: in DiffusionBlocks mode the optimizer
-        # owns the engine, and its `db_adapters.*` / `db_denoise_heads.*` are
-        # separate subtrees that `ctx.model` cannot reach. Zeroing the bare GPT
-        # left those gradients alive, and `_apply_requires_grad` only clears
-        # `p.grad` for parameters the *active* block does not own -- so when a
-        # block is drawn twice inside one optimizer step, the second draw's
-        # adapter and denoise-head gradients accumulate onto the first.
+        # `trainable_root`, not `model`: in DiffusionBlocks mode the optimizer owns the engine, and its `db_adapters.*` / `db_denoise_heads.*` are separate subtrees that `ctx.model` cannot reach. Zeroing the bare GPT left those gradients alive, and `_apply_requires_grad` only clears `p.grad` for parameters the *active* block does not own -- so when a block is drawn twice inside one optimizer step, the second draw's adapter and denoise-head gradients accumulate onto the first.
         ctx.trainable_root.zero_grad(set_to_none=True)
         train_loss_f = train_loss.item()  # .item() is a CPU-GPU sync point
         ctx.synchronize()
@@ -742,20 +636,13 @@ def train_loop(ctx):
                 "train/mfu": mfu,
                 "train/epoch": epoch,
             }
-            # The float-vs-quantized denoiser gap this step's anchor actually saw.
-            # Logged separately from `train/loss` because the returned loss mixes it
-            # with the data term, so a silently-dead anchor is otherwise invisible.
+            # The float-vs-quantized denoiser gap this step's anchor actually saw. Logged separately from `train/loss` because the returned loss mixes it with the data term, so a silently-dead anchor is otherwise invisible.
             if ctx.kd_denoiser is not None:
                 log_data["train/kd_denoiser"] = kd_mean
             if ctx.dard_loss_fn is not None:
-                # The raw (pre-normalization) penalty. Logged because the
-                # balanced total is normalized to ~1 by construction, so a
-                # rule set that quietly stopped enforcing anything would be
-                # invisible in `train/loss` alone.
+                # The raw (pre-normalization) penalty. Logged because the balanced total is normalized to ~1 by construction, so a rule set that quietly stopped enforcing anything would be invisible in `train/loss` alone.
                 log_data["train/dard_rule_penalty"] = dard_mean
-            # EfQAT latch progress: how many diffusion blocks have been permanently
-            # retired. Plateaus at `num_db_blocks` once all of them have finished
-            # specializing to their noise range.
+            # EfQAT latch progress: how many diffusion blocks have been permanently retired. Plateaus at `num_db_blocks` once all of them have finished specializing to their noise range.
             if ctx.block_latch_freezer is not None:
                 log_data["train/efqat_latched_blocks"] = float(
                     len(ctx.block_latch_freezer.latched_blocks())

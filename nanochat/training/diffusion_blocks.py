@@ -48,16 +48,9 @@ class NoiseConditionedBlockAdapter(nn.Module):
         self.cond_dim = cond_dim
         self.n_layers = int(n_layers)
         self.n_embd = int(n_embd)
-        # NOTE: do NOT keep a `self.out = self.mlp[-1]` alias here. That alias
-        # shares the same nn.Linear Parameter object under two attribute paths
-        # (`mlp.2` and `out`), so nn.Module registers it twice and the optimizer
-        # emits "parameter group with duplicate parameters". The final linear is
-        # reachable as self.mlp[-1]; nothing reads self.out.
+        # NOTE: do NOT keep a `self.out = self.mlp[-1]` alias here. That alias shares the same nn.Linear Parameter object under two attribute paths (`mlp.2` and `out`), so nn.Module registers it twice and the optimizer emits "parameter group with duplicate parameters". The final linear is reachable as self.mlp[-1]; nothing reads self.out.
         factory = {"device": device, "dtype": dtype}
-        # `nn.Sequential` typed explicitly: without this annotation every
-        # `adapter.mlp[j]` / `for linear in adapter.mlp` site resolves through
-        # `Module.__getattr__` (typed `-> Tensor` in the torch stubs), which
-        # makes the sequence look non-iterable and non-indexable.
+        # `nn.Sequential` typed explicitly: without this annotation every `adapter.mlp[j]` / `for linear in adapter.mlp` site resolves through `Module.__getattr__` (typed `-> Tensor` in the torch stubs), which makes the sequence look non-iterable and non-indexable.
         self.mlp: nn.Sequential = nn.Sequential(
             nn.Linear(cond_dim, 4 * cond_dim, **factory),
             nn.SiLU(),
@@ -101,12 +94,7 @@ def _standard_normal_icdf(q: torch.Tensor) -> torch.Tensor:
     return 2.0**0.5 * torch.erfinv(2.0 * q - 1.0)
 
 
-#: Checkpoint provenance for the block/noise map. v1 mapped block 0 onto the
-#: LOWEST sigma range (backwards relative to the paper Fig. 6 / App. C); v2
-#: corrects it so block 0 (earliest layers) owns the highest noise range. The
-#: loader rejects anything but the current version loudly, because a v1
-#: checkpoint resumed under v2 would silently retarget every block's noise
-#: range and train garbage that looks healthy.
+#: Checkpoint provenance for the block/noise map. v1 mapped block 0 onto the LOWEST sigma range (backwards relative to the paper Fig. 6 / App. C); v2 corrects it so block 0 (earliest layers) owns the highest noise range. The loader rejects anything but the current version loudly, because a v1 checkpoint resumed under v2 would silently retarget every block's noise range and train garbage that looks healthy.
 NOISE_MAP_VERSION = 2
 
 
@@ -427,18 +415,10 @@ def _wrap_sparseprop(
         SparsePropLinearLCQAT,
     )
 
-    # `is_lcqat_layer`, not isinstance: on a ramp event the layer is
-    # ALREADY a SparsePropLinearLCQAT, which is functionally LC-QAT but
-    # not a subclass. Asking isinstance here built a plain
-    # SparsePropLinear on the second wrap, silently dropping the
-    # quantized forward while leaving the codebook modules attached --
-    # so `verify_partition` saw no missing role and the loss went
-    # unnoticed.
+    # `is_lcqat_layer`, not isinstance: on a ramp event the layer is ALREADY a SparsePropLinearLCQAT, which is functionally LC-QAT but not a subclass. Asking isinstance here built a plain SparsePropLinear on the second wrap, silently dropping the quantized forward while leaving the codebook modules attached -- so `verify_partition` saw no missing role and the loss went unnoticed.
     if is_lcqat_layer(linear):
         if not with_lcqat:
-            # LC-QAT without SparseProp: leave the module alone. Forcing a
-            # wrapper would drop the quantized inference path (see
-            # SparsePropLinearLCQAT's docstring).
+            # LC-QAT without SparseProp: leave the module alone. Forcing a wrapper would drop the quantized inference path (see SparsePropLinearLCQAT's docstring).
             return linear
         if in_place:
             _reparent_sparseprop_in_place(linear, sparsity)
@@ -469,12 +449,7 @@ def _reparent_sparseprop_in_place(linear, sparsity: float) -> None:
         SparsePropLinearLCQAT,
     )
 
-    # The class swap needs the SparsePropLinear.__init__ state, which we build
-    # on a throwaway module and then adopt. Nothing is allocated twice: the
-    # weight and quantizers are the *same objects*, shared with the scratch
-    # module, which is discarded immediately.
-    # `is_lcqat_layer` so a re-wrap of an already-sparse LC-QAT layer
-    # keeps the SparsePropLinearLCQAT class. See `_wrap_sparseprop`.
+    # The class swap needs the SparsePropLinear.__init__ state, which we build on a throwaway module and then adopt. Nothing is allocated twice: the weight and quantizers are the *same objects*, shared with the scratch module, which is discarded immediately. `is_lcqat_layer` so a re-wrap of an already-sparse LC-QAT layer keeps the SparsePropLinearLCQAT class. See `_wrap_sparseprop`.
     if is_lcqat_layer(linear):
         scratch = SparsePropLinearLCQAT(linear, sparsity=sparsity)
         new_cls = SparsePropLinearLCQAT
@@ -580,21 +555,14 @@ class DiffusionBlockEngine:
                 f"Unknown denoise backend: {denoise_backend!r}. "
                 "Valid backends: ['naive', 'cpu', 'gpu']"
             )
-        #: Which backend computes the EDM loss scalar in `denoise_step`.
-        #: "cpu" (default) runs the compiled C++ kernel; "naive" is the
-        #: pure-PyTorch oracle (bit-identical intent, debugging); "gpu" the
-        #: Taichi/Vulkan kernel. Never silently falls back: an unavailable
-        #: compiled backend raises from the dispatcher.
+        #: Which backend computes the EDM loss scalar in `denoise_step`. "cpu" (default) runs the compiled C++ kernel; "naive" is the pure-PyTorch oracle (bit-identical intent, debugging); "gpu" the Taichi/Vulkan kernel. Never silently falls back: an unavailable compiled backend raises from the dispatcher.
         self.denoise_backend = denoise_backend
         n_layer = len(model.transformer.h)
         assert partitioner.num_blocks <= n_layer
         n_embd = model.config.n_embd
-        # `device` is load-bearing, not cosmetic: the engine's own parameters
-        # live in the optimizer (parameters()), so landing them off-device means
-        # their .grad stays None and AdamW skips them without a word.
+        # `device` is load-bearing, not cosmetic: the engine's own parameters live in the optimizer (parameters()), so landing them off-device means their .grad stays None and AdamW skips them without a word.
         factory = {"device": device, "dtype": dtype}
-        # Per-block layer counts must be known before the adapters are built,
-        # since each adapter emits one (gamma, beta) per layer of its block.
+        # Per-block layer counts must be known before the adapters are built, since each adapter emits one (gamma, beta) per layer of its block.
         groups = _layer_groups(n_layer, partitioner.num_blocks)
         self.adapters = nn.ModuleList(
             [
@@ -604,11 +572,7 @@ class DiffusionBlockEngine:
                 for b in range(partitioner.num_blocks)
             ]
         )
-        # One denoise head per block, not one shared head. Each block trains on a
-        # disjoint equi-probability sigma-range whose activation distributions
-        # differ, and under LC-QAT a single head carries a single quantized
-        # K_act codebook -- one codebook cannot cover B disjoint distributions.
-        # Per-block heads let each specialize to its own noise range.
+        # One denoise head per block, not one shared head. Each block trains on a disjoint equi-probability sigma-range whose activation distributions differ, and under LC-QAT a single head carries a single quantized K_act codebook -- one codebook cannot cover B disjoint distributions. Per-block heads let each specialize to its own noise range.
         self.denoise_heads = nn.ModuleList(
             [
                 nn.Linear(n_embd, n_embd, **factory)
@@ -616,52 +580,26 @@ class DiffusionBlockEngine:
             ]
         )
         for head in self.denoise_heads:
-            # ModuleList yields `nn.Module`; assert before reading `.weight`
-            # so the checker narrows it to a Linear rather than inferring
-            # `Module.__getattr__ -> Tensor`.
+            # ModuleList yields `nn.Module`; assert before reading `.weight` so the checker narrows it to a Linear rather than inferring `Module.__getattr__ -> Tensor`.
             assert isinstance(head, nn.Linear), (
                 "denoise head is not an nn.Linear; cannot zero-init"
             )
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
         self.freezer = None
-        #: Optional DARD auxiliary loss module (`DardRuleLoss`). None means "no
-        #: DARD", the default. Set by `set_dard`. The engine does NOT evaluate
-        #: it: it only publishes `last_dard_logits`, the denoiser's own
-        #: vocabulary distribution, because the training loop owns the loss
-        #: balancing (`DardLossBalancer`) and folding the penalty in here would
-        #: make the lambda the engine sees and the lambda the loop applies two
-        #: different numbers.
+        #: Optional DARD auxiliary loss module (`DardRuleLoss`). None means "no DARD", the default. Set by `set_dard`. The engine does NOT evaluate it: it only publishes `last_dard_logits`, the denoiser's own vocabulary distribution, because the training loop owns the loss balancing (`DardLossBalancer`) and folding the penalty in here would make the lambda the engine sees and the lambda the loop applies two different numbers.
         self.dard_loss_fn: torch.nn.Module | None = None
-        #: Run a per-block LM head so the DARD penalty reaches every block.
-        #: Off by default: it costs L layers per step instead of L/B, trading
-        #: away the forward isolation DiffusionBlocks exists for. `set_dard`
-        #: turns it on when the caller wants rules over all blocks.
+        #: Run a per-block LM head so the DARD penalty reaches every block. Off by default: it costs L layers per step instead of L/B, trading away the forward isolation DiffusionBlocks exists for. `set_dard` turns it on when the caller wants rules over all blocks.
         self.dard_per_block_head = False
-        #: The denoiser logits from the most recent `denoise_step`, kept in the
-        #: graph so the caller's rule penalty backpropagates into `lm_head` and
-        #: the active block. None when DARD is off, or after a step that did not
-        #: run a denoiser.
+        #: The denoiser logits from the most recent `denoise_step`, kept in the graph so the caller's rule penalty backpropagates into `lm_head` and the active block. None when DARD is off, or after a step that did not run a denoiser.
         self.last_dard_logits: torch.Tensor | None = None
-        #: Per-block vocabulary distributions from the most recent
-        #: `denoise_step`, keyed by block index. Each is that block's own hidden
-        #: state through the *shared* `lm_head`, so a rule penalty summed over
-        #: them backpropagates into every block instead of only the active one.
-        #: None when DARD is off.
+        #: Per-block vocabulary distributions from the most recent `denoise_step`, keyed by block index. Each is that block's own hidden state through the *shared* `lm_head`, so a rule penalty summed over them backpropagates into every block instead of only the active one. None when DARD is off.
         self.last_block_logits: dict[int, torch.Tensor] | None = None
-        # Optional float-twin KD anchor for the EDM objective (see
-        # `set_distiller`). None means "no anchor", which is the default.
+        # Optional float-twin KD anchor for the EDM objective (see `set_distiller`). None means "no anchor", which is the default.
         self.distiller = None
-        # The KD term from the most recent `denoise_step`, or 0.0 when no
-        # distiller is installed. Exposed because the *returned* loss is a
-        # convex mix of the data and anchor terms, so from it alone there is
-        # no way to tell a working anchor from one that never fired.
+        # The KD term from the most recent `denoise_step`, or 0.0 when no distiller is installed. Exposed because the *returned* loss is a convex mix of the data and anchor terms, so from it alone there is no way to tell a working anchor from one that never fired.
         self.last_kd_loss = 0.0
-        # The auxiliary per-block next-token loss from the most recent
-        # `denoise_step`, or 0.0 when `aux_lm_weight` is 0. Exposed for
-        # the same reason as `last_kd_loss`: the returned loss mixes the
-        # EDM term and (when enabled) this CE term, so the raw value is
-        # the only observable of whether the head is actually training.
+        # The auxiliary per-block next-token loss from the most recent `denoise_step`, or 0.0 when `aux_lm_weight` is 0. Exposed for the same reason as `last_kd_loss`: the returned loss mixes the EDM term and (when enabled) this CE term, so the raw value is the only observable of whether the head is actually training.
         self.last_aux_lm_loss = 0.0
 
     @property
@@ -807,15 +745,7 @@ class DiffusionBlockEngine:
 
         created = 0
         for i, head in enumerate(self.denoise_heads):
-            # `is_lcqat_layer`, not isinstance: on a resume the head arrives from
-            # `load_state_dict` already carrying its quantizers, and
-            # `LCQATLinear` IS an `nn.Linear` subclass, so the naive isinstance
-            # check the adapter loop below uses would still let it through and
-            # `from_float` would raise "expects a plain float Linear". The
-            # adapter loop additionally catches the subclass case; here the
-            # duck-typed check is what matches "is this already quantized",
-            # which is also true of `SparsePropLinearLCQAT` (functionally LC-QAT,
-            # not a subclass).
+            # `is_lcqat_layer`, not isinstance: on a resume the head arrives from `load_state_dict` already carrying its quantizers, and `LCQATLinear` IS an `nn.Linear` subclass, so the naive isinstance check the adapter loop below uses would still let it through and `from_float` would raise "expects a plain float Linear". The adapter loop additionally catches the subclass case; here the duck-typed check is what matches "is this already quantized", which is also true of `SparsePropLinearLCQAT` (functionally LC-QAT, not a subclass).
             if is_lcqat_layer(head):
                 continue
             assert isinstance(head, nn.Linear), (
@@ -831,21 +761,14 @@ class DiffusionBlockEngine:
             )
             created += 1
         for i, adapter in enumerate(self.adapters):
-            # ModuleList yields `nn.Module`; narrow so `adapter.mlp` reads
-            # as a typed sequence instead of through `Module.__getattr__`.
+            # ModuleList yields `nn.Module`; narrow so `adapter.mlp` reads as a typed sequence instead of through `Module.__getattr__`.
             assert isinstance(adapter, NoiseConditionedBlockAdapter), (
                 "engine adapter is not a NoiseConditionedBlockAdapter"
             )
             for j, linear in enumerate(adapter.mlp):
-                # `is_lcqat_layer` rather than `not isinstance(LCQATLinear)`:
-                # after a SparseProp wrap the layer is a
-                # `SparsePropLinearLCQAT`, which is functionally LC-QAT but NOT
-                # a subclass of `LCQATLinear`, so the isinstance check passed it
-                # through and `from_float` raised on the second application.
-                # Same reasoning as the denoise-head guard above.
+                # `is_lcqat_layer` rather than `not isinstance(LCQATLinear)`: after a SparseProp wrap the layer is a `SparsePropLinearLCQAT`, which is functionally LC-QAT but NOT a subclass of `LCQATLinear`, so the isinstance check passed it through and `from_float` raised on the second application. Same reasoning as the denoise-head guard above.
                 if isinstance(linear, nn.Linear) and not is_lcqat_layer(linear):
-                    # The adapter MLP is (in, hidden, out): a c_fc-like expansion
-                    # followed by a c_proj-like contraction onto 2*n_layers*n_embd.
+                    # The adapter MLP is (in, hidden, out): a c_fc-like expansion followed by a c_proj-like contraction onto 2*n_layers*n_embd.
                     roles = (
                         ("fc_weight", "fc_act")
                         if j == 0
@@ -887,18 +810,12 @@ class DiffusionBlockEngine:
             with_lcqat=with_lcqat,
         )
         for head in self.denoise_heads:
-            # ModuleList yields `nn.Module`; assert before passing to a
-            # function that expects `Linear` (the checker narrows on it).
+            # ModuleList yields `nn.Module`; assert before passing to a function that expects `Linear` (the checker narrows on it).
             assert isinstance(head, nn.Linear), (
                 "denoise head is not an nn.Linear; sparseprop cannot wrap it"
             )
             _wrap_sparseprop(head, sparsity, with_lcqat, in_place=True)
-        # Engine-owned layers are converted IN PLACE (class swap + buffer
-        # adoption), never by substituting a new module. `apply_lcqat` put an
-        # LCQATLinear into each `nn.Sequential` slot, so replacing that slot
-        # would leave the original reachable at its old path and register every
-        # codebook parameter twice -- which AdamW rejects and which silently
-        # doubled the codebook count before `verify_partition` existed.
+        # Engine-owned layers are converted IN PLACE (class swap + buffer adoption), never by substituting a new module. `apply_lcqat` put an LCQATLinear into each `nn.Sequential` slot, so replacing that slot would leave the original reachable at its old path and register every codebook parameter twice -- which AdamW rejects and which silently doubled the codebook count before `verify_partition` existed.
         for adapter in self.adapters:
             assert isinstance(adapter, NoiseConditionedBlockAdapter), (
                 "engine adapter is not a NoiseConditionedBlockAdapter"
@@ -998,10 +915,7 @@ class DiffusionBlockEngine:
         """
         for name, p in self.model.named_parameters("", recurse, remove_duplicate):
             yield name, p
-        # named_parameters(prefix) already inserts the prefix, so do not add it
-        # again -- doing so produced `db_adapters.db_adapters.1....`, which broke
-        # both the block routing in `_requires_grad_for` and any consumer that
-        # parses these names.
+        # named_parameters(prefix) already inserts the prefix, so do not add it again -- doing so produced `db_adapters.db_adapters.1....`, which broke both the block routing in `_requires_grad_for` and any consumer that parses these names.
         for name, p in self.adapters.named_parameters(
             "db_adapters", recurse, remove_duplicate
         ):
@@ -1126,10 +1040,7 @@ class DiffusionBlockEngine:
             return layer_idx.isdigit() and int(layer_idx) in set(
                 self.block_layers()[block_idx]
             )
-        # One adapter and one denoise head per block: only the active block's own
-        # may train, since each is specialized to a single noise range. The block
-        # index is the ModuleList position right after the prefix, e.g.
-        # `db_denoise_heads.1.weight` -> parts[1] == "1".
+        # One adapter and one denoise head per block: only the active block's own may train, since each is specialized to a single noise range. The block index is the ModuleList position right after the prefix, e.g. `db_denoise_heads.1.weight` -> parts[1] == "1".
         for prefix in ("db_adapters.", "db_denoise_heads."):
             if name.startswith(prefix):
                 parts = name.split(".")
@@ -1301,33 +1212,14 @@ class DiffusionBlockEngine:
         groups = self.block_layers()
         head_dim = self.model.config.n_embd // self.model.config.n_head
         cos, sin = self.model._precompute_rotary_embeddings(seq_len, head_dim)
-        # Per-layer AdaLN: each layer of the block gets its own (gamma, beta)
-        # rather than one modulation for the whole group. The paper conditions
-        # inside the block (Step 3), and a single block-level modulation leaves
-        # the deeper layers of a block unable to specialize within its noise
-        # range.
+        # Per-layer AdaLN: each layer of the block gets its own (gamma, beta) rather than one modulation for the whole group. The paper conditions inside the block (Step 3), and a single block-level modulation leaves the deeper layers of a block unable to specialize within its noise range.
         conds = self.adapters[block_idx](noisy, sigma.view(1))
-        # Sigma-conditioned LC-QAT codebooks resolve against the *batch*
-        # dimension, so the engine's `(B,)` sigma is reshaped to `(B, 1, 1)`
-        # here. Passed on every step rather than only when conditioning is on:
-        # the block's own `sigma` parameter defaults to `None` and the float
-        # layers ignore it, so the cost is one kwarg and the alternative is two
-        # near-identical loops that must be kept in sync.
+        # Sigma-conditioned LC-QAT codebooks resolve against the *batch* dimension, so the engine's `(B,)` sigma is reshaped to `(B, 1, 1)` here. Passed on every step rather than only when conditioning is on: the block's own `sigma` parameter defaults to `None` and the float layers ignore it, so the cost is one kwarg and the alternative is two near-identical loops that must be kept in sync.
         sigma_b = sigma.view(-1, 1, 1)
         h = noisy
-        # When collecting, run EVERY block in order and project each block's
-        # own hidden state through the shared `lm_head`. Each projection keeps
-        # its block's layers in the graph, so the DARD penalty's gradient flows
-        # from the head back into that block. Only the active block runs with
-        # `requires_grad=True` (set by `_activate_block`), so the inactive
-        # blocks contribute zero parameter gradient here while still giving the
-        # penalty a per-block distribution to act on -- which is the point: the
-        # rules then shape every block's representation rather than only the one
-        # whose prediction is scored.
+        # When collecting, run EVERY block in order and project each block's own hidden state through the shared `lm_head`. Each projection keeps its block's layers in the graph, so the DARD penalty's gradient flows from the head back into that block. Only the active block runs with `requires_grad=True` (set by `_activate_block`), so the inactive blocks contribute zero parameter gradient here while still giving the penalty a per-block distribution to act on -- which is the point: the rules then shape every block's representation rather than only the one whose prediction is scored.
         block_logits: dict[int, torch.Tensor] = {}
-        # Without collection this is a single-block loop, identical to the
-        # pre-per-block-head code: the forward isolation DiffusionBlocks exists
-        # for (L/B layers, not L) is a property this must not give up silently.
+        # Without collection this is a single-block loop, identical to the pre-per-block-head code: the forward isolation DiffusionBlocks exists for (L/B layers, not L) is a property this must not give up silently.
         blocks_to_run = range(len(groups)) if collect_block_logits else (block_idx,)
         for b in blocks_to_run:
             block_conds = (
@@ -1350,9 +1242,7 @@ class DiffusionBlockEngine:
                 block_logits[b] = denoiser_logits(
                     self.model.lm_head, h, self.model.config.vocab_size
                 )
-        # `sigma` is forwarded for the same reason as in the block loop: a
-        # sigma-conditioned head needs it, and a static one ignores it. The
-        # duck-typed helper keeps a plain `nn.Linear` head working unchanged.
+        # `sigma` is forwarded for the same reason as in the block loop: a sigma-conditioned head needs it, and a static one ignores it. The duck-typed helper keeps a plain `nn.Linear` head working unchanged.
         pred = maybe_sigma_call(self.denoise_heads[block_idx], h, sigma_b)
         return _DenoiserOutput(
             pred=pred, h=h, block_logits=block_logits if collect_block_logits else None
@@ -1423,22 +1313,7 @@ class DiffusionBlockEngine:
                 pure-PyTorch oracle; all three agree by construction.
         """
         b = self._activate_block(block_idx)
-        # The embedding table is used twice, and the two uses need different
-        # gradient treatment:
-        #
-        # * as the **input** base: `noisy = c_in * (clean + sigma * eps)`. The
-        #   paper conditions the denoiser on clean token embeddings (App. B), and
-        #   those embeddings come from `wte`, so this path must stay in the graph
-        #   or the embedding table never trains -- while `generate()` needs it to
-        #   build the prefix.
-        # * as the **target**: `loss = w(sigma) * ||pred - clean||^2`. This must
-        #   be detached. It is the "clean data" of the denoising problem, and if
-        #   it were differentiable the model could reduce the loss by shrinking
-        #   the embeddings rather than by denoising well.
-        #
-        # When `clean` is supplied by the caller it is already a hoisted,
-        # no-grad tensor, so it is used for both (this is the fast path, and the
-        # embedding then trains via whatever else touches it).
+        # The embedding table is used twice, and the two uses need different gradient treatment: * as the **input** base: `noisy = c_in * (clean + sigma * eps)`. The paper conditions the denoiser on clean token embeddings (App. B), and those embeddings come from `wte`, so this path must stay in the graph or the embedding table never trains -- while `generate()` needs it to build the prefix. * as the **target**: `loss = w(sigma) * ||pred - clean||^2`. This must be detached. It is the "clean data" of the denoising problem, and if it were differentiable the model could reduce the loss by shrinking the embeddings rather than by denoising well. When `clean` is supplied by the caller it is already a hoisted, no-grad tensor, so it is used for both (this is the fast path, and the embedding then trains via whatever else touches it).
         if clean is None:
             clean_input = F.normalize(self.model.transformer.wte(idx).float(), dim=-1)
             clean = clean_input.detach()
@@ -1447,26 +1322,14 @@ class DiffusionBlockEngine:
         sigma = self.partitioner.sample_sigma(b, generator=generator, overlap=overlap)
         c_in, _, w = edm_preconditioning(sigma, self.partitioner.sigma_data)
         t = idx.size(1)
-        # App. E.4 causal conditioning: the block sees [clean | noisy] and the
-        # loss covers the noisy suffix only. The clean prefix is the same
-        # `clean_input` tensor the noise was drawn from (graph intact, so the
-        # embedding table trains through it); the suffix target is the
-        # detached `clean`, so the model cannot shrink the loss by shrinking
-        # the embeddings.
+        # App. E.4 causal conditioning: the block sees [clean | noisy] and the loss covers the noisy suffix only. The clean prefix is the same `clean_input` tensor the noise was drawn from (graph intact, so the embedding table trains through it); the suffix target is the detached `clean`, so the model cannot shrink the loss by shrinking the embeddings.
         noisy_suffix = c_in * (clean_input + sigma * torch.randn_like(clean))
         full = torch.cat([clean_input, noisy_suffix], dim=1)
         if attn_mask is None:
             attn_mask = torch.ones(t, t, dtype=torch.bool, device=idx.device).tril()
             attn_mask = attn_mask.view(1, 1, t, t)
         mask_2t = self._concat_causal_mask(attn_mask)
-        # Per-block head, **opt-in**. Running every block to give each one a
-        # vocabulary distribution is exactly what makes the DARD penalty reach
-        # every block -- but it also runs all L layers instead of L/B, which
-        # gives up the forward isolation that is DiffusionBlocks' reason to
-        # exist (pinned by `test_dbcpu_denoise.py`). So it is a deliberate
-        # trade the caller must ask for, not a default that silently spends the
-        # memory saving. Without it the per-block path is byte-identical to
-        # before and pays nothing.
+        # Per-block head, **opt-in**. Running every block to give each one a vocabulary distribution is exactly what makes the DARD penalty reach every block -- but it also runs all L layers instead of L/B, which gives up the forward isolation that is DiffusionBlocks' reason to exist (pinned by `test_dbcpu_denoise.py`). So it is a deliberate trade the caller must ask for, not a default that silently spends the memory saving. Without it the per-block path is byte-identical to before and pays nothing.
         need_blocks = self.dard_loss_fn is not None and self.dard_per_block_head
         denoiser_out = self._run_block_denoiser(
             b,
@@ -1479,18 +1342,14 @@ class DiffusionBlockEngine:
         if need_blocks:
             pred_full = denoiser_out.pred
             block_logits = denoiser_out.block_logits or {}
-            # Published for the caller, which owns the balancing. The final
-            # block's logits are the same distribution the old single-head path
-            # produced, so behaviour with one block is unchanged.
+            # Published for the caller, which owns the balancing. The final block's logits are the same distribution the old single-head path produced, so behaviour with one block is unchanged.
             self.last_dard_logits = block_logits[len(block_logits) - 1]
             self.last_block_logits = block_logits
         else:
             pred_full = denoiser_out.pred
             self.last_block_logits = None
         pred = pred_full[:, t:, :]
-        # Late import: the op layer is a runtime backend, not model math, and
-        # importing it at module scope would pull torch.library registration
-        # machinery into every importer of the training engine.
+        # Late import: the op layer is a runtime backend, not model math, and importing it at module scope would pull torch.library registration machinery into every importer of the training engine.
         from nanochat.ops.db_denoise import db_denoise_loss
 
         loss = db_denoise_loss(
@@ -1499,21 +1358,7 @@ class DiffusionBlockEngine:
             float(w),
             backend=self.denoise_backend if backend is None else backend,
         )
-        # Auxiliary per-block next-token loss (EDM only). The EDM term
-        # score-matches the block's hidden state against the clean
-        # embedding, so it never touches `lm_head`: left alone, the
-        # head is trained only by DARD's small penalty (when DARD is
-        # on) and otherwise stays at its random init, and an
-        # EDM-trained checkpoint cannot generate text. This term keeps
-        # the B-fold forward isolation DiffusionBlocks exists for --
-        # it reuses the block's already-computed hidden state, it does
-        # NOT run the full model -- and projects that state through the
-        # shared `lm_head` to predict the next token. `h` covers the
-        # `[clean | noisy]` 2T sequence; the suffix is the
-        # noisy half the block actually conditioned on, so the head
-        # predicts `targets` from it. Weighted by `aux_lm_weight`
-        # against the EDM term (0 disables it, restoring the old
-        # behaviour byte for byte).
+        # Auxiliary per-block next-token loss (EDM only). The EDM term score-matches the block's hidden state against the clean embedding, so it never touches `lm_head`: left alone, the head is trained only by DARD's small penalty (when DARD is on) and otherwise stays at its random init, and an EDM-trained checkpoint cannot generate text. This term keeps the B-fold forward isolation DiffusionBlocks exists for -- it reuses the block's already-computed hidden state, it does NOT run the full model -- and projects that state through the shared `lm_head` to predict the next token. `h` covers the `[clean | noisy]` 2T sequence; the suffix is the noisy half the block actually conditioned on, so the head predicts `targets` from it. Weighted by `aux_lm_weight` against the EDM term (0 disables it, restoring the old behaviour byte for byte).
         if aux_lm_weight > 0.0 and targets is not None:
             aux_logits = self.model.lm_head(denoiser_out.h[:, t:, :])
             aux_logits = aux_logits[..., : self.model.config.vocab_size]
@@ -1527,17 +1372,10 @@ class DiffusionBlockEngine:
             self.last_aux_lm_loss = float(aux_loss.detach())
         else:
             self.last_aux_lm_loss = 0.0
-        # Reset first: a stale value from a previous call must not survive into
-        # a step that ran without a distiller.
+        # Reset first: a stale value from a previous call must not survive into a step that ran without a distiller.
         self.last_kd_loss = 0.0
         if self.distiller is not None:
-            # Denoiser distillation (KD, PRD 3.1, EDM form). The float twin
-            # re-runs the *same* block on the *same* `[clean | noisy]` input
-            # and sigma -- no new noise is sampled for it -- so the only
-            # difference between the two suffix predictions is quantization,
-            # which is what the anchor is supposed to measure. `alpha` mixes
-            # the anchor against the data term rather than adding a second,
-            # unnormalized objective.
+            # Denoiser distillation (KD, PRD 3.1, EDM form). The float twin re-runs the *same* block on the *same* `[clean | noisy]` input and sigma -- no new noise is sampled for it -- so the only difference between the two suffix predictions is quantization, which is what the anchor is supposed to measure. `alpha` mixes the anchor against the data term rather than adding a second, unnormalized objective.
             alpha = self.distiller.alpha
             loss_kd = self.distiller(
                 pred,
@@ -1549,6 +1387,138 @@ class DiffusionBlockEngine:
             loss = (1.0 - alpha) * loss + alpha * loss_kd
             self.last_kd_loss = float(loss_kd.detach())
         return loss, sigma
+
+    def denoise_step_parallel(
+        self,
+        idx: torch.Tensor,
+        overlap: float = 0.0,
+        generator: torch.Generator | None = None,
+        attn_mask: torch.Tensor | None = None,
+        clean: torch.Tensor | None = None,
+        backend: str | None = None,
+        aux_lm_weight: float = 0.0,
+        targets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """EDM score-matching step for EVERY block, run concurrently.
+
+        The sequential `denoise_step` trains the one sampled block per
+        step, which is where DiffusionBlocks' B-fold activation saving
+        comes from. This variant runs all B block denoisers over the
+        same `[clean | noisy]` input and sums their EDM losses, so
+        every block receives a gradient signal each step instead of
+        1/B. That trades the isolation away -- every block's graph is
+        live at once, so activation memory is O(L), not O(L/B) --
+        which a first-order optimizer pays for on every backward. It is
+        therefore OFF by default and meant for MeZO: the positive-point
+        graph is never backpropagated (the optimizer consumes only the
+        loss VALUE for its SPSA estimate), so the memory cost is one
+        transient forward rather than a persistent graph, and the B
+        blocks overlap in time on CPU because torch releases the GIL
+        inside matmul.
+
+        Each block gets its own sigma draw from its equi-probability
+        range (the same `sample_sigma` the sequential path uses), its
+        own AdaLN conditioning, and its own denoise head -- the only
+        sharing is the `[clean | noisy]` input and the embedding table.
+        The per-block losses are summed into one scalar the caller can
+        treat exactly like the sequential `denoise_step`'s loss.
+
+        Returns `(total_loss, sigmas)` where `sigmas[b]` is the sigma
+        block `b` was trained against.
+        """
+        import concurrent.futures
+
+        # Enable gradients for every block (the freezer still arbitrates: a block latched by EfQAT stays frozen even here).
+        self._apply_requires_grad_all_blocks()
+        self.train()
+        if clean is None:
+            clean_input = F.normalize(self.model.transformer.wte(idx).float(), dim=-1)
+            clean = clean_input.detach()
+        else:
+            clean_input = clean
+        t = idx.size(1)
+        if attn_mask is None:
+            attn_mask = torch.ones(t, t, dtype=torch.bool, device=idx.device).tril()
+            attn_mask = attn_mask.view(1, 1, t, t)
+        mask_2t = self._concat_causal_mask(attn_mask)
+        # Precompute the shared rotary tables once for the 2T sequence; every block's forward reuses them (the sequential path recomputes per block inside `_run_block_denoiser`).
+        groups = self.block_layers()
+        head_dim = self.model.config.n_embd // self.model.config.n_head
+        cos, sin = self.model._precompute_rotary_embeddings(2 * t, head_dim)
+        # One sigma draw per block from its own equi-probability range.
+        sigmas = [
+            self.partitioner.sample_sigma(b, generator=generator, overlap=overlap)
+            for b in range(len(groups))
+        ]
+        # The EDM preconditioning for each block's sigma.
+        conds_all = []
+        for b in range(len(groups)):
+            c_in, _, w = edm_preconditioning(sigmas[b], self.partitioner.sigma_data)
+            conds_all.append((c_in, w))
+        noisy_suffixes = []
+        for b in range(len(groups)):
+            c_in = conds_all[b][0]
+            noisy_suffixes.append(
+                c_in * (clean_input + sigmas[b] * torch.randn_like(clean_input))
+            )
+        # The full [clean | noisy] input is the same clean prefix with each block's own noisy suffix; the clean prefix is shared.
+        fulls = [
+            torch.cat([clean_input, noisy_suffixes[b]], dim=1)
+            for b in range(len(groups))
+        ]
+
+        def _run_block(b: int):
+            # Per-layer AdaLN conditioning from this block's adapter, then its layers, then its denoise head. Mirrors the sequential `_run_block_denoiser` for a single block so the arithmetic matches byte-for-byte when only one block is live.
+            noisy = fulls[b]
+            conds = self.adapters[b](noisy, sigmas[b].view(1))
+            sigma_b = sigmas[b].view(-1, 1, 1)
+            h = noisy
+            for i, layer in enumerate(groups[b]):
+                h = self.model.transformer.h[layer](
+                    h,
+                    None,
+                    (cos, sin),
+                    (2 * t, 0),
+                    None,
+                    attn_mask=mask_2t,
+                    cond=conds[i],
+                    sigma=sigma_b,
+                )
+            pred = maybe_sigma_call(self.denoise_heads[b], h, sigma_b)
+            pred = pred[:, t:, :]
+            from nanochat.ops.db_denoise import db_denoise_loss
+
+            w = conds_all[b][1]
+            loss = db_denoise_loss(
+                pred,
+                clean,
+                float(w),
+                backend=self.denoise_backend if backend is None else backend,
+            )
+            # Auxiliary per-block next-token loss (EDM only), same form as the sequential path: project the block's own hidden state through the shared lm_head.
+            if aux_lm_weight > 0.0 and targets is not None:
+                aux_logits = self.model.lm_head(h[:, t:, :])
+                aux_logits = aux_logits[..., : self.model.config.vocab_size]
+                aux_logits = aux_logits.float()
+                aux_loss = F.cross_entropy(
+                    aux_logits.reshape(-1, aux_logits.size(-1)),
+                    targets.reshape(-1),
+                    ignore_index=-1,
+                )
+                loss = loss + aux_lm_weight * aux_loss
+            return loss
+
+        # Run every block's denoiser concurrently. On CPU the matmuls release the GIL, so the threads overlap; the per-block work is independent (separate adapters, heads, and sigma), so there is no cross-block synchronization to serialize them.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(groups)) as pool:
+            losses = list(pool.map(_run_block, range(len(groups))))
+        total_loss = losses[0]
+        for lb in losses[1:]:
+            total_loss = total_loss + lb
+        self.last_block_logits = None
+        self.last_dard_logits = None
+        self.last_aux_lm_loss = 0.0
+        self.last_kd_loss = 0.0
+        return total_loss, sigmas
 
     @torch.inference_mode()
     def generate(
@@ -1628,9 +1598,7 @@ class DiffusionBlockEngine:
                 else:
                     full_z = c_in * z_curr
 
-                # Per-layer AdaLN, mirroring denoise_step: the adapter returns
-                # one (gamma, beta) per layer of the active block, consumed
-                # inside each layer rather than applied to the block's input.
+                # Per-layer AdaLN, mirroring denoise_step: the adapter returns one (gamma, beta) per layer of the active block, consumed inside each layer rather than applied to the block's input.
                 conds = self.adapters[b_idx](full_z, sigma_curr.view(1))
 
                 h = full_z

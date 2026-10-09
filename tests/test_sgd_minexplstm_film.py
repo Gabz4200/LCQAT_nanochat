@@ -21,9 +21,7 @@ from nanochat.training.minexp_lstm import (
     SGDMinExpLSTMCellFiLM4D,
 )
 
-# ---------------------------------------------------------------------------
 # Cell structure
-# ---------------------------------------------------------------------------
 
 
 def test_cell_param_count_is_microscopic() -> None:
@@ -92,17 +90,13 @@ def test_cell_gate_depends_only_on_input_not_prev_hidden() -> None:
     _, _, h_next_a = cell(x, h_a)
     _, _, h_next_b = cell(x, h_b)
     assert not torch.allclose(h_next_a, h_next_b)
-    # The gate is a function of x alone: reconstruct it from the two
-    # states (h_next_b - h_next_a = hat_phi * (h_b - h_a)) and check
-    # it against the directly computed gate.
+    # The gate is a function of x alone: reconstruct it from the two states (h_next_b - h_next_a = hat_phi * (h_b - h_a)) and check it against the directly computed gate.
     hat_phi = (h_next_b - h_next_a) / (h_b - h_a)
     expected = torch.sigmoid(cell.phi_proj(x) - cell.iota_proj(x))
     assert torch.allclose(hat_phi, expected, atol=1e-5)
 
 
-# ---------------------------------------------------------------------------
 # Lambda-coupled dynamic betas (PRD section 3.2)
-# ---------------------------------------------------------------------------
 
 
 def test_betas_are_lambda_coupled_and_bounded() -> None:
@@ -144,9 +138,7 @@ def test_beta_predictor_is_two_learned_params() -> None:
     assert cell.w_beta.requires_grad and cell.b_beta.requires_grad
 
 
-# ---------------------------------------------------------------------------
 # Optimizer: step-0 fallback, memory budget, update rule
-# ---------------------------------------------------------------------------
 
 
 def test_step_zero_matches_sgd_with_weight_decay_exactly() -> None:
@@ -220,9 +212,7 @@ def test_gamma_delta_clamps_hold() -> None:
     p.grad = torch.randn(64) * 10.0
     before = p.detach().clone()
     opt.step()
-    # Back out the applied (gamma, delta) contribution: with a huge head the
-    # raw outputs saturate the clamps, so the non-SGD part of the update is
-    # bounded by |(1+2)(-lr G)| + 0.5 + |decay| per coordinate.
+    # Back out the applied (gamma, delta) contribution: with a huge head the raw outputs saturate the clamps, so the non-SGD part of the update is bounded by |(1+2)(-lr G)| + 0.5 + |decay| per coordinate.
     assert torch.isfinite(p.detach()).all()
     assert not torch.equal(before, p.detach())
 
@@ -276,13 +266,18 @@ def test_rms_normalization_bounds_cell_inputs() -> None:
     assert torch.isfinite(p.detach()).all()
 
 
-# ---------------------------------------------------------------------------
 # Meta-optimizer: AdamW over < 1KB of cell params (PRD principle 5)
-# ---------------------------------------------------------------------------
 
 
 def test_meta_optimizer_is_adamw_over_cell_params() -> None:
-    """The cell's own optimizer is AdamW over the cell parameters only."""
+    """The cell's optimizer is AdamW over the cell + LR params.
+
+    PRD principle 5: the meta-optimizer owns the cell's own
+    (< 50) parameters plus the data-dependent LR predictor
+    (a single ``nn.Linear(1, 1)`, 2 params). Both are
+    co-trained online; the meta LR itself stays a plain
+    hyperparameter.
+    """
     p = torch.nn.Parameter(torch.randn(4, 4))
     opt = SGD_MinExpLstm_Optimizer([p], lr=1e-3, meta_lr=1e-3)
     assert isinstance(opt.meta_optimizer, torch.optim.AdamW)
@@ -290,8 +285,11 @@ def test_meta_optimizer_is_adamw_over_cell_params() -> None:
         id(q) for group in opt.meta_optimizer.param_groups for q in group["params"]
     }
     cell_ids = {id(q) for q in opt.cell.parameters()}
-    assert owned == cell_ids
-    total_bytes = sum(q.numel() * q.element_size() for q in opt.cell.parameters())
+    lr_ids = {id(q) for q in opt.lr_predictor.parameters()}
+    assert owned == cell_ids | lr_ids
+    total_bytes = sum(
+        q.numel() * q.element_size() for q in opt.cell.parameters()
+    ) + sum(q.numel() * q.element_size() for q in opt.lr_predictor.parameters())
     assert total_bytes < 1024
 
 

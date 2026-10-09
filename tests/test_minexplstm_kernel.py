@@ -98,9 +98,7 @@ def test_dispatch_backend_runs(backend):
         if backend == "gpu" and "Vulkan" in str(e):
             pytest.skip(f"GPU backend not available: {e}")
         raise
-    # The dispatch must actually step the weight: a kernel that
-    # ran but left the weight unchanged would pass a smoke test
-    # while silently no-opping the optimizer.
+    # The dispatch must actually step the weight: a kernel that ran but left the weight unchanged would pass a smoke test while silently no-opping the optimizer.
     assert not torch.equal(p.data, weight_before), (
         f"{backend} backend did not update the weight"
     )
@@ -141,18 +139,14 @@ def test_naive_vs_fused_parity():
 
     hyperparams = {"lr": 1e-3, "wd": 1e-2, "lam": 0.10, "clamp_val": 1.0}
 
-    # Naive path: the optimizer's own pure-PyTorch step, which
-    # mutates p in place through batched_cell_forward + the
-    # shared film_sgd_update formula.
+    # Naive path: the optimizer's own pure-PyTorch step, which mutates p in place through batched_cell_forward + the shared film_sgd_update formula.
     opt.zero_grad()
     loss = model(*batch)
     loss.backward()
     opt.step()
     naive_weight = p.data.clone()
 
-    # Fused path: run the C++ kernel on the same gradient/state
-    # the naive path just consumed. Fresh copies so the kernel
-    # starts from the identical input the naive step saw.
+    # Fused path: run the C++ kernel on the same gradient/state the naive path just consumed. Fresh copies so the kernel starts from the identical input the naive step saw.
     p_fused = p.data.clone()
     ef = state["ema_fast_int8"].clone()
     es = state["ema_slow_int8"].clone()
@@ -160,8 +154,7 @@ def test_naive_vs_fused_parity():
     sf = state["scale_fast"].clone()
     ss = state["scale_slow"].clone()
     sh = state["scale_h"].clone()
-    # Re-run the backward so p.grad is the gradient the fused
-    # kernel steps on (opt.step above already consumed it).
+    # Re-run the backward so p.grad is the gradient the fused kernel steps on (opt.step above already consumed it).
     opt.zero_grad()
     loss = model(*batch)
     loss.backward()
@@ -189,10 +182,89 @@ def test_naive_vs_fused_parity():
         **hyperparams,
         backend="cpu",
     )
-    # The fused kernel updates the weight in place; the naive
-    # optimizer step updated p.data in place. They start from
-    # the same weight and the same gradient, so the updated
-    # values must agree to fp32 tolerance.
+    # The fused kernel updates the weight in place; the naive optimizer step updated p.data in place. They start from the same weight and the same gradient, so the updated values must agree to fp32 tolerance.
+    torch.testing.assert_close(p_fused, naive_weight, rtol=1e-5, atol=1e-6)
+
+
+def test_learnable_lr_backend_parity():
+    """The learnable LR gives the same update on every backend.
+
+    The LR is a data-dependent tensor on the naive path and a
+    float (the tensor's value) on the fused paths. This pins
+    that the two spellings produce the same step: the same
+    predictor state, the same gradient, the same update --
+    so the learnable LR does not break the three-way parity.
+    """
+    model, opt = _setup_optimizer_and_model()
+    cell_params = _get_cell_params(opt)
+    batch = (torch.randint(0, 100, (2, 16)), torch.randint(0, 100, (2, 16)))
+
+    # Initialize optimizer state on all params.
+    opt.zero_grad()
+    loss = model(*batch)
+    loss.backward()
+    opt.step()
+
+    param_name = None
+    for name, p in model.named_parameters():
+        if p.grad is not None and len(opt.state[p]) > 0:
+            param_name = name
+            break
+    assert param_name is not None
+    p = dict(model.named_parameters())[param_name]
+    state = opt.state[p]
+    assert p.grad is not None
+
+    # The data-dependent LR value this step computes.
+    lr_tensor = opt.predict_lr(opt._rms(p.grad.unsqueeze(0)))
+    lr_val = float(lr_tensor.detach())
+    assert 0.0 < lr_val < 1.0
+
+    # Naive path: the optimizer's own step (tensor LR).
+    opt.zero_grad()
+    loss = model(*batch)
+    loss.backward()
+    opt.step()
+    naive_weight = p.data.clone()
+
+    # Fused path: the C++ kernel with the LR *value*.
+    p_fused = p.data.clone()
+    ef = state["ema_fast_int8"].clone()
+    es = state["ema_slow_int8"].clone()
+    h = state["h_int8"].clone()
+    sf = state["scale_fast"].clone()
+    ss = state["scale_slow"].clone()
+    sh = state["scale_h"].clone()
+    opt.zero_grad()
+    loss = model(*batch)
+    loss.backward()
+    dispatch_sgd_minexplstm_step(
+        grad=p.grad,
+        weight=p_fused,
+        ema_fast_int8=ef,
+        ema_slow_int8=es,
+        h_int8=h,
+        scale_fast=sf,
+        scale_slow=ss,
+        scale_h=sh,
+        phi_w=cell_params["phi_w"],
+        phi_b=cell_params["phi_b"],
+        iota_w=cell_params["iota_w"],
+        iota_b=cell_params["iota_b"],
+        h_w=cell_params["h_w"],
+        h_b=cell_params["h_b"],
+        out_w=cell_params["out_w"],
+        out_b=cell_params["out_b"],
+        film_w=cell_params["film_w"],
+        film_b=cell_params["film_b"],
+        w_beta=cell_params["w_beta"],
+        b_beta=cell_params["b_beta"],
+        lr=lr_val,
+        wd=1e-2,
+        lam=0.10,
+        clamp_val=1.0,
+        backend="cpu",
+    )
     torch.testing.assert_close(p_fused, naive_weight, rtol=1e-5, atol=1e-6)
 
 
@@ -220,8 +292,7 @@ def test_cpu_gpu_parity():
     hyperparams = {"lr": 1e-3, "wd": 1e-2, "lam": 0.10, "clamp_val": 1.0}
 
     def _run(backend):
-        # Fresh copies of the state so each backend
-        # starts from the same input.
+        # Fresh copies of the state so each backend starts from the same input.
         p_copy = p.data.clone()
         ef = state["ema_fast_int8"].clone()
         es = state["ema_slow_int8"].clone()
@@ -264,10 +335,7 @@ def test_cpu_gpu_parity():
             pytest.skip(f"GPU backend not available: {e}")
         raise
 
-    # Weight updates agree to fp32 tolerance; the
-    # INT8 states and scales must match exactly (the
-    # quantization is deterministic given the same
-    # max-abs scale).
+    # Weight updates agree to fp32 tolerance; the INT8 states and scales must match exactly (the quantization is deterministic given the same max-abs scale).
     for i, name in enumerate(
         ("weight", "ema_fast", "ema_slow", "h", "scale_fast", "scale_slow", "scale_h")
     ):

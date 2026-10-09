@@ -217,10 +217,7 @@ def test_when_denoising_with_kd_then_gradients_reach_the_codebooks() -> None:
         if ("raw_pos_deltas" in n or "raw_neg_deltas" in n) and p.grad is not None
     }
     assert codebook_grads, "the LC-QAT engine should own codebook deltas"
-    # Magnitude, not presence: at alpha=1 the data term is scaled by zero, so a
-    # `.grad` of exactly 0.0 on a codebook means the anchor was detached from the
-    # graph and the whole objective reduced to a constant. `is not None` would
-    # pass on that, which is the whole reason this asserts `> 0`.
+    # Magnitude, not presence: at alpha=1 the data term is scaled by zero, so a `.grad` of exactly 0.0 on a codebook means the anchor was detached from the graph and the whole objective reduced to a constant. `is not None` would pass on that, which is the whole reason this asserts `> 0`.
     assert any(g.abs().sum() > 0 for g in codebook_grads.values()), (
         "no codebook received a nonzero gradient from the KD anchor"
     )

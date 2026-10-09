@@ -80,9 +80,7 @@ def test_when_shared_parameters_then_wte_trains_on_every_block():
         loss, _ = engine.denoise_step(idx, block_idx=b)
         loss.backward()
         grad = engine.model.transformer.wte.weight.grad
-        # Non-zero, not merely present: this file's whole premise is that a
-        # zero tensor transmits no gradient, so `grad is not None` alone is
-        # satisfied by the exact vacuity it exists to rule out.
+        # Non-zero, not merely present: this file's whole premise is that a zero tensor transmits no gradient, so `grad is not None` alone is satisfied by the exact vacuity it exists to rule out.
         assert grad is not None
         assert grad.abs().sum() > 0, f"wte received an all-zero gradient on block {b}"
 
@@ -142,8 +140,7 @@ def test_when_freezer_freezes_then_the_veto_survives_later_steps():
     freezer = SelectiveFreezer(engine.model, warmup_steps=0, freeze_middle_frac=1.0)
     # 4 layers: the band is clamped to layers 1..2 (never the first or last).
     n_layer, start, end = freezer.layer_bounds()
-    # n_layer is pinned as well: `start`/`end` are only bounds if the band
-    # was computed against the depth we actually built.
+    # n_layer is pinned as well: `start`/`end` are only bounds if the band was computed against the depth we actually built.
     assert n_layer == 4 and start >= 1 and end <= 3
     assert freezer.freeze() > 0
     engine.set_freezer(freezer)
@@ -199,9 +196,7 @@ def test_when_set_freezer_none_then_the_veto_stops_applying():
     freezer.freeze()
     engine.set_freezer(freezer)
 
-    # Block 0 owns layers 0 and 1; layer 1 is in the frozen middle band. Not all
-    # of it: attn.c_q / attn.c_k are CRITICAL_PATTERNS and stay trainable by
-    # design (EfQAT keeps the outlier layers), so check a non-critical param.
+    # Block 0 owns layers 0 and 1; layer 1 is in the frozen middle band. Not all of it: attn.c_q / attn.c_k are CRITICAL_PATTERNS and stay trainable by design (EfQAT keeps the outlier layers), so check a non-critical param.
     frozen_name = "transformer.h.1.mlp.c_fc.weight"
     critical_name = "transformer.h.1.attn.c_q.weight"
     engine._activate_block(0)

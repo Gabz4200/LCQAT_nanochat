@@ -45,8 +45,7 @@ RELAXATION_ACT_BODY_PAIRS = [
 
 def _model(seed: int = 0) -> GPT:
     config = GPTConfig(n_layer=2, n_head=4, n_embd=256, sequence_len=64, vocab_size=512)
-    # GPTConfig's GQA default is derived, not a field; set it explicitly so a
-    # change to its derivation cannot turn this into a construction error.
+    # GPTConfig's GQA default is derived, not a field; set it explicitly so a change to its derivation cannot turn this into a construction error.
     config.n_kv_head = 4
     torch.manual_seed(seed)
     return GPT(config)

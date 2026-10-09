@@ -21,9 +21,7 @@ def _tiny_lcqat_model() -> GPT:
         model = GPT(config)
     model.to_empty(device="cpu")
     model.init_weights()
-    # `retrofit_model` returns `nn.Module`; the return type above is the
-    # real `GPT`, which has `transformer.h` as a typed `BlockList`. The
-    # retrofit mutates in place and returns the same object.
+    # `retrofit_model` returns `nn.Module`; the return type above is the real `GPT`, which has `transformer.h` as a typed `BlockList`. The retrofit mutates in place and returns the same object.
     retrofit_model(model, PRESETS["small"])
     return model  # type: ignore[return-value]
 

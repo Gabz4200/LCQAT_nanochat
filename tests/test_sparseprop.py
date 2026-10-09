@@ -270,8 +270,7 @@ class TestSparseLayoutContracts:
         assert int(col_ptr[-1]) == nnz
         assert col_idx.numel() == nnz
         assert row_idx.numel() == nnz
-        # Every (row, col) in the CSR listing must be a mask entry, and the
-        # CSC listing must be the same set.
+        # Every (row, col) in the CSR listing must be a mask entry, and the CSC listing must be the same set.
         rows_csr = _nnz_row_indices(row_ptr, mask.shape[0]).long()
         cols_csc = _csc_col_indices(col_ptr, mask.shape[1]).long()
         csr_set = {(int(r), int(c)) for r, c in zip(rows_csr, col_idx.long())}

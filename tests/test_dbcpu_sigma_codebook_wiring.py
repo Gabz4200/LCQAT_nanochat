@@ -127,9 +127,7 @@ class TestEngineTraining:
                 seen.append((type(layer).__name__, float(sigma.reshape(-1)[0])))
             return original(layer, x, sigma)
 
-        # Both modules import the helper by value, so both bindings have to be
-        # replaced. Patching only `gpt` would miss the denoise head and the
-        # adapter -- which is exactly the coverage this test exists to check.
+        # Both modules import the helper by value, so both bindings have to be replaced. Patching only `gpt` would miss the denoise head and the adapter -- which is exactly the coverage this test exists to check.
         gpt_mod.maybe_sigma_call = spy
         db_mod.maybe_sigma_call = spy
         original_sample = engine.partitioner.sample_sigma
@@ -142,15 +140,11 @@ class TestEngineTraining:
             engine.partitioner.sample_sigma = original_sample
 
         assert seen, "no conditioned layer was reached at all"
-        # Every call must carry the step's sigma, not a per-row sample of it.
-        # A per-row sigma is the subtler bug: the codebook would still vary
-        # across the batch, so the model would train, but it would be
-        # conditioning on noise levels the denoiser never saw.
+        # Every call must carry the step's sigma, not a per-row sample of it. A per-row sigma is the subtler bug: the codebook would still vary across the batch, so the model would train, but it would be conditioning on noise levels the denoiser never saw.
         assert all(v == pytest.approx(7.25) for _, v in seen), (
             f"layers saw wrong sigmas: {sorted(set(v for _, v in seen))}"
         )
-        # And more than one call site must be covered, so a regression that
-        # fixes the MLP but drops the denoise head (or the adapter) is caught.
+        # And more than one call site must be covered, so a regression that fixes the MLP but drops the denoise head (or the adapter) is caught.
         assert len(seen) > 1, f"only one layer received sigma: {seen}"
 
     def test_when_not_conditioned_then_the_static_path_is_unchanged(self) -> None:
@@ -195,14 +189,11 @@ class TestBaseTransformerLayers:
                 "modulated() must produce a SigmaModulatedCodebook"
             )
 
-        # Without sigma this raises, which is the point: the base MLPs are only
-        # reachable with sigma threaded, and the flag would otherwise report
-        # itself enabled while these layers trained unconditioned.
+        # Without sigma this raises, which is the point: the base MLPs are only reachable with sigma threaded, and the flag would otherwise report itself enabled while these layers trained unconditioned.
         out = mlp(torch.randn(3, 16), sigma=torch.full((3, 1, 1), 4.0))
         assert out.shape == (3, 16)
         out.sum().backward()
-        # `act_quantizer` is typed as the union; the test has just swapped in
-        # a `SigmaModulatedCodebook`, so narrow before reading `gain_net`.
+        # `act_quantizer` is typed as the union; the test has just swapped in a `SigmaModulatedCodebook`, so narrow before reading `gain_net`.
         codebook = mlp.c_fc.act_quantizer
         assert isinstance(codebook, SigmaModulatedCodebook), (
             "test expected a sigma-conditioned codebook with gain_net"
@@ -230,33 +221,17 @@ class TestBaseTransformerLayers:
             torch.manual_seed(seed)
             mlp = MLP.__new__(MLP)
             torch.nn.Module.__init__(mlp)
-            # `K_weight` is left at its 3-level default if not set, and 3 levels
-            # over a signed weight matrix round almost every weight to the zero
-            # anchor -- the layer's output collapses to 0.0 and any comparison
-            # between two zeros trivially "matches". `K_act=15` likewise needs
-            # enough levels to resolve the relu^2 in between.
+            # `K_weight` is left at its 3-level default if not set, and 3 levels over a signed weight matrix round almost every weight to the zero anchor -- the layer's output collapses to 0.0 and any comparison between two zeros trivially "matches". `K_act=15` likewise needs enough levels to resolve the relu^2 in between.
             mlp.c_fc = LCQATLinear(16, 32, bias=False, K_act=15, K_weight=15)
             mlp.c_proj = LCQATLinear(32, 16, bias=False, K_act=15, K_weight=15)
             for layer in (mlp.c_fc, mlp.c_proj):
                 layer.act_quantizer = modulated(layer.act_quantizer)
-            # Non-degenerate weights: a freshly built `LCQATLinear` initializes
-            # to a tiny span, and the relu^2 in between zeroes most of it, so
-            # the whole output collapses to 0.0 and any comparison of two zeros
-            # trivially "matches".
+            # Non-degenerate weights: a freshly built `LCQATLinear` initializes to a tiny span, and the relu^2 in between zeroes most of it, so the whole output collapses to 0.0 and any comparison of two zeros trivially "matches".
             with torch.no_grad():
                 mlp.c_fc.weight.normal_(0.0, 0.5)
                 mlp.c_proj.weight.normal_(0.0, 0.5)
                 for layer in (mlp.c_fc, mlp.c_proj):
-                    # A *moderate* gain. The last layer's `SiLU` is fed
-                    # `log(sigma)`, which is -4.6 at sigma=0.01 and +4.6 at
-                    # sigma=100, so a weight of 1.0 drives the raw output to the
-                    # clamp and the gain saturates at exp(4) ~= 54.6. The
-                    # codebook then spans +-54 while the activations are +-2, so
-                    # every input lands in the middle bucket, the zero anchor,
-                    # and the whole layer returns 0.0 -- a "different output"
-                    # that is really two tensors of zeros.
-                    # `nn.Sequential.__getitem__` yields `nn.Module`; assert
-                    # so the checker narrows to `Linear` before `.weight`.
+                    # A *moderate* gain. The last layer's `SiLU` is fed `log(sigma)`, which is -4.6 at sigma=0.01 and +4.6 at sigma=100, so a weight of 1.0 drives the raw output to the clamp and the gain saturates at exp(4) ~= 54.6. The codebook then spans +-54 while the activations are +-2, so every input lands in the middle bucket, the zero anchor, and the whole layer returns 0.0 -- a "different output" that is really two tensors of zeros. `nn.Sequential.__getitem__` yields `nn.Module`; assert so the checker narrows to `Linear` before `.weight`.
                     codebook = layer.act_quantizer
                     assert isinstance(codebook, SigmaModulatedCodebook)
                     last = codebook.gain_net[-1]
@@ -265,12 +240,10 @@ class TestBaseTransformerLayers:
             return mlp
 
         x = torch.randn(2, 16)
-        # Identical weights in both arms: without the seed the two MLPs would
-        # differ anyway and the comparison would prove nothing.
+        # Identical weights in both arms: without the seed the two MLPs would differ anyway and the comparison would prove nothing.
         low = build(0)(x, sigma=torch.full((2, 1, 1), 0.01))
         high = build(0)(x, sigma=torch.full((2, 1, 1), 100.0))
-        # The arms must be non-degenerate, or this compares two zero tensors and
-        # passes for the wrong reason.
+        # The arms must be non-degenerate, or this compares two zero tensors and passes for the wrong reason.
         assert float(low.detach().abs().max()) > 1e-6, "MLP output is identically zero"
         assert not torch.allclose(low, high), (
             "the MLP produced identical output for sigma 0.01 and 100: the "
@@ -328,8 +301,7 @@ class TestQuantizedRuntimeGuard:
 
         mlp = MLP.__new__(MLP)
         torch.nn.Module.__init__(mlp)
-        # A plain float MLP must still run with sigma threaded through, which is
-        # the shape the guard has to leave alone.
+        # A plain float MLP must still run with sigma threaded through, which is the shape the guard has to leave alone.
         mlp.c_fc = torch.nn.Linear(8, 16, bias=False)
         mlp.c_proj = torch.nn.Linear(16, 8, bias=False)
         out = mlp(torch.randn(2, 8), sigma=torch.tensor([[1.0]]))
@@ -394,8 +366,7 @@ class TestGradientScaling:
         g_scaled = codebook.base.raw_pos_deltas.grad
         assert g_scaled is not None, "codebook delta gradient is None"
         assert float(g_scaled.abs().sum()) > 0.0
-        # The input gradient is the STE identity in both cases, so its magnitude
-        # must be unchanged by the codebook scale.
+        # The input gradient is the STE identity in both cases, so its magnitude must be unchanged by the codebook scale.
         assert x.grad is not None and x2.grad is not None, (
             "input gradient is None after backward"
         )

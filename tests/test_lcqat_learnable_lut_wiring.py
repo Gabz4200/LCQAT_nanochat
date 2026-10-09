@@ -67,10 +67,7 @@ def build_mlp(
             _out_cb(c_fc).get_codebook(), _act_cb(c_proj).get_codebook()
         ).to(torch.uint8),
     )
-    # The fused chain dispatches on packed buffers, so install a trivial packed
-    # form for each side. Parity is about the activation table, not the matmul.
-    # The reference index kernel requires uint8 act indices, so the buffer is
-    # stored in the same uint8 form the real export produces for K <= 16.
+    # The fused chain dispatches on packed buffers, so install a trivial packed form for each side. Parity is about the activation table, not the matmul. The reference index kernel requires uint8 act indices, so the buffer is stored in the same uint8 form the real export produces for K <= 16.
     for layer in (c_fc, c_proj):
         indices = layer.weight_quantizer(layer.weight).indices
         layer.register_buffer("packed_weight_indices", indices.to(torch.uint8))
@@ -114,10 +111,7 @@ class TestFusedChainLutParity:
         x = torch.randn(4, 16)
         with torch.no_grad():
             before = c_fc.quantized_mlp_chain(x, c_proj)
-            # Repoint an index the chain actually produces. Index 0 is the
-            # zero anchor: relu^2 maps every negative input there, so editing
-            # that row would leave the output unchanged and the test would pass
-            # for the wrong reason.
+            # Repoint an index the chain actually produces. Index 0 is the zero anchor: relu^2 maps every negative input there, so editing that row would leave the output unchanged and the test would pass for the wrong reason.
             table = learnable.resolved_table()
             reachable = table[table != 0]
             assert reachable.numel() > 0, "no non-zero output index to test with"

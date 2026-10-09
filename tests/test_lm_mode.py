@@ -106,10 +106,7 @@ def test_when_db_blocks_zero_then_checkpoint_meta_db_is_none():
 
     ckpt_dir = os.path.join(get_base_dir(), "base_checkpoints", tag)
     assert os.path.isdir(ckpt_dir), f"no checkpoint directory at {ckpt_dir}"
-    # Through load_checkpoint rather than torch.load on a glob: the directory
-    # also holds optim_*.pt, which sorts after model_*.pt, so a `sorted(...)[-1]`
-    # reads the optimizer state and reports its keys instead of the
-    # checkpoint's.
+    # Through load_checkpoint rather than torch.load on a glob: the directory also holds optim_*.pt, which sorts after model_*.pt, so a `sorted(...)[-1]` reads the optimizer state and reports its keys instead of the checkpoint's.
     model_data, _optim, meta = load_checkpoint(ckpt_dir, 2, "cpu", load_optimizer=False)
     assert "db" in meta, "meta has no 'db' key at all"
     assert meta["db"] is None, f"meta['db'] is {meta['db']!r}, expected None"

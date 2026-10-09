@@ -24,8 +24,7 @@ import pytest
 
 from tests.test_w0_smoke import SMOKE_ARGS
 
-# ~171 s measured per probe (§12.4) with headroom for the float twin, which adds
-# a second full model to the KD probe. Comfortably above the 600 s floor.
+# ~171 s measured per probe (§12.4) with headroom for the float twin, which adds a second full model to the KD probe. Comfortably above the 600 s floor.
 RUN_TIMEOUT = 1200
 
 
@@ -116,10 +115,7 @@ def test_when_latch_blocks_are_set_then_the_run_completes_and_reports_latched_bl
         "the latch never fired during the run\n--- stdout tail ---\n"
         f"{proc.stdout[-3000:]}"
     )
-    # The line reports the latch step and the accumulated latched set. Reading
-    # the accumulated set (not just the requested targets) is what proves block
-    # 0 was actually retired rather than the freezer being constructed and left
-    # unconsulted.
+    # The line reports the latch step and the accumulated latched set. Reading the accumulated set (not just the requested targets) is what proves block 0 was actually retired rather than the freezer being constructed and left unconsulted.
     assert "total latched: [0]" in latch_lines[0], latch_lines[0]
     assert "permanently at step 0" in latch_lines[0], latch_lines[0]
 
@@ -149,8 +145,7 @@ def test_when_kd_denoiser_alpha_is_set_then_the_run_completes(tmp_path) -> None:
 
     _assert_ran(proc)
     assert "KD denoiser distillation enabled" in proc.stdout, proc.stdout[-3000:]
-    # The anchor is installed on the engine, so the per-step line carries the
-    # kd field. That the field reads 0.0 is expected -- see the docstring.
+    # The anchor is installed on the engine, so the per-step line carries the kd field. That the field reads 0.0 is expected -- see the docstring.
     assert "kd:" in proc.stdout, (
         f"the per-step kd field is missing, so the anchor is not installed\n"
         f"{proc.stdout[-3000:]}"

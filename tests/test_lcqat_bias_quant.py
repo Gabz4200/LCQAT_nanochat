@@ -259,9 +259,7 @@ class TestZeroAnchor:
         self,
     ) -> None:
         linear = quantized(quantize_bias=True)
-        # A full-length vector with one entry zeroed: `bucketize` is
-        # position-wise, so this asks the same question as the test above of the
-        # real per-entry path rather than of a detached scalar.
+        # A full-length vector with one entry zeroed: `bucketize` is position-wise, so this asks the same question as the test above of the real per-entry path rather than of a detached scalar.
         bias = linear.bias.detach().clone()
         bias[7] = 0.0
         quantizer = linear.bias_quantizer
@@ -652,8 +650,7 @@ class TestRetrofitPath:
             net_quantizer.get_codebook(),
         )
 
-        # strict=True: the flag has to be in the config, or the resume fails
-        # with "unexpected keys" for every bias codebook in the checkpoint.
+        # strict=True: the flag has to be in the config, or the resume fails with "unexpected keys" for every bias codebook in the checkpoint.
         clone.load_state_dict(state)
         assert torch.equal(
             clone_quantizer.get_codebook(),

@@ -90,8 +90,7 @@ def test_when_atomize_then_rules_are_well_formed() -> None:
     assert result.rules, "structured corpus produced no rules"
     for rule in result.rules:
         assert rule.premise and rule.conclusion
-        # A rule whose premise is already inside its conclusion has a penalty
-        # at its minimum by construction, so it could never teach anything.
+        # A rule whose premise is already inside its conclusion has a penalty at its minimum by construction, so it could never teach anything.
         assert not rule.premise <= rule.conclusion
 
 

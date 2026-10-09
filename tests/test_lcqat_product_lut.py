@@ -164,8 +164,7 @@ class TestFusedDeviationIsRoundingOnly:
             w = torch.randint(0, k, (8, n))
             _, deviation = fused_matches_reference(a, act_lut, w, weight_lut, n)
             deviations.append(deviation)
-            # FP32 has ~1.2e-7 relative precision; a term sum of `n` of them
-            # accumulates at most ~n * eps * max|term|, which stays tiny here.
+            # FP32 has ~1.2e-7 relative precision; a term sum of `n` of them accumulates at most ~n * eps * max|term|, which stays tiny here.
             assert deviation < 1e-3, f"n={n} deviation {deviation} is not rounding"
         # And it must not grow superlinearly with the reduction length.
         assert deviations[2] < max(deviations[0], 1e-5) * 200

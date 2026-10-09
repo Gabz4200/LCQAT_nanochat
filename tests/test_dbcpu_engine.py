@@ -105,6 +105,5 @@ def test_when_denoise_step_with_attn_mask_then_mask_changes_the_loss() -> None:
     torch.manual_seed(7)
     masked, _ = engine.denoise_step(idx, block_idx=0, attn_mask=mask)
     assert torch.isfinite(unmasked) and torch.isfinite(masked)
-    # A causal mask over a full (non-packed) sequence must be a no-op relative
-    # to the default, because attention is already causal.
+    # A causal mask over a full (non-packed) sequence must be a no-op relative to the default, because attention is already causal.
     assert torch.allclose(unmasked, masked, atol=1e-5)

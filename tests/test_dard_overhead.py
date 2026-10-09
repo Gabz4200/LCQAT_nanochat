@@ -52,8 +52,7 @@ def test_when_dard_runs_then_its_marginal_overhead_is_measured() -> None:
     idx = torch.randint(0, vocab, (batch, seq))
     targets = torch.randint(0, vocab, (batch, seq))
 
-    # Rules mined from a real corpus, so the penalty touches the same shape of
-    # rule set a training run would use.
+    # Rules mined from a real corpus, so the penalty touches the same shape of rule set a training run would use.
     shards = shard_corpus(_corpus(vocab), max_shard_size=500)
     rule_set = mine_rules(shards, vocab_size=vocab, max_rules_per_shard=64)
     dard = DardRuleLoss(rule_set, gamma=10.0)
@@ -82,10 +81,7 @@ def test_when_dard_runs_then_its_marginal_overhead_is_measured() -> None:
         )
         (ce + dard(logits)).backward()
 
-    # Single-shot timing on a shared host is noisy at the millisecond scale, and
-    # an *impossible* result (negative overhead) is the tell. Interleaved
-    # best-of-N: taking the minimum of repeated trials cancels scheduler jitter,
-    # because noise only ever adds time.
+    # Single-shot timing on a shared host is noisy at the millisecond scale, and an *impossible* result (negative overhead) is the tell. Interleaved best-of-N: taking the minimum of repeated trials cancels scheduler jitter, because noise only ever adds time.
     trials = []
     for _ in range(5):
         trials.append((_time(ce_backward), _time(ce_plus_dard_backward)))

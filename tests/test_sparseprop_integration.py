@@ -44,8 +44,7 @@ def build_tiny_gpt():
     return model
 
 
-#: A 4x6 mask with no row or column fully zero, so every row keeps at least one
-#: nnz (the per-row floor `magnitude_mask` enforces).
+#: A 4x6 mask with no row or column fully zero, so every row keeps at least one nnz (the per-row floor `magnitude_mask` enforces).
 SAMPLE_MASK_ROWS = (
     (1, 0, 1, 0, 1, 0),
     (0, 1, 0, 1, 0, 1),
@@ -61,9 +60,7 @@ def sample_mask() -> torch.Tensor:
 
 @pytest.fixture
 def tiny_model():
-    # Active weights: zero-init c_proj transmits no gradient, so gradient-flow
-    # tests on the zero model pass vacuously. Randomize projections off zero,
-    # preserving this file's (n_layer=2, n_embd=32) shape.
+    # Active weights: zero-init c_proj transmits no gradient, so gradient-flow tests on the zero model pass vacuously. Randomize projections off zero, preserving this file's (n_layer=2, n_embd=32) shape.
     import torch as _torch
 
     model = build_tiny_gpt()
@@ -224,8 +221,7 @@ class TestInjection:
             assert 0.55 <= actual <= 0.65, (
                 f"Module sparsity {actual:.2f} outside range for 0.6 target"
             )
-            # The pruning criterion writes exact zeros, which is what makes a
-            # pruned position a structural zero under the LC-QAT codebook.
+            # The pruning criterion writes exact zeros, which is what makes a pruned position a structural zero under the LC-QAT codebook.
             assert (m.weight.detach()[~m.sparsity_mask] == 0.0).all()
         total_all = sum(m.weight.numel() for m in layers)
         nnz_all = sum(int(m.sparsity_mask.sum()) for m in layers)
@@ -307,9 +303,7 @@ class TestDBCPUIntegration:
         # Inject SparseProp wrapping LCQATLinear while preserving codebooks
         inject_sparseprop_layers(model, sparsity=0.5, with_lcqat=True)
 
-        # After inject with_lcqat=True, top-level LCQATLinear modules are wrapped
-        # in SparsePropLinearLCQAT (which absorbs the LCQATLinear's weight/
-        # quantizers in-tree, so no orphan LCQATLinear remains).
+        # After inject with_lcqat=True, top-level LCQATLinear modules are wrapped in SparsePropLinearLCQAT (which absorbs the LCQATLinear's weight/ quantizers in-tree, so no orphan LCQATLinear remains).
         sparse_count = sum(
             1 for m in model.modules() if isinstance(m, SparsePropLinearLCQAT)
         )
@@ -476,16 +470,7 @@ class TestSparsePropDenseGEMMPath:
         """
         from nanochat.models.quant import LayerKConfig, retrofit_model
 
-        # Both arms must be the *same* layer: inject_sparseprop_layers wraps a
-        # subset of the Linears, so picking "the first LCQATLinear" and "the
-        # first SparsePropLinearLCQAT" independently can land on different
-        # layers and compare two unrelated matrices.
-        # Both arms must be the *same layer* on *independent models*.
-        # `retrofit_model` mutates the model in place and re-parents its
-        # quantizers, so retrofitting the same GPT twice leaves the second call
-        # wrapping modules the first already replaced -- and both arms then share
-        # one weight tensor, which makes the ratio exactly 1.0 and the test
-        # silently vacuous.
+        # Both arms must be the *same* layer: inject_sparseprop_layers wraps a subset of the Linears, so picking "the first LCQATLinear" and "the first SparsePropLinearLCQAT" independently can land on different layers and compare two unrelated matrices. Both arms must be the *same layer* on *independent models*. `retrofit_model` mutates the model in place and re-parents its quantizers, so retrofitting the same GPT twice leaves the second call wrapping modules the first already replaced -- and both arms then share one weight tensor, which makes the ratio exactly 1.0 and the test silently vacuous.
         dense = retrofit_model(_fresh_tiny_gpt(), LayerKConfig(min_linear_dim=1))
         dense_named = {
             n: m for n, m in dense.named_modules() if isinstance(m, LCQATLinear)
@@ -660,9 +645,7 @@ class TestSparsePropLearnedActivationLUT:
         dense = build()
         torch.manual_seed(0)
         sparse = build()
-        # Share every weight so the two arms differ only in the activation path.
-        # `retrofit_model` re-parents quantizers, so copy by module name, not by
-        # parameter position.
+        # Share every weight so the two arms differ only in the activation path. `retrofit_model` re-parents quantizers, so copy by module name, not by parameter position.
         dense_sd = dense.state_dict()
         with torch.no_grad():
             for name, param in sparse.named_parameters():
@@ -689,10 +672,7 @@ class TestSparsePropLearnedActivationLUT:
         s_fc = sparse.transformer.h[0].mlp.c_fc
         assert s_fc.in_features == d_fc.in_features
 
-        # Perturb the trained table off its init so the relaxation is observable:
-        # at init the hard and soft paths agree, and a dead LUT would pass.
-        # The SAME perturbation is applied to both arms -- a fresh draw per model
-        # would make them differ and mask the regression this test exists to catch.
+        # Perturb the trained table off its init so the relaxation is observable: at init the hard and soft paths agree, and a dead LUT would pass. The SAME perturbation is applied to both arms -- a fresh draw per model would make them differ and mask the regression this test exists to catch.
         torch.manual_seed(1234)
         for model in (dense, sparse):
             for mod in model.modules():
@@ -709,11 +689,7 @@ class TestSparsePropLearnedActivationLUT:
         d_out = d_fc.apply_trained_activation(y)
         s_out = s_fc.apply_trained_activation(y)
         assert s_out.shape == d_out.shape
-        # float32 tolerance, not bit-equality: the two arms reach the same values
-        # through a different op order (the sparse layer's dense GEMM vs the
-        # dense layer's F.linear), which differs by at most an ULP. Before the
-        # fix this differed by the relaxation term itself, not by rounding --
-        # see the gradient test for the sharp version of the invariant.
+        # float32 tolerance, not bit-equality: the two arms reach the same values through a different op order (the sparse layer's dense GEMM vs the dense layer's F.linear), which differs by at most an ULP. Before the fix this differed by the relaxation term itself, not by rounding -- see the gradient test for the sharp version of the invariant.
         torch.testing.assert_close(s_out, d_out, rtol=1e-6, atol=1e-6)
 
     def test_lut_parameters_receive_gradient(self, models):

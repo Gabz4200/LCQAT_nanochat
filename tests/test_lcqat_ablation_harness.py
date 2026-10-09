@@ -68,8 +68,7 @@ class TestQuantizerSelection:
 
     def test_when_the_layer_lacks_the_quantizer_then_selection_raises(self) -> None:
         layer = retrofitted_layer(layer="c_fc")
-        # c_fc is built with quantize_out=True by the asym preset, so use a layer
-        # that genuinely has no `out_quantizer` to prove the guard fires.
+        # c_fc is built with quantize_out=True by the asym preset, so use a layer that genuinely has no `out_quantizer` to prove the guard fires.
         assert hasattr(layer, "out_quantizer")
         stripped = retrofitted_layer()
         stripped.out_quantizer = None
@@ -166,8 +165,7 @@ class TestPairedComparison:
         layer = retrofitted_layer()
         probe = relu2_probe(layer.in_features)
         good = measure_reconstruction(layer, probe, "asym", which="act")
-        # A probe scaled up is far outside the codebook's range, so it
-        # reconstructs worse: an unambiguous, data-driven difference.
+        # A probe scaled up is far outside the codebook's range, so it reconstructs worse: an unambiguous, data-driven difference.
         bad = measure_reconstruction(layer, probe * 100.0, "small", which="act")
         assert bad.nmse > good.nmse, "precondition: the bad arm is worse"
 
@@ -285,8 +283,7 @@ class TestLeaderboardRendering:
         ]
         table = render_leaderboard(rows, "T")
         lines = table.splitlines()
-        # Distinct experiment prefix so the header row (whose first column is
-        # literally "experiment") is never counted as data.
+        # Distinct experiment prefix so the header row (whose first column is literally "experiment") is never counted as data.
         body = [line for line in lines if line.startswith("| zz")]
         assert len(body) == 3, f"expected 3 table rows, got {len(body)}:\n{table}"
         # Every data row must have the same column count as the header.

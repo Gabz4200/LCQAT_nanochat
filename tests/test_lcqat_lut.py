@@ -31,8 +31,7 @@ def test_when_compiling_then_lut_matches_direct_bucketization() -> None:
 
 
 def test_when_relu_squared_then_lut_is_monotonic_on_the_positive_branch() -> None:
-    # relu^2 is nondecreasing on [0, inf), so target indices must not decrease
-    # there; the negative branch maps everything to the anchor region.
+    # relu^2 is nondecreasing on [0, inf), so target indices must not decrease there; the negative branch maps everything to the anchor region.
     in_cb = make_codebook(15)
     out_cb = make_codebook(15)
     lut = compile_activation_lut(relu_squared, in_cb, out_cb).long()

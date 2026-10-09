@@ -69,6 +69,5 @@ def test_when_runtime_module_backward_then_actionable_error(tmp_path) -> None:
     export_lcqat_checkpoint(module, str(tmp_path / "linear_export2.pt"))
     x = torch.randn(3, 16)
     out = module(x)
-    # exported codebooks are frozen (no grad path) and the index op is
-    # inference-only; any backward through it must not silently succeed.
+    # exported codebooks are frozen (no grad path) and the index op is inference-only; any backward through it must not silently succeed.
     assert not out.requires_grad

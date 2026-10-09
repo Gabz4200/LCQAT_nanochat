@@ -51,8 +51,7 @@ def _sample(m=8, n=16, k=15, density=0.4, seed=0):
     torch.manual_seed(seed)
     indices = torch.randint(0, k, (m, n))
     mask = torch.rand(m, n) < density
-    # Guarantee at least one survivor per row so the reconstruction has no
-    # empty rows (which magnitude pruning also guarantees).
+    # Guarantee at least one survivor per row so the reconstruction has no empty rows (which magnitude pruning also guarantees).
     empty = ~mask.any(dim=1)
     mask[empty, 0] = True
     return indices, mask
@@ -106,11 +105,7 @@ class TestAlphabetCompaction:
     def test_when_a_level_is_unused_then_it_is_dropped(self):
         indices = torch.zeros(4, 8, dtype=torch.long)  # only level 0 used
         plan = plan_sparse_export(indices, None, k=15)
-        # One level survives, but the *exported* alphabet is floored at
-        # MIN_EXPORT_ALPHABET: packing selects a storage format from K and the
-        # densest one (trits) starts at 3, so K=1 has no valid format and
-        # `pack_sparse_plan` would raise. `used` records the truth; `k_used`
-        # records what can actually be stored.
+        # One level survives, but the *exported* alphabet is floored at MIN_EXPORT_ALPHABET: packing selects a storage format from K and the densest one (trits) starts at 3, so K=1 has no valid format and `pack_sparse_plan` would raise. `used` records the truth; `k_used` records what can actually be stored.
         assert plan.used.tolist() == [0]
         assert plan.k_used == MIN_EXPORT_ALPHABET
         assert plan.compaction
@@ -159,8 +154,7 @@ class TestAlphabetCompaction:
         used = plan.used.tolist()
         assert used == sorted(used), "compaction must preserve level order"
         assert m_neg in used
-        # The anchor's compacted index is its rank among the survivors, which
-        # is what a consumer must use to find the zero row of a fused LUT.
+        # The anchor's compacted index is its rank among the survivors, which is what a consumer must use to find the zero row of a fused LUT.
         anchor_compacted = int(plan.remap[m_neg])
         assert used[anchor_compacted] == m_neg
 
@@ -169,8 +163,7 @@ class TestAlphabetCompaction:
         plan = plan_sparse_export(indices, None, k=15)
         assert plan.k_used == 15
         assert not plan.compaction
-        # keep_indices is CSR-ordered, so compare against the dense flattening
-        # rather than the 2-D shape.
+        # keep_indices is CSR-ordered, so compare against the dense flattening rather than the 2-D shape.
         assert torch.equal(plan.keep_indices.long(), indices.reshape(-1).long())
 
     def test_when_layer_is_fully_pruned_then_an_artifact_is_still_emitted(self):
@@ -224,8 +217,7 @@ class TestSparseRoundTrip:
         break_even = sparsity_break_even(indices, k)
         assert 0.6 < break_even < 0.95, break_even
 
-        # At exactly break-even sparsity the two footprints are equal; above it
-        # the sparse layout wins.
+        # At exactly break-even sparsity the two footprints are equal; above it the sparse layout wins.
         for sparsity, expect_sparse_wins in ((break_even - 0.2, False), (0.95, True)):
             keep = int(m * n * (1 - sparsity))
             mask = torch.zeros(m, n, dtype=torch.bool)
@@ -253,24 +245,19 @@ class TestSparseRoundTrip:
             ],
             dim=1,
         )
-        # max index is 14, so the inferred K is 15 and both paths see the same
-        # two surviving levels (0 and 14).
+        # max index is 14, so the inferred K is 15 and both paths see the same two surviving levels (0 and 14).
         inferred = plan_sparse_export(indices, None, k=None)
         explicit = plan_sparse_export(indices, None, k=15)
         assert inferred.k_used == explicit.k_used == MIN_EXPORT_ALPHABET
         assert inferred.used.tolist() == explicit.used.tolist() == [0, 14]
         assert torch.equal(inferred.keep_indices, explicit.keep_indices)
 
-        # The case the inference actually gets wrong: the top level is unused,
-        # so `indices.max()` understates the layer's alphabet. The compacted
-        # alphabet is unaffected -- only the verdict about whether the layer was
-        # 15 levels wide to begin with differs.
+        # The case the inference actually gets wrong: the top level is unused, so `indices.max()` understates the layer's alphabet. The compacted alphabet is unaffected -- only the verdict about whether the layer was 15 levels wide to begin with differs.
         small = torch.zeros(4, 8, dtype=torch.long)  # only level 0
         assert plan_sparse_export(small, None, k=None).k_used == MIN_EXPORT_ALPHABET
         assert plan_sparse_export(small, None, k=15).k_used == MIN_EXPORT_ALPHABET
         assert plan_sparse_export(small, None, k=15).compaction is True
-        # A layer that genuinely uses every level is not compacted, so the
-        # faithful case reports no compaction.
+        # A layer that genuinely uses every level is not compacted, so the faithful case reports no compaction.
         full = torch.arange(15).reshape(1, 15)
         assert plan_sparse_export(full, None, k=None).k_used == 15
         assert plan_sparse_export(full, None, k=None).compaction is False
@@ -360,8 +347,7 @@ class TestSparseExportIntegration:
         state = export_lcqat_checkpoint(model, str(tmp_path / "both.pt"), sparse=True)
         packed = state["0.packed_weight_indices"]
         fmt = int(state["0.weight_index_format"])
-        # `unpack_weight_indices(packed, n, k)` takes the *in_features* width and
-        # returns the [m, n] index matrix, so pass 16 (not the out width 8).
+        # `unpack_weight_indices(packed, n, k)` takes the *in_features* width and returns the [m, n] index matrix, so pass 16 (not the out width 8).
         unpacked = unpack_weight_indices(packed, 16, 15)
         assert tuple(unpacked.shape) == (8, 16), tuple(unpacked.shape)
         assert fmt in (0, 1, 2, 3)

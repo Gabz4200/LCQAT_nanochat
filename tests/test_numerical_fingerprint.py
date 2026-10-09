@@ -34,8 +34,7 @@ REFERENCE_PATH = pathlib.Path(__file__).resolve().parent / "numerical_reference.
 def reference() -> dict[str, str]:
     if not REFERENCE_PATH.exists():
         pytest.skip(f"no recorded fingerprint at {REFERENCE_PATH}")
-    # The file nests the digests under "digests"; this fixture exposes just that
-    # mapping, so the assertions below read like the keys they check.
+    # The file nests the digests under "digests"; this fixture exposes just that mapping, so the assertions below read like the keys they check.
     return json.loads(REFERENCE_PATH.read_text())["digests"]
 
 
@@ -71,8 +70,7 @@ def test_arms_are_distinguishable() -> None:
     actual, _ = fingerprint()
     arms = ("plain_lm", "lcqat", "sparseprop")
     losses = {arm: actual[f"{arm}/loss"] for arm in arms}
-    # Every pair, not just "more than one distinct value": a gate where two of
-    # the three arms agree is half blind, and `len(set(...)) > 1` would pass it.
+    # Every pair, not just "more than one distinct value": a gate where two of the three arms agree is half blind, and `len(set(...)) > 1` would pass it.
     collisions = [
         (a, b)
         for i, a in enumerate(arms)

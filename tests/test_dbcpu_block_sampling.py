@@ -101,8 +101,7 @@ def test_when_micro_mode_then_earlier_blocks_gradients_are_discarded():
                 n.split(".")[1] for n in grads if n.startswith("db_denoise_heads.")
             )
         )
-    # ... but the next micro-step zeroes the ones it does not own, so at no point
-    # do gradients from more than one block survive.
+    # ... but the next micro-step zeroes the ones it does not own, so at no point do gradients from more than one block survive.
     assert all(len(s) == 1 for s in seen), (
         f"expected one surviving block per micro-step, got {[sorted(s) for s in seen]}"
     )

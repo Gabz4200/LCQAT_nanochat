@@ -274,8 +274,7 @@ def test_when_clip_bound_applied_then_update_bounded() -> None:
     opt.stage_mezo_estimate(123, torch.tensor(10.0), torch.tensor(-10.0))
     opt.step()
 
-    # clip_bound = a_t * delta_q = 1.5 * 0.0625 = 0.09375 at lr == lr_max.
-    # The update is lr * clipped, so |delta| <= lr * clip_bound.
+    # clip_bound = a_t * delta_q = 1.5 * 0.0625 = 0.09375 at lr == lr_max. The update is lr * clipped, so |delta| <= lr * clip_bound.
     max_delta = (p.data - before).abs().max().item()
     assert max_delta <= 1.0 * 0.09375 + 1e-6
 
@@ -287,8 +286,7 @@ def test_when_meta_step_tensor_then_trains_cell() -> None:
     opt = MeZo_MinExpLstm_Optimizer([p], backend="naive")
     opt.cell = cell
 
-    # Build a differentiable loss through the cell: a quadratic
-    # target so every parameter of the cell has a nonzero gradient.
+    # Build a differentiable loss through the cell: a quadratic target so every parameter of the cell has a nonzero gradient.
     x = torch.randn(16, 3)
     h = torch.randn(16, 1)
     gamma, beta, h_next = cell(x, h)
@@ -309,10 +307,7 @@ def test_when_meta_step_closure_then_trains_cell() -> None:
     model = torch.nn.Linear(4, 4)
     opt = MeZo_MinExpLstm_Optimizer(list(model.parameters()), backend="naive")
 
-    # A step first: the closure rebuilds each parameter
-    # from its step state (FIR history, hidden state), so
-    # seed_history/mu_history and the state must be
-    # populated before meta_step.
+    # A step first: the closure rebuilds each parameter from its step state (FIR history, hidden state), so seed_history/mu_history and the state must be populated before meta_step.
     x = torch.randn(8, 4)
     y = torch.randint(0, 4, (8,))
     opt.perturb(1, scaling=1.0)
@@ -331,10 +326,7 @@ def test_when_meta_step_closure_then_trains_cell() -> None:
 
     cell_before = [q.detach().clone() for q in opt.cell.parameters()]
     loss = opt.meta_step(model, closure)
-    # The closure rebuilt the loss from updated params through the
-    # cell, so the returned loss is differentiable (the optimizer
-    # raises TypeError otherwise). A vacuous `or True` here would
-    # let a silent no-op pass.
+    # The closure rebuilt the loss from updated params through the cell, so the returned loss is differentiable (the optimizer raises TypeError otherwise). A vacuous `or True` here would let a silent no-op pass.
     assert loss.requires_grad is True
     assert any(
         not torch.equal(b, q.detach())
@@ -416,8 +408,7 @@ def test_when_meta_step_closure_then_conv_w_receives_gradient() -> None:
     model = torch.nn.Linear(32, 32)
     opt = MeZo_MinExpLstm_Optimizer(list(model.parameters()), backend="naive")
 
-    # A few steps to populate the seed/mu history the FIR
-    # filter reads.
+    # A few steps to populate the seed/mu history the FIR filter reads.
     x = torch.randn(8, 32)
     y = torch.randint(0, 32, (8,))
     for seed in (1, 2, 3):
@@ -429,13 +420,7 @@ def test_when_meta_step_closure_then_conv_w_receives_gradient() -> None:
         opt.stage_mezo_estimate(seed, loss_pos, loss_neg)
         opt.step()
 
-    # The FiLM head is zero-initialized (the step-0
-    # safeguard), so the first meta-step leaves the
-    # FIR kernel with a zero gradient: gamma's gradient
-    # to fir_norm flows through film_proj, which sits at
-    # its zero fixed point. Two meta-steps -- the first
-    # moves the FiLM head off zero, the second gives
-    # conv_w a nonzero gradient.
+    # The FiLM head is zero-initialized (the step-0 safeguard), so the first meta-step leaves the FIR kernel with a zero gradient: gamma's gradient to fir_norm flows through film_proj, which sits at its zero fixed point. Two meta-steps -- the first moves the FiLM head off zero, the second gives conv_w a nonzero gradient.
     for _ in range(2):
         for q in opt.cell.parameters():
             q.grad = None
@@ -453,8 +438,5 @@ def test_when_meta_step_closure_then_conv_w_receives_gradient() -> None:
     )
     film_grad = opt.cell.film_proj.weight.grad
     assert film_grad is not None
-    # The FIR kernel's gradient is nonzero but smaller than
-    # the FiLM head's (the chain traverses the cell); pin
-    # the ordering so a severed FIR path (exactly zero) is
-    # distinguishable from a healthy small one.
+    # The FIR kernel's gradient is nonzero but smaller than the FiLM head's (the chain traverses the cell); pin the ordering so a severed FIR path (exactly zero) is distinguishable from a healthy small one.
     assert float(conv_w_grad.abs().sum()) < float(film_grad.abs().sum())

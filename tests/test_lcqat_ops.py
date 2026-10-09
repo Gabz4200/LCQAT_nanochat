@@ -128,8 +128,7 @@ def test_when_compile_naive_backend_then_composes() -> None:
 
 
 def test_when_compile_codebook_quantization_then_composes() -> None:
-    # base_train runs the retrofitted model under torch.compile; bucketize and
-    # the STE identity must survive tracing.
+    # base_train runs the retrofitted model under torch.compile; bucketize and the STE identity must survive tracing.
     from nanochat.models.quant import MemoryEfficientLearnedCodebook
 
     cb = MemoryEfficientLearnedCodebook.from_k(15, init_min=-2.0, init_max=2.0)

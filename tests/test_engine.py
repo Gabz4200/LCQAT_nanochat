@@ -10,8 +10,7 @@ import torch
 
 from nanochat.modules.engine import Engine, KVCache
 
-# -----------------------------------------------------------------------------
-# Mock classes for testing Engine without loading a real model
+# ----------------------------------------------------------------------------- Mock classes for testing Engine without loading a real model
 
 
 @dataclass
@@ -204,8 +203,7 @@ def test_multi_sample_first_token_diversity():
     for token_column, token_masks in gen:
         first_tokens = token_column  # This is the first (and only) yield
 
-    # With uniform distribution and 16 samples, they should NOT all be identical
-    # If they are all identical, the bug exists (broadcasting instead of sampling)
+    # With uniform distribution and 16 samples, they should NOT all be identical If they are all identical, the bug exists (broadcasting instead of sampling)
     unique_tokens = set(first_tokens)
     assert len(unique_tokens) > 1, (
         f"All {num_samples} samples got the same first token ({first_tokens[0]}). "

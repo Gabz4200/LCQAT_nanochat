@@ -31,9 +31,7 @@ import torch
 
 from nanochat.training.minexp_lstm import MinExpLSTMCell, SGD_MinExpLstm_Optimizer
 
-# ---------------------------------------------------------------------------
 # Cell
-# ---------------------------------------------------------------------------
 
 
 def test_cell_output_proj_zero_init_then_delta_is_zero() -> None:
@@ -76,13 +74,9 @@ def test_cell_gate_depends_only_on_input_not_prev_hidden() -> None:
     h_b = torch.full((3, 1), 7.0)
     _, _, h_next_a = cell(x, h_a)
     _, _, h_next_b = cell(x, h_b)
-    # The gate is a function of x alone, so h_next differs only
-    # through the h_prev term, and the two h_nexts share the same
-    # candidate (tilde_h) contribution.
+    # The gate is a function of x alone, so h_next differs only through the h_prev term, and the two h_nexts share the same candidate (tilde_h) contribution.
     assert not torch.allclose(h_next_a, h_next_b)
-    # hat_phi identical: reconstruct it from the two states.
-    # h_next = hat_phi * h_prev + (1 - hat_phi) * tilde_h
-    # => h_next_b - h_next_a = hat_phi * (h_b - h_a)
+    # hat_phi identical: reconstruct it from the two states. h_next = hat_phi * h_prev + (1 - hat_phi) * tilde_h => h_next_b - h_next_a = hat_phi * (h_b - h_a)
     hat_phi = (h_next_b - h_next_a) / (h_b - h_a)
     expected = torch.sigmoid(cell.phi_proj(x) - cell.iota_proj(x))
     assert torch.allclose(hat_phi, expected, atol=1e-5)
@@ -111,9 +105,7 @@ def test_cell_recurrence_is_linear_scan() -> None:
     assert torch.equal(delta, torch.zeros_like(delta))
 
 
-# ---------------------------------------------------------------------------
 # Optimizer: SGD equivalence (Phase 1 of the PRD verification plan)
-# ---------------------------------------------------------------------------
 
 
 def test_alpha_zero_matches_sgd_exactly() -> None:
@@ -178,9 +170,7 @@ def test_step_count_increments_and_states_are_int8() -> None:
     for key in ("ema_fast_int8", "ema_slow_int8", "h_int8"):
         assert state[key].dtype == torch.int8
         assert state[key].shape == p.shape
-    # Scales stay on-device as 0-dim tensors (the
-    # .item() a float would force is a CPU sync per
-    # tensor per step -- the dominant step cost).
+    # Scales stay on-device as 0-dim tensors (the .item() a float would force is a CPU sync per tensor per step -- the dominant step cost).
     for key in ("scale_fast", "scale_slow", "scale_h"):
         assert isinstance(state[key], torch.Tensor)
         assert state[key].ndim == 0
@@ -204,9 +194,7 @@ def test_state_footprint_is_three_bytes_per_param() -> None:
     assert state_bytes / n == 3.0
 
 
-# ---------------------------------------------------------------------------
 # Optimizer: elementwise independence (coordinate-wise processing)
-# ---------------------------------------------------------------------------
 
 
 def test_optimizer_is_permutation_invariant() -> None:
@@ -229,9 +217,7 @@ def test_optimizer_is_permutation_invariant() -> None:
     grad_a = torch.randn(4, 6)
     grad_b = grad_a.reshape(-1)[perm].reshape(4, 6)
 
-    # Synchronize both cells so every projection has identical
-    # weights across the two optimizers. Each projection keeps
-    # its own shape, so copy per-name, not one weight into all.
+    # Synchronize both cells so every projection has identical weights across the two optimizers. Each projection keeps its own shape, so copy per-name, not one weight into all.
     torch.manual_seed(123)
     ref = {
         name: (m.weight.clone(), m.bias.clone() if m.bias is not None else None)
@@ -295,9 +281,7 @@ def test_optimizer_rms_scale_invariance() -> None:
         opt_a.step()
         opt_b.step()
 
-    # Now scale the gradient by 100x for p_b only. The RMS normalization
-    # makes the cell inputs identical, so the learned residual delta is
-    # identical; only the SGD term scales.
+    # Now scale the gradient by 100x for p_b only. The RMS normalization makes the cell inputs identical, so the learned residual delta is identical; only the SGD term scales.
     p_a.grad = grad.clone()
     p_b.grad = grad.clone() * 100.0
     opt_a.step()
@@ -308,9 +292,7 @@ def test_optimizer_rms_scale_invariance() -> None:
     assert torch.isfinite(p_b).all()
 
 
-# ---------------------------------------------------------------------------
 # Optimizer: INT8 quantization roundtrip
-# ---------------------------------------------------------------------------
 
 
 def test_int8_quantize_dequantize_roundtrip_error_bounded() -> None:
@@ -362,9 +344,7 @@ def test_int8_states_survive_multiple_steps() -> None:
         assert torch.allclose(slow_rt, ema_slow, atol=1e-2)
 
 
-# ---------------------------------------------------------------------------
 # Integration: the optimizer must train a real DiffusionBlocks engine
-# ---------------------------------------------------------------------------
 
 
 def test_optimizer_trains_diffusion_blocks_engine() -> None:
@@ -394,9 +374,7 @@ def test_optimizer_trains_diffusion_blocks_engine() -> None:
     after = engine.model.transformer.h[0].attn.c_q.weight.detach()
     assert not torch.equal(before, after)
     assert torch.isfinite(after).all()
-    # The loss must trend down across the steps: the optimizer
-    # is the whole point, and a step that moves weights without
-    # reducing the reconstruction loss is not training.
+    # The loss must trend down across the steps: the optimizer is the whole point, and a step that moves weights without reducing the reconstruction loss is not training.
     assert first_losses[-1] < first_losses[0], (
         f"loss did not decrease: {first_losses[0]:.4f} -> {first_losses[-1]:.4f}"
     )
@@ -448,9 +426,7 @@ def test_optimizer_trains_lcqat_codebook_params() -> None:
     grad = codebook_params[0].grad.detach().clone()
     opt.step()
     after = codebook_params[0].detach()
-    # The update the optimizer applied, analytically. With
-    # alpha_residual=0 (frozen FiLM head) gamma and delta are 0,
-    # so the step is pure SGD: theta - lr * grad.
+    # The update the optimizer applied, analytically. With alpha_residual=0 (frozen FiLM head) gamma and delta are 0, so the step is pure SGD: theta - lr * grad.
     expected = before - 1.0 * grad
     assert torch.allclose(after, expected, atol=1e-6, rtol=1e-6)
 
@@ -462,9 +438,7 @@ def build_qat_groups(model):
     return build_qat_param_groups(model, matrix_lr=1e-3, weight_decay=0.0)
 
 
-# ---------------------------------------------------------------------------
 # Integration: SparseProp frozen pruned weights
-# ---------------------------------------------------------------------------
 
 
 def test_optimizer_preserves_sparseprop_frozen_weights() -> None:
@@ -494,8 +468,7 @@ def test_optimizer_preserves_sparseprop_frozen_weights() -> None:
         opt.zero_grad(set_to_none=True)
         y = layer(x)
         y.sum().backward()
-        # SparseProp's backward already zeroes pruned grads; assert the
-        # invariant the kernel guarantees, then step.
+        # SparseProp's backward already zeroes pruned grads; assert the invariant the kernel guarantees, then step.
         grad = layer.weight.grad
         assert grad is not None
         assert (grad[~layer.sparsity_mask] == 0.0).all()
@@ -503,9 +476,7 @@ def test_optimizer_preserves_sparseprop_frozen_weights() -> None:
         assert (layer.weight.data[~layer.sparsity_mask] == 0.0).all()
 
 
-# ---------------------------------------------------------------------------
 # Meta-training: joint online co-training (PRD section 4.3)
-# ---------------------------------------------------------------------------
 
 
 def test_meta_step_updates_cell_weights() -> None:
@@ -531,9 +502,7 @@ def test_meta_step_updates_cell_weights() -> None:
     loss.backward()
     opt.step()
 
-    # Meta pass: hand meta_step the model and a closure that
-    # rebuilds the loss from the *updated* parameters (via
-    # functional_call), so the graph runs through the cell.
+    # Meta pass: hand meta_step the model and a closure that rebuilds the loss from the *updated* parameters (via functional_call), so the graph runs through the cell.
     def closure(params):
         return torch.func.functional_call(model, params, (idx, targets)).sum()
 
@@ -554,10 +523,7 @@ def test_meta_step_returns_loss_and_is_differentiable() -> None:
     p = next(module.parameters())
     opt = SGD_MinExpLstm_Optimizer([p], lr=1e-3)
 
-    # The closure rebuilds each parameter from its gradient, so
-    # a step (which populates p.grad and the optimizer state)
-    # must precede meta_step. meta_step before zero_grad: the
-    # closure reads p.grad to rebuild the updated value.
+    # The closure rebuilds each parameter from its gradient, so a step (which populates p.grad and the optimizer state) must precede meta_step. meta_step before zero_grad: the closure reads p.grad to rebuild the updated value.
     p.grad = torch.ones_like(p)
     opt.step()
 
@@ -604,19 +570,14 @@ def test_learnable_beta_is_data_dependent_and_bounded() -> None:
     opt = SGD_MinExpLstm_Optimizer([p], lr=1e-3, lam=0.10)
     assert opt.cell.w_beta.requires_grad and opt.cell.b_beta.requires_grad
 
-    # Fresh predictor at zero input: sigma = 0.5, so beta_slow is the
-    # midpoint of [2*lam, 0.999] = 0.5995 at lam=0.10.
+    # Fresh predictor at zero input: sigma = 0.5, so beta_slow is the midpoint of [2*lam, 0.999] = 0.5995 at lam=0.10.
     beta_fast, beta_slow = opt.cell.predict_betas(torch.zeros(8, 8), lam=0.10)
     assert abs(float(beta_slow.detach().mean()) - 0.5995) < 1e-6
     assert torch.allclose(
         beta_slow - beta_fast, torch.full_like(beta_slow, 0.10), atol=1e-6
     )
 
-    # meta_step trains the predictor. The FiLM head is zero at init,
-    # and a zero *weight* kills the upstream gradient (d gamma/d z =
-    # 0), so the test seeds a nonzero head to open the path -- the
-    # joint-online nature of the optimizer: horizons and head learn
-    # together over many steps.
+    # meta_step trains the predictor. The FiLM head is zero at init, and a zero *weight* kills the upstream gradient (d gamma/d z = 0), so the test seeds a nonzero head to open the path -- the joint-online nature of the optimizer: horizons and head learn together over many steps.
     module = torch.nn.Linear(8, 8, bias=False)
     p = next(module.parameters())
     opt = SGD_MinExpLstm_Optimizer([p], lr=1e-3, lam=0.10)

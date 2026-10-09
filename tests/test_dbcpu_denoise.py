@@ -51,12 +51,7 @@ def test_when_overlap_enabled_then_range_is_widened() -> None:
     part = EquiProbabilityPartitioner(num_blocks=3)
     for b in range(3):
         lo, hi = (float(v) for v in part.range_for_block(b))
-        # gamma > 0 widens the support to [lo/alpha, hi*alpha] with
-        # alpha = (hi/lo)^gamma > 1, so the widened distribution covers strictly
-        # more of the log-sigma axis. Assert that on the CDF directly: the
-        # reachable endpoints are the 1e-6 / 1-1e-6 quantiles (sample_sigma
-        # clamps), not exactly lo and hi, so comparing sample extrema would be
-        # comparing different quantiles rather than testing containment.
+        # gamma > 0 widens the support to [lo/alpha, hi*alpha] with alpha = (hi/lo)^gamma > 1, so the widened distribution covers strictly more of the log-sigma axis. Assert that on the CDF directly: the reachable endpoints are the 1e-6 / 1-1e-6 quantiles (sample_sigma clamps), not exactly lo and hi, so comparing sample extrema would be comparing different quantiles rather than testing containment.
         alpha = (hi / lo) ** 0.1
         assert alpha > 1.0
         assert part._cdf(lo / alpha).item() < part._cdf(lo).item()
@@ -123,8 +118,7 @@ def test_when_denoise_step_then_activation_memory_tracks_the_active_block_only()
     """
 
     def peak_mb(fn):
-        # Reset the allocator's high-water mark by taking a baseline reading
-        # after a throwaway allocation of the same shape class.
+        # Reset the allocator's high-water mark by taking a baseline reading after a throwaway allocation of the same shape class.
         fn()  # warm up (JIT, lazy init)
         gc.collect()
         before = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
@@ -152,10 +146,7 @@ def test_when_denoise_step_then_activation_memory_tracks_the_active_block_only()
         engine4.zero_grad(set_to_none=True)
 
     if not torch.cuda.is_available():
-        # CPU has no allocator high-water mark to read. The isolation property
-        # itself is already asserted structurally in test_dbcpu_engine.py (only
-        # the active block's params get gradients); what is not observable here
-        # on CPU is the activation byte count, so skip rather than fake it.
+        # CPU has no allocator high-water mark to read. The isolation property itself is already asserted structurally in test_dbcpu_engine.py (only the active block's params get gradients); what is not observable here on CPU is the activation byte count, so skip rather than fake it.
         import pytest
 
         pytest.skip("activation memory accounting requires a CUDA allocator")
@@ -189,12 +180,7 @@ def test_when_ce_and_edm_objectives_then_only_edm_isolates_the_forward() -> None
     assert len(calls) == 2, "still L/B = 2 layers, independent of which block"
 
 
-# ---------------------------------------------------------------------------
-# Masking and target hoisting. Merged in from `test_dbcpu_objective.py`, which
-# was a near-wholesale duplicate of this file: same intent, same imports, and
-# four tests with identical bodies modulo docstring wording. This file held the
-# stronger variant of both overlapping pairs, so the survivor is here.
-# ---------------------------------------------------------------------------
+# Masking and target hoisting. Merged in from `test_dbcpu_objective.py`, which was a near-wholesale duplicate of this file: same intent, same imports, and four tests with identical bodies modulo docstring wording. This file held the stronger variant of both overlapping pairs, so the survivor is here.
 
 
 def test_when_loss_scales_with_sigma_then_the_jitter_is_the_edm_weighting():

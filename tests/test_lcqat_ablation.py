@@ -43,15 +43,12 @@ def assert_strict_grid(grid: StrictLearnableGrid) -> torch.Tensor:
     """Assert the grid contract holds; returns the detached positions."""
     positions = grid().detach()
     gaps = positions[1:] - positions[:-1]
-    # Positions are a cumsum, so differencing neighbours reintroduces a few ULPs
-    # of the grid magnitude; the spacing guarantee is exact in real arithmetic.
+    # Positions are a cumsum, so differencing neighbours reintroduces a few ULPs of the grid magnitude; the spacing guarantee is exact in real arithmetic.
     tol = 4 * torch.finfo(positions.dtype).eps * max(1.0, positions.abs().max().item())
     assert torch.isfinite(positions).all()
     assert (gaps > 0).all(), f"grid collapsed: {positions.tolist()}"
     assert (gaps >= grid.min_spacing - tol).all()
-    # In the saturated limit softplus(raw_span) underflows to 0, so the span only
-    # equals min_span (it is strictly greater right after init / while training
-    # with usable gradients).
+    # In the saturated limit softplus(raw_span) underflows to 0, so the span only equals min_span (it is strictly greater right after init / while training with usable gradients).
     assert grid.domain_length.detach().item() >= grid.min_span
     return positions
 
@@ -85,9 +82,7 @@ def test_when_forward_then_high_matches_the_last_position() -> None:
 
 
 def test_when_optimizer_drives_the_span_down_then_grid_never_collapses() -> None:
-    # Regression: with a freely learned `high - low`, the span could shrink below
-    # (n_points - 1) * min_spacing, so `available` went negative and the gaps
-    # became negative/overlapping (an inverted grid).
+    # Regression: with a freely learned `high - low`, the span could shrink below (n_points - 1) * min_spacing, so `available` went negative and the gaps became negative/overlapping (an inverted grid).
     grid = make_grid(min_spacing=0.05)
     opt = torch.optim.Adam(grid.parameters(), lr=0.5)
     span_seen = float("inf")
@@ -98,8 +93,7 @@ def test_when_optimizer_drives_the_span_down_then_grid_never_collapses() -> None
         opt.step()
         span_seen = min(span_seen, grid.domain_length.item())
         assert_strict_grid(grid)
-    # The optimizer stalls on Adam's eps floor just above the constraint, but the
-    # span never crosses it (the old formula went to 0 and then negative).
+    # The optimizer stalls on Adam's eps floor just above the constraint, but the span never crosses it (the old formula went to 0 and then negative).
     assert span_seen >= grid.min_span
     assert grid.min_span < grid.domain_length.item() < grid.min_span * 1.01
 
@@ -118,8 +112,7 @@ def test_when_optimizer_translates_the_grid_then_spacing_is_preserved() -> None:
 def test_when_min_spacing_is_zero_then_floored_softmax_keeps_positions_distinct() -> (
     None
 ):
-    # With min_spacing == 0 the only thing keeping the grid strict is the weight
-    # floor: a saturated softmax would zero every gap but the largest.
+    # With min_spacing == 0 the only thing keeping the grid strict is the weight floor: a saturated softmax would zero every gap but the largest.
     grid = make_grid(min_spacing=0.0, weight_floor=1e-4)
     with torch.no_grad():
         grid.raw_weights[0] = 1000.0
@@ -214,8 +207,7 @@ def test_when_at_center_then_falloff_is_exactly_one(kind: str) -> None:
 
 @pytest.mark.parametrize("kind", FALLOFF_KINDS)
 def test_when_at_the_window_edge_then_falloff_has_decayed(kind: str) -> None:
-    # A gaussian only approaches 0 (it is exactly `edge` at the window edge); the
-    # compact windows are 0 there.
+    # A gaussian only approaches 0 (it is exactly `edge` at the window edge); the compact windows are 0 there.
     edge_value = 1e-2 if kind == "gaussian" else 0.0
     for center, radius in ((0.0, 0.5), (-3.25, 2.0), (1.5, 0.25)):
         left = falloff(torch.tensor([center - radius]), center, radius, kind)

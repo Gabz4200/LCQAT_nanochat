@@ -84,8 +84,7 @@ class TestCodebookStructure:
         book = q.get_codebook()
         for c in range(q.num_channels):
             assert torch.equal(book[c, q.m_neg], torch.zeros(()))
-            # Nothing above the anchor is non-positive, so the exact-zero level
-            # is unambiguously the last one at or below zero.
+            # Nothing above the anchor is non-positive, so the exact-zero level is unambiguously the last one at or below zero.
             assert bool(torch.all(book[c, q.m_neg + 1 :] > 0.0))
             assert bool(torch.all(book[c, : q.m_neg] < 0.0))
 
@@ -223,8 +222,7 @@ class TestAgainstSharedCodebook:
         """
         from nanochat.models.quant.codebook import MemoryEfficientLearnedCodebook
 
-        # One channel 100x larger than the rest, which is the case a shared
-        # alphabet handles worst.
+        # One channel 100x larger than the rest, which is the case a shared alphabet handles worst.
         rows = []
         for c in range(4):
             scale = 100.0 if c == 0 else 1.0
@@ -238,22 +236,10 @@ class TestAgainstSharedCodebook:
         shared = MemoryEfficientLearnedCodebook(
             m_neg=3, m_pos=3, init_min=-100.0, init_max=100.0
         )
-        # Seed the per-channel table from the data. Without this the whole table
-        # starts far wider than the data, every value lands on the anchor, and
-        # the codebook gets exactly zero gradient -- the failure is silent and
-        # permanent, not a slow start. The shared codebook needs no such help: a
-        # scalar ladder is not per-channel, so a wide init only costs it
-        # resolution, it does not zero its gradient.
+        # Seed the per-channel table from the data. Without this the whole table starts far wider than the data, every value lands on the anchor, and the codebook gets exactly zero gradient -- the failure is silent and permanent, not a slow start. The shared codebook needs no such help: a scalar ladder is not per-channel, so a wide init only costs it resolution, it does not zero its gradient.
         per_channel.init_from_tensor(x)
 
-        # Both arms are *fitted to the same data for the same number of steps*,
-        # under a per-channel normalized loss. Normalizing matters and is not a
-        # thumb on the scale: with a pooled MSE the gradient is dominated by the
-        # largest channel, and the small channels' tables simply never move --
-        # measured, both arms then sit at NMSE 1.0 and the test measures nothing.
-        # Per-channel normalization is also the only loss under which a
-        # per-channel table is the right tool, so comparing under any other loss
-        # would argue against the thing being compared.
+        # Both arms are *fitted to the same data for the same number of steps*, under a per-channel normalized loss. Normalizing matters and is not a thumb on the scale: with a pooled MSE the gradient is dominated by the largest channel, and the small channels' tables simply never move -- measured, both arms then sit at NMSE 1.0 and the test measures nothing. Per-channel normalization is also the only loss under which a per-channel table is the right tool, so comparing under any other loss would argue against the thing being compared.
         opt_pc = torch.optim.SGD(per_channel.parameters(), lr=1.0)
         opt_sh = torch.optim.SGD(shared.parameters(), lr=1.0)
         for _ in range(400):
@@ -275,21 +261,17 @@ class TestAgainstSharedCodebook:
                 for c in range(4)
             ]
 
-        # The large channel is where the two must agree -- the shared codebook is
-        # free to spend its whole alphabet there, so per-channel cannot lose by
-        # much and should not.
+        # The large channel is where the two must agree -- the shared codebook is free to spend its whole alphabet there, so per-channel cannot lose by much and should not.
         assert per_row[0] <= sh_row[0] * 1.10 + 1e-6, (
             f"per-channel lost on the dominant channel: {per_row[0]:.4g} vs "
             f"{sh_row[0]:.4g}"
         )
-        # The small channels are the point: at least one must be rescued from
-        # being rounded entirely to the zero anchor.
+        # The small channels are the point: at least one must be rescued from being rounded entirely to the zero anchor.
         assert any(p < s - 0.1 for p, s in zip(per_row[1:], sh_row[1:])), (
             f"no small channel improved: per-channel {per_row[1:]} vs shared "
             f"{sh_row[1:]}"
         )
-        # And the shared codebook really does discard them, so the test is
-        # measuring a real effect rather than a marginal one.
+        # And the shared codebook really does discard them, so the test is measuring a real effect rather than a marginal one.
         assert max(sh_row[1:]) > 0.9, (
             f"the shared codebook was expected to flatten the small channels, "
             f"got {sh_row[1:]}"

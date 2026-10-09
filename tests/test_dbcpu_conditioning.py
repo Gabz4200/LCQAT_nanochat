@@ -90,8 +90,7 @@ def test_when_cond_shapes_then_broadcast_over_the_sequence_axis():
     with torch.no_grad():
         out = block(x, None, cos_sin, (8, 0), None, cond=(gamma, beta))
     assert out.shape == x.shape
-    # A (B, T, C) broadcast of the same cond must give the same result, since
-    # the modulation is sequence-independent by construction.
+    # A (B, T, C) broadcast of the same cond must give the same result, since the modulation is sequence-independent by construction.
     gamma_t = gamma.expand(2, 8, model.config.n_embd)
     beta_t = beta.expand(2, 8, model.config.n_embd)
     with torch.no_grad():

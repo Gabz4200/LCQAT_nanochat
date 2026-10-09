@@ -64,10 +64,7 @@ def _lcqat_linears(model: nn.Module) -> list[LCQATLinear]:
         pytest.param({}, False, id="flag_absent"),
         pytest.param({"lcqat_channel_center": True}, True, id="flag_set"),
         pytest.param({"lcqat_channel_center": False}, False, id="flag_off"),
-        # `chat_rl` does not register `--lcqat-channel-center` at all.
-        # `lcqat_config_from_args` reads it with a `getattr` default precisely so
-        # a caller that registered a subset of the flags still works; without
-        # that, the missing attribute would be an AttributeError at startup.
+        # `chat_rl` does not register `--lcqat-channel-center` at all. `lcqat_config_from_args` reads it with a `getattr` default precisely so a caller that registered a subset of the flags still works; without that, the missing attribute would be an AttributeError at startup.
         pytest.param({"__delete__": True}, False, id="flag_not_registered"),
     ],
 )
@@ -101,9 +98,7 @@ def test_when_flag_set_then_retrofitted_model_really_gets_per_channel_tables() -
             module.per_channel_weight_quantizer, PerChannelValueCenteredQuantizer
         )
         assert module.per_channel_weight_quantizer.num_channels == module.out_features
-        # The shared table is retained on purpose (K_weight, the optimizer
-        # partition and the export planner all still read it), so its presence
-        # is not evidence of anything -- the per-channel table's own shape is.
+        # The shared table is retained on purpose (K_weight, the optimizer partition and the export planner all still read it), so its presence is not evidence of anything -- the per-channel table's own shape is.
         assert module.weight_quantizer.K == module.K_weight
 
 
@@ -184,10 +179,7 @@ def test_when_per_channel_layer_backprops_then_per_channel_table_gets_grads() ->
     cfg = lcqat_config_from_args(_args(lcqat_channel_center=True))
     model = retrofit_model(build_active_tiny_gpt(), cfg)
     module = _lcqat_linears(model)[0]
-    # Per-channel tables are biased by observed statistics; without this every
-    # value buckets to the anchor, the anchor is the only gathered level, and
-    # the table receives exactly zero gradient (handoff §9.8: silent and
-    # permanent).
+    # Per-channel tables are biased by observed statistics; without this every value buckets to the anchor, the anchor is the only gathered level, and the table receives exactly zero gradient (handoff §9.8: silent and permanent).
     assert module.per_channel_weight_quantizer is not None
     module.per_channel_weight_quantizer.init_from_tensor(module.weight)
     module.per_channel_weight_quantizer.train()
@@ -274,9 +266,7 @@ def test_when_codebook_spec_fields_are_declared_then_all_are_real_fields() -> No
         "qkv_out",
         "fc_out",
     }
-    # Deliberately excluded: `per_channel_weight` (the §9.3 landmine),
-    # `min_linear_dim` and the two `quantize_*` booleans (not specs), and
-    # `k_map` (a tuple of rules, validated entry-by-entry just above).
+    # Deliberately excluded: `per_channel_weight` (the §9.3 landmine), `min_linear_dim` and the two `quantize_*` booleans (not specs), and `k_map` (a tuple of rules, validated entry-by-entry just above).
     assert set(CODEBOOK_SPEC_FIELDS).isdisjoint(
         {
             "per_channel_weight",

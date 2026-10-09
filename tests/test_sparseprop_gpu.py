@@ -159,8 +159,7 @@ def loop_oracle_backward(
     return gX, gW
 
 
-# The four parity shapes below dispatch the same
-# forward/backward calls; only the backend pair differs.
+# The four parity shapes below dispatch the same forward/backward calls; only the backend pair differs.
 PARITY_SHAPES = [
     (6, 8, 5, 0.5),
     (16, 32, 13, 0.75),
@@ -327,9 +326,7 @@ def test_when_dispatch_unknown_backend_then_value_error() -> None:
         )
 
 
-# ---------------------------------------------------------------------------
 # Listing layout contracts (the GPU kernels walk the emitted order)
-# ---------------------------------------------------------------------------
 
 
 class TestListingLayoutContract:
@@ -373,9 +370,7 @@ class TestListingLayoutContract:
         assert csr_pairs == csc_pairs
 
 
-# ---------------------------------------------------------------------------
 # Structural validation
-# ---------------------------------------------------------------------------
 
 
 class TestValidation:
@@ -478,9 +473,7 @@ class TestValidation:
             )
 
 
-# ---------------------------------------------------------------------------
 # FakeTensor / opcheck (the forward fake's parameter order is schema order)
-# ---------------------------------------------------------------------------
 
 
 def test_when_forward_op_then_opcheck_passes() -> None:
@@ -499,9 +492,7 @@ def test_when_forward_op_then_opcheck_passes() -> None:
     torch.library.opcheck(torch.ops.nanochat.lcqat_sparseprop_forward, args)
 
 
-# ---------------------------------------------------------------------------
 # The paper's Sec. 4.2 measured crossover on the training path
-# ---------------------------------------------------------------------------
 
 
 class TestMeasuredCrossover:
@@ -564,8 +555,7 @@ class TestMeasuredCrossover:
         layer = SparsePropLinear(16, 8, sparsity=0.9)
         layer._set_mask(torch.rand(8, 16) < 0.15)
         layer._kernel_choice = "cpu"
-        # A new prune event must re-resolve (and re-measure): the
-        # pattern changed, so the old measurement no longer applies.
+        # A new prune event must re-resolve (and re-measure): the pattern changed, so the old measurement no longer applies.
         layer._set_mask(torch.rand(8, 16) < 0.15)
         assert layer._kernel_choice is None
 
@@ -611,8 +601,7 @@ class TestMeasuredCrossover:
         assert torch.allclose(
             layer.weight.grad[mask], lin_ref.weight.grad[mask], atol=1e-5
         )
-        # The freeze contract: pruned slots hold an exact zero
-        # gradient (a mask multiply could only approximate this).
+        # The freeze contract: pruned slots hold an exact zero gradient (a mask multiply could only approximate this).
         assert bool((layer.weight.grad[~mask] == 0).all())
 
 
@@ -638,9 +627,7 @@ class TestSparsePathLCQAT:
         y.sum().backward()
 
         assert module.weight.grad is not None
-        # `weight_quantizer` is typed as the union; the plain type is the
-        # one that exposes `named_parameters` (the sigma-modulated wrapper
-        # wraps it rather than extending it).
+        # `weight_quantizer` is typed as the union; the plain type is the one that exposes `named_parameters` (the sigma-modulated wrapper wraps it rather than extending it).
         wq = module.weight_quantizer
         assert isinstance(wq, MemoryEfficientLearnedCodebook)
         for name, p in wq.named_parameters():

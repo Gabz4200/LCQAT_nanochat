@@ -48,8 +48,7 @@ def half_gap(cb: torch.Tensor) -> float:
 def test_when_write_then_dequant_window_within_half_gap() -> None:
     cache = make_cache()
     torch.manual_seed(1)
-    # Uniform inside the codebook span: bucketize clamps outside it, where the
-    # half-gap bound does not hold.
+    # Uniform inside the codebook span: bucketize clamps outside it, where the half-gap bound does not hold.
     k = 1.8 * torch.rand(B, 4, H, D) - 0.9
     v = 1.8 * torch.rand(B, 4, H, D) - 0.9
     cache.write(0, k, v)
@@ -109,8 +108,7 @@ def test_when_dequant_window_out_of_range_then_value_error() -> None:
 
 
 def test_when_codebook_k_out_of_range_then_constructor_raises() -> None:
-    # The bound is the nibble packing (K <= 15), not oddness. Even K is legal:
-    # the asymmetric split makes one-sided codebooks, so K=4, 8, 14 all work.
+    # The bound is the nibble packing (K <= 15), not oddness. Even K is legal: the asymmetric split makes one-sided codebooks, so K=4, 8, 14 all work.
     with pytest.raises(ValueError, match=r"K in \[3, 15\]"):
         make_cache(k_codebooks=torch.zeros(L, H, 31))
     with pytest.raises(ValueError, match=r"K in \[3, 15\]"):
@@ -190,8 +188,7 @@ def test_when_computing_storage_bytes_then_matches_real_buffers() -> None:
 
 
 def test_when_prd_32k_budget_then_kv_rows_match_prd_section_7_table() -> None:
-    # PRD section 7 table: 32K KV cache = 0.45 GB packed 4-bit vs 1.8 GB bf16.
-    # The row implies n_layer * n_kv_head * head_dim = 13,824 (24 x 9 x 64).
+    # PRD section 7 table: 32K KV cache = 0.45 GB packed 4-bit vs 1.8 GB bf16. The row implies n_layer * n_kv_head * head_dim = 13,824 (24 x 9 x 64).
     dims = dict(batch_size=1, num_heads=9, seq_len=32768, head_dim=64, num_layers=24)
     packed = QuantizedKVCache.storage_bytes(**dims)
     bf16 = (

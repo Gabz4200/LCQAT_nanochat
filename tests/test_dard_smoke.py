@@ -26,8 +26,7 @@ def test_when_dard_is_on_then_base_train_runs_and_reports_a_rule_penalty() -> No
     assert result.returncode == 0, result.stderr[-3000:]
     assert "DARD: mined" in result.stdout
     assert "DARD rule penalty attached" in result.stdout
-    # The per-step line carries the raw penalty. Its presence is the proof the
-    # penalty was evaluated inside the loop rather than built and discarded.
+    # The per-step line carries the raw penalty. Its presence is the proof the penalty was evaluated inside the loop rather than built and discarded.
     assert "dard:" in result.stdout
 
 

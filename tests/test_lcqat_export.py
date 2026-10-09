@@ -141,8 +141,7 @@ def test_when_loading_exported_db_artifact_then_engine_owns_its_quantized_layers
         "exported db_* state dropped on reload: "
         f"{sorted(exported_db_keys - set(loaded.state_dict()))[:5]}"
     )
-    # `adapters` is `nn.ModuleList`; narrow so `.mlp[0]` resolves as a
-    # typed sequence rather than through `Module.__getattr__`.
+    # `adapters` is `nn.ModuleList`; narrow so `.mlp[0]` resolves as a typed sequence rather than through `Module.__getattr__`.
     adapter = loaded.adapters[0]
     assert isinstance(adapter, NoiseConditionedBlockAdapter), (
         f"adapter reloaded as plain {type(adapter).__name__}: export/load are asymmetric"
@@ -215,12 +214,10 @@ def test_when_loading_exported_sparseprop_artifact_then_it_reloads(
         str(ckpt), 1, torch.device("cpu"), "eval"
     )
 
-    # `build_model` returns `nn.Module`; the artifact is a GPT, so narrow
-    # before reading `transformer.h[0]`.
+    # `build_model` returns `nn.Module`; the artifact is a GPT, so narrow before reading `transformer.h[0]`.
     assert isinstance(loaded, GPT), "loaded artifact is not a GPT"
     layer = loaded.transformer.h[0].attn.c_q
-    # Strips weights, gains the index buffer, and keeps the artifact's CSR
-    # structure registered rather than silently discarded.
+    # Strips weights, gains the index buffer, and keeps the artifact's CSR structure registered rather than silently discarded.
     assert not hasattr(layer, "weight"), "exported layer kept its shadow weight"
     assert "transformer.h.0.attn.c_q.packed_weight_indices" in loaded.state_dict()
     assert "transformer.h.0.attn.c_q.sparse_row_ptr" in loaded.state_dict()
@@ -437,8 +434,7 @@ def test_when_exporting_a_diffusion_blocks_engine_then_every_owned_subtree_is_st
 
     assert is_exported_lcqat_state(state)
     assert not is_lcqat_state(state)
-    # Every quantized layer in every owned subtree loses its FP32 shadow weight
-    # and gains packed indices -- base GPT, adapters, and denoise heads alike.
+    # Every quantized layer in every owned subtree loses its FP32 shadow weight and gains packed indices -- base GPT, adapters, and denoise heads alike.
     quantized = [
         name
         for name, module in engine.named_modules()

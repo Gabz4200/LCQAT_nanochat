@@ -27,8 +27,7 @@ from nanochat.models.quant.retrofit import (
 )
 from tests.conftest import build_active_tiny_gpt
 
-# K values at real bit boundaries. Even K is only legal because of the
-# asymmetric split (m_neg = 0 + 1 anchor + m_pos).
+# K values at real bit boundaries. Even K is only legal because of the asymmetric split (m_neg = 0 + 1 anchor + m_pos).
 EVEN_K = (4, 8, 16, 255)
 
 
@@ -130,9 +129,7 @@ def test_when_asym_applied_to_a_model_then_mlp_codebooks_are_one_sided():
     assert isinstance(c_fc, LCQATLinear) and isinstance(c_proj, LCQATLinear)
     for quantizer in (c_fc.out_quantizer, c_proj.act_quantizer):
         assert quantizer is not None and callable(quantizer)
-        # The asym preset installs plain codebooks; the union type
-        # (`MemoryEfficientLearnedCodebook | SigmaModulatedCodebook`)
-        # otherwise widens `get_codebook` to `Module.__getattr__`.
+        # The asym preset installs plain codebooks; the union type (`MemoryEfficientLearnedCodebook | SigmaModulatedCodebook`) otherwise widens `get_codebook` to `Module.__getattr__`.
         assert isinstance(quantizer, MemoryEfficientLearnedCodebook)
         assert quantizer.m_neg == 0 and quantizer.m_pos == 7
         assert (quantizer.get_codebook() >= 0).all()

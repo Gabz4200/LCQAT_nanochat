@@ -172,9 +172,7 @@ class TestDriverRuns:
                 "64",
                 "--json-out",
                 str(target),
-                # `--out` defaults to dev/LEADERBOARD.md, so omitting it here
-                # made every full-suite run overwrite the published table with
-                # this 1-seed row. Scope both outputs to tmp_path.
+                # `--out` defaults to dev/LEADERBOARD.md, so omitting it here made every full-suite run overwrite the published table with this 1-seed row. Scope both outputs to tmp_path.
                 "--out",
                 str(tmp_path / "LEADERBOARD.md"),
             ]

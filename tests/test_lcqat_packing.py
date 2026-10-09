@@ -77,8 +77,7 @@ def test_when_nibbles_contain_invalid_value_then_raises() -> None:
 
 @pytest.mark.parametrize("shape", [(2, 3, 8), (4, 5, 1), (2, 1, 7)])
 def test_when_roundtripping_batched_nibbles_then_indices_are_recovered(shape) -> None:
-    # Trailing-dim contract: pack/unpack apply row-wise over any leading dims
-    # (the quantized KV cache packs [B, T, H, D] in one call).
+    # Trailing-dim contract: pack/unpack apply row-wise over any leading dims (the quantized KV cache packs [B, T, H, D] in one call).
     torch.manual_seed(0)
     idx = torch.randint(0, 16, shape, dtype=torch.uint8)
     packed = pack_nibbles(idx)
@@ -182,9 +181,7 @@ def test_when_packing_weight_indices_then_roundtrip_and_size_match_format(
 
 
 def test_when_weight_index_k_invalid_then_raises() -> None:
-    # Even K is legal: the asymmetric split is what makes a one-sided codebook
-    # (and therefore K=4, K=8, K=16) possible, and these are all real bit
-    # boundaries rather than odd-numbered approximations.
+    # Even K is legal: the asymmetric split is what makes a one-sided codebook (and therefore K=4, K=8, K=16) possible, and these are all real bit boundaries rather than odd-numbered approximations.
     assert index_format_for_k(4) == FORMAT_NIBBLES
     assert index_format_for_k(16) == FORMAT_UINT8
     with pytest.raises(ValueError, match=">= 3"):

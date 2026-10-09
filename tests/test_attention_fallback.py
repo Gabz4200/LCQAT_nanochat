@@ -65,9 +65,7 @@ def qkv(
     return q, k, v
 
 
-# =============================================================================
 # FA3 vs SDPA comparison tests
-# =============================================================================
 @pytest.mark.skipif(not HAS_FA3, reason="FA3 required to compare implementations")
 class TestFA3VsSDPA:
     """Compare FA3 and SDPA produce identical results."""
@@ -277,9 +275,7 @@ class TestFA3VsSDPA:
         print(f"v_grad: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}")
 
 
-# =============================================================================
 # SDPA-only tests (run on any device)
-# =============================================================================
 class TestSDPAOnly:
     """Test SDPA fallback works correctly. Runs on any device."""
 
@@ -377,9 +373,7 @@ class TestSDPAOnly:
         set_impl(None)
 
 
-# =============================================================================
 # Override mechanism tests
-# =============================================================================
 class TestOverrideMechanism:
     """Test that the override mechanism works correctly."""
 

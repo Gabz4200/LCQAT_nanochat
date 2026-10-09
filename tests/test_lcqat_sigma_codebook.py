@@ -250,18 +250,14 @@ class TestSigmaModulatedCodebook:
         """
         mod = SigmaModulatedCodebook(m_neg=7, m_pos=7)
         with torch.no_grad():
-            # The last layer is zero-initialised (that is what makes init
-            # equivalence hold), so it must be perturbed explicitly -- setting
-            # only the first layer would leave the gain identically 1.0.
+            # The last layer is zero-initialised (that is what makes init equivalence hold), so it must be perturbed explicitly -- setting only the first layer would leave the gain identically 1.0.
             _gain_weight(mod, 0).fill_(1.0)
             _gain_bias(mod, 0).fill_(0.0)
             _gain_weight(mod, -1).fill_(0.25)
             _gain_bias(mod, -1).zero_()
         low = mod.effective_codebook(torch.tensor(0.01)).reshape(-1)
         high = mod.effective_codebook(torch.tensor(100.0)).reshape(-1)
-        # A gain scales the *span* of the levels, so compare the outermost
-        # levels rather than the mean: the mean is ~0 for a symmetric codebook
-        # and would hide the effect.
+        # A gain scales the *span* of the levels, so compare the outermost levels rather than the mean: the mean is ~0 for a symmetric codebook and would hide the effect.
         assert float(high.detach()[-1] - high.detach()[0]) > float(
             low.detach()[-1] - low.detach()[0]
         )
@@ -276,8 +272,7 @@ class TestSigmaModulatedCodebook:
             _gain_weight(mod, -1).fill_(0.25)
         sigmas = torch.tensor([0.01, 0.5, 10.0])
         gains = mod.gain_for(sigmas).detach()
-        # At least one pair must differ meaningfully, else the gain is constant
-        # across the whole range and the module is pure overhead.
+        # At least one pair must differ meaningfully, else the gain is constant across the whole range and the module is pure overhead.
         spread = float(gains.max() - gains.min())
         assert spread > 1e-3, f"gain is flat across sigma: {gains.tolist()}"
 
@@ -326,11 +321,7 @@ class TestSigmaModulatedCodebook:
         """
         mod = SigmaModulatedCodebook(m_neg=7, m_pos=7)
         grid = torch.logspace(-6, 4, 60)
-        # Trained first: at init the gain net's last layer is zero, so the raw
-        # output is 0 everywhere and *any* positivity property would hold
-        # trivially. Driving the network directly is not enough either -- the
-        # failure mode this guards is a positive-but-shrinking gain, which needs
-        # the raw output to actually move.
+        # Trained first: at init the gain net's last layer is zero, so the raw output is 0 everywhere and *any* positivity property would hold trivially. Driving the network directly is not enough either -- the failure mode this guards is a positive-but-shrinking gain, which needs the raw output to actually move.
         with torch.no_grad():
             _gain_weight(mod, 0).fill_(1.0)
             _gain_weight(mod, -1).fill_(1.0)
@@ -572,8 +563,7 @@ class TestFidelityComparison:
                 (shared(flat).value.reshape(2, 64, 64) - x).square().mean()
                 / x.square().mean()
             )
-        # Tied anchors reduce to a single shared codebook, so the two must agree
-        # to within the optimization noise, not merely be "in the same range".
+        # Tied anchors reduce to a single shared codebook, so the two must agree to within the optimization noise, not merely be "in the same range".
         assert tied_nmse == pytest.approx(shared_nmse, rel=0.25), (
             f"tied {tied_nmse:.4g} vs shared {shared_nmse:.4g}: the degenerate "
             "case must reproduce the shared codebook"

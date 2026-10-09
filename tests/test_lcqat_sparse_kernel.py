@@ -196,8 +196,7 @@ class TestZeroSkip:
         assert case["plan"].nnz == case["keep"].sum(), (
             "pruned slots are stored, not removed from the listing"
         )
-        # The stored values include exact zeros, since pruned slots resolve to
-        # the zero anchor.
+        # The stored values include exact zeros, since pruned slots resolve to the zero anchor.
         assert int((case["alphabet"] == 0.0).sum()) > 0
 
     def test_when_the_listing_contains_zeros_then_the_result_matches_the_oracle(

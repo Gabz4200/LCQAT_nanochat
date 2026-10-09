@@ -305,9 +305,7 @@ class TestEngineTreeTraversal:
 
     def test_when_schedule_runs_against_the_engine_then_it_prunes(self):
         engine = self._sparse_engine()
-        # start_frac=1.0: a default schedule's target at step 0 is 0.0, so
-        # step 0 prunes nothing. One-shot-at-target needs the ramp to start
-        # at its end, which is what start_frac=1.0 expresses.
+        # start_frac=1.0: a default schedule's target at step 0 is 0.0, so step 0 prunes nothing. One-shot-at-target needs the ramp to start at its end, which is what start_frac=1.0 expresses.
         schedule = GradualPruningSchedule(target_sparsity=0.5, start_frac=1.0, every=1)
         achieved = schedule.apply(engine, 0)
         assert achieved == pytest.approx(0.5, abs=0.02), achieved
@@ -359,10 +357,7 @@ class TestScheduleFromArgs:
         )
 
         parser = argparse.ArgumentParser()
-        # No manual `--sparseprop-sparsity` registration here: the helper owns
-        # the whole SparseProp surface, including the always-on pair. Registering
-        # it first would raise an argparse conflict, which is itself the point --
-        # the flag can no longer be restated by a caller.
+        # No manual `--sparseprop-sparsity` registration here: the helper owns the whole SparseProp surface, including the always-on pair. Registering it first would raise an argparse conflict, which is itself the point -- the flag can no longer be restated by a caller.
         add_sparseprop_pruning_args(parser)
         args = parser.parse_args(argv)
         schedule = schedule_from_args(args)

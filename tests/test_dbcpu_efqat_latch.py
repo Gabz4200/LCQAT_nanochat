@@ -58,8 +58,7 @@ def test_when_block_latched_then_stays_frozen_across_later_steps_and_blocks() ->
     assert expected, "block 1 should own parameters (layers, adapter, head)"
 
     idx = torch.randint(0, 128, (2, 16))
-    # 30 steps over all three blocks, block 1 included -- the whole point is
-    # that sampling block 1 does not revive it.
+    # 30 steps over all three blocks, block 1 included -- the whole point is that sampling block 1 does not revive it.
     for step in range(30):
         block = step % 3
         engine.zero_grad(set_to_none=True)
@@ -117,8 +116,7 @@ def test_when_never_latched_block_sampled_then_it_still_receives_gradients() -> 
         own = _block_params(engine, freezer, block)
         assert own & got, f"block {block} lost its gradients"
         assert not any(n.startswith("db_denoise_heads.0.") for n in got)
-    # Embeddings/lm_head are shared by every block, so no single latch can claim
-    # them; they must stay trainable or the model stops learning entirely.
+    # Embeddings/lm_head are shared by every block, so no single latch can claim them; they must stay trainable or the model stops learning entirely.
     assert engine.model.transformer.wte.weight.requires_grad
     assert engine.model.lm_head.weight.requires_grad
 
@@ -158,8 +156,7 @@ def test_when_latch_state_then_readable_and_round_trips_through_metadata() -> No
     resumed.load_metadata(meta)
     resumed_engine.set_freezer(resumed)
     resumed_engine._activate_block(2)
-    # Loading the metadata must actually freeze the tensors, not just record
-    # the index -- otherwise a resumed run reports "latched" while still training.
+    # Loading the metadata must actually freeze the tensors, not just record the index -- otherwise a resumed run reports "latched" while still training.
     assert _latched_params(resumed_engine, resumed, 2) == _block_params(
         resumed_engine, resumed, 2
     )

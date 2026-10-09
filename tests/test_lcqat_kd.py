@@ -22,10 +22,7 @@ def test_kd_loss_matches_kl_divergence():
     teacher = torch.randn(4, 8)
     student = torch.randn(4, 8, requires_grad=True)
     loss = kd_loss(teacher, student, tau=2.0)
-    # Expected: tau^2 * KL( softmax(T/tau) || softmax(S/tau) ), log_target form.
-    # PRD 3.1: L_KD = tau^2 * KL( softmax(Z_teacher/tau) || softmax(Z_student/tau) )
-    # F.kl_div(input, target, log_target=True) computes KL(target || input),
-    # so KL(teacher || student) = F.kl_div(student_logp, teacher_logp).
+    # Expected: tau^2 * KL( softmax(T/tau) || softmax(S/tau) ), log_target form. PRD 3.1: L_KD = tau^2 * KL( softmax(Z_teacher/tau) || softmax(Z_student/tau) ) F.kl_div(input, target, log_target=True) computes KL(target || input), so KL(teacher || student) = F.kl_div(student_logp, teacher_logp).
     exp = 4.0 * F.kl_div(
         F.log_softmax(student.detach() / 2.0, dim=-1),
         F.log_softmax(teacher / 2.0, dim=-1),

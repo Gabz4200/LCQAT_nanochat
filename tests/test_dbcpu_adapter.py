@@ -31,8 +31,7 @@ def test_when_adapter_at_init_then_conditioning_is_exact_no_op() -> None:
     for gamma, beta in conds:
         assert gamma.shape == (2, 1, 16), "broadcast over the sequence axis"
         assert beta.shape == (2, 1, 16)
-        # Zero-init of the output layer: gamma=0, beta=0 exactly, so applying
-        # the conditioning to a pre-norm activation is an exact identity.
+        # Zero-init of the output layer: gamma=0, beta=0 exactly, so applying the conditioning to a pre-norm activation is an exact identity.
         assert torch.equal(gamma, torch.zeros_like(gamma))
         assert torch.equal(beta, torch.zeros_like(beta))
 
@@ -40,12 +39,9 @@ def test_when_adapter_at_init_then_conditioning_is_exact_no_op() -> None:
 def test_when_adapter_conditioned_then_sigma_changes_each_layer_and_gets_grad() -> None:
     torch.manual_seed(0)
     adapter = NoiseConditionedBlockAdapter(n_embd=16, cond_dim=8, n_layers=3)
-    # Break zero-init symmetry so conditioning has an effect.
-    # The final linear is mlp[-1] (no self.out alias -- that would share the
-    # Parameter object under two paths and trip the optimizer's dup-param check).
+    # Break zero-init symmetry so conditioning has an effect. The final linear is mlp[-1] (no self.out alias -- that would share the Parameter object under two paths and trip the optimizer's dup-param check).
     with torch.no_grad():
-        # `nn.Sequential.__getitem__` yields `nn.Module`; assert so the
-        # checker narrows to `Linear` before reading `.weight`.
+        # `nn.Sequential.__getitem__` yields `nn.Module`; assert so the checker narrows to `Linear` before reading `.weight`.
         last = adapter.mlp[-1]
         assert isinstance(last, nn.Linear)
         last.weight.normal_(std=0.05)

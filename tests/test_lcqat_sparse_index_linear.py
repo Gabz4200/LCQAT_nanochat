@@ -37,8 +37,7 @@ def make_case(
     act_indices = torch.randint(0, k, (t, n), dtype=torch.uint8)
     indices = torch.randint(0, k, (m, n))
     keep = torch.rand(m, n) < keep_p
-    # A pruned slot carries LC-QAT's exact zero anchor, so it is an ordinary
-    # codebook index rather than a special marker.
+    # A pruned slot carries LC-QAT's exact zero anchor, so it is an ordinary codebook index rather than a special marker.
     indices[~keep] = 0
     plan = plan_sparse_export(indices, keep, k=k)
     packed, _ = pack_sparse_plan(plan)
@@ -191,8 +190,7 @@ class TestSparseSemantics:
         for keep_p in (1.0, 0.5, 0.1, 0.0):
             case = make_case(0, keep_p=keep_p, k=k)
             assert case["plan"].k_used >= MIN_EXPORT_ALPHABET
-            # And the padding levels are never referenced. An empty listing has
-            # no levels to check.
+            # And the padding levels are never referenced. An empty listing has no levels to check.
             if case["unpacked"].numel():
                 assert int(case["unpacked"].max()) < case["plan"].k_used
 

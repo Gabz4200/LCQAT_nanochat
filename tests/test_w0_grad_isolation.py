@@ -26,9 +26,7 @@ import torch
 
 from nanochat.modules.experiments.tiny_models import build_active_tiny_gpt, make_engine
 
-#: `denoise_step` draws some of its randomness from the global RNG, so both
-#: draws below pin it. Without this the two draws differ by ~1.3x on their own
-#: and the accumulation is invisible in the noise.
+#: `denoise_step` draws some of its randomness from the global RNG, so both draws below pin it. Without this the two draws differ by ~1.3x on their own and the accumulation is invisible in the noise.
 _GLOBAL_SEED = 7
 
 

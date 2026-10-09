@@ -97,8 +97,7 @@ def test_the_quantize_out_flag_decides_the_output_quantizer(
     linear = from_float(quantize_out=quantize_out)
     assert (linear.out_quantizer is not None) is expected
     if quantize_out:
-        # An out-quantizer that exists but holds the wrong K would still pass an
-        # existence check.
+        # An out-quantizer that exists but holds the wrong K would still pass an existence check.
         assert linear.out_quantizer is not None
         assert linear.out_quantizer.K == 15
 
@@ -109,8 +108,7 @@ def test_when_backward_then_gradients_reach_weights_inputs_and_all_codebooks() -
     linear(x).sum().backward()
     assert x.grad is not None and torch.isfinite(x.grad).all()
     assert linear.weight.grad is not None and linear.weight.grad.abs().sum() > 0
-    # `act_quantizer` is typed as the union; narrow to the plain codebook
-    # before reading `raw_pos_deltas`, which only the unconditioned type has.
+    # `act_quantizer` is typed as the union; narrow to the plain codebook before reading `raw_pos_deltas`, which only the unconditioned type has.
     act_cb = linear.act_quantizer
     assert isinstance(act_cb, MemoryEfficientLearnedCodebook)
     assert act_cb.raw_pos_deltas.grad is not None
@@ -136,9 +134,7 @@ def test_when_weight_quantized_then_values_are_codebook_levels() -> None:
     assert int(w_q.indices.max()) < 3
 
 
-# ---------------------------------------------------------------------------
 # PRD 2.4: 1/sqrt(N) codebook gradient scaling
-# ---------------------------------------------------------------------------
 
 
 def _codebook_grad_sum(grad_scale: str, seed: int = 1) -> float:
@@ -219,10 +215,7 @@ def test_when_act_batch_size_changes_then_activation_codebook_scale_changes() ->
     assert act_cb.raw_pos_deltas.grad is not None
     large = act_cb.raw_pos_deltas.grad.abs().sum().item()
 
-    # 4x the elements => 1/sqrt(4) = 1/2 the gradient for the same per-element
-    # signal. Note the sum also grows with N, so the comparison is only
-    # meaningful as a ratio against the unscaled baseline; what is asserted here
-    # is the direction and rough magnitude of the effect.
+    # 4x the elements => 1/sqrt(4) = 1/2 the gradient for the same per-element signal. Note the sum also grows with N, so the comparison is only meaningful as a ratio against the unscaled baseline; what is asserted here is the direction and rough magnitude of the effect.
     assert large != small
     assert small > 0 and large > 0
 

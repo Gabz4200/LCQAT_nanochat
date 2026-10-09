@@ -111,16 +111,14 @@ def test_when_parsing_k_map_then_validates_entries() -> None:
         ("mlp.c_proj", 255, 255),
         ("attn.c_q", 3, 15),
     )
-    # Asymmetric split syntax: m_neg-m_pos. The MLP `relu^2` tensors are the
-    # case this exists for, so 0-7 (one-sided, 8 levels) must parse.
+    # Asymmetric split syntax: m_neg-m_pos. The MLP `relu^2` tensors are the case this exists for, so 0-7 (one-sided, 8 levels) must parse.
     assert parse_k_map("mlp.c_proj:0-7/0-7") == (("mlp.c_proj", (0, 7), (0, 7)),)
     assert parse_k_map("attn.c_q:6-8/6-8") == (("attn.c_q", (6, 8), (6, 8)),)
     # Even K is legal; 4 is a real 2-bit boundary, not an error.
     assert parse_k_map("mlp.c_proj:4/15") == (("mlp.c_proj", 4, 15),)
     with pytest.raises(ValueError, match=">= 3"):
         parse_k_map("mlp.c_proj:2/15")
-    # A one-sided codebook needs two levels on its side, or the zero anchor
-    # would also be the endpoint and bucketize would have no interior midpoint.
+    # A one-sided codebook needs two levels on its side, or the zero anchor would also be the endpoint and bucketize would have no interior midpoint.
     with pytest.raises(ValueError, match="m_pos >= 2"):
         parse_k_map("mlp.c_proj:0-1/15")
     with pytest.raises(ValueError, match="substring:KW/KA"):
@@ -149,8 +147,7 @@ def test_when_asym_preset_then_non_negative_tensors_get_one_sided_codebooks() ->
     for name in ("transformer.h.0.attn.c_q", "transformer.h.0.attn.c_proj"):
         spec = get_layer_config(name, config)
         assert spec is not None
-        # `CodebookSpec = int | tuple[int, int]`; a signed layer uses the
-        # tuple form, so narrow before indexing.
+        # `CodebookSpec = int | tuple[int, int]`; a signed layer uses the tuple form, so narrow before indexing.
         assert isinstance(spec.activation, tuple), (
             f"{name} input is RMSNorm'd and signed, expected a (m_neg, m_pos) split"
         )
@@ -162,9 +159,7 @@ def test_when_asym_preset_then_applied_to_a_model() -> None:
     c_fc = model.get_submodule("transformer.h.0.mlp.c_fc")
     c_proj = model.get_submodule("transformer.h.0.mlp.c_proj")
     assert isinstance(c_fc, LCQATLinear) and isinstance(c_proj, LCQATLinear)
-    # Narrow the quantizers to the plain codebook type: the attributes are
-    # typed as the union, and the plain type is the one that exposes
-    # `m_neg` / `m_pos` / `get_codebook`.
+    # Narrow the quantizers to the plain codebook type: the attributes are typed as the union, and the plain type is the one that exposes `m_neg` / `m_pos` / `get_codebook`.
     out_cb = c_fc.out_quantizer
     assert isinstance(out_cb, MemoryEfficientLearnedCodebook)
     act_cb = c_proj.act_quantizer
@@ -173,12 +168,10 @@ def test_when_asym_preset_then_applied_to_a_model() -> None:
     assert out_cb.m_pos == 7
     assert act_cb.m_neg == 0
     assert act_cb.m_pos == 7
-    # The one-sided codebook's levels are all >= 0, which is the point: a
-    # symmetric 15 would place 7 levels below the minimum the tensor can reach.
+    # The one-sided codebook's levels are all >= 0, which is the point: a symmetric 15 would place 7 levels below the minimum the tensor can reach.
     assert (act_cb.get_codebook() >= 0).all()
     assert act_cb.get_codebook()[0].item() == 0.0
-    # The forward agrees: a non-negative activation never produces a negative
-    # dequantized value.
+    # The forward agrees: a non-negative activation never produces a negative dequantized value.
     with torch.no_grad():
         pos = torch.rand(2, 16, c_proj.in_features)
         assert (act_cb(pos).value >= 0).all()
@@ -211,10 +204,7 @@ def test_when_forward_and_backward_on_retrofitted_model_then_codebooks_get_grads
     tiny_gpt_lcqat,
 ) -> None:
     model = tiny_gpt_lcqat
-    # nanochat zero-initializes the attention/MLP projections, and a zero weight
-    # matrix transmits exactly zero gradient upstream, so on the very first step
-    # nothing behind the projections (including codebooks) receives any gradient.
-    # Nudge them off zero the way the first optimizer step would.
+    # nanochat zero-initializes the attention/MLP projections, and a zero weight matrix transmits exactly zero gradient upstream, so on the very first step nothing behind the projections (including codebooks) receives any gradient. Nudge them off zero the way the first optimizer step would.
     torch.manual_seed(0)
     with torch.no_grad():
         for block in model.transformer.h:
@@ -286,8 +276,7 @@ def test_when_build_qat_param_groups_then_codebooks_get_their_own_adamw_group(
     assert group["weight_decay"] == 0.0
     assert group["lr"] > 0
     assert {id(p) for p in group["params"]} == codebook_params
-    # Every parameter lands in exactly one group (this is the check that caught
-    # the duplicate-codebook-parameter bug).
+    # Every parameter lands in exactly one group (this is the check that caught the duplicate-codebook-parameter bug).
     verify_partition(tiny_gpt_lcqat, groups)
     covered = {id(p) for group in groups for p in group["params"]}
     assert covered == {id(p) for p in tiny_gpt_lcqat.parameters()}
@@ -315,8 +304,7 @@ def test_when_build_qat_param_groups_then_per_role_lrs_are_not_dropped(
     assert lrs["x0"] == pytest.approx(0.5)
     assert lrs["resid"] == pytest.approx(0.5 * 0.01)
     assert lrs["matrix"] == pytest.approx(0.02)
-    # dmodel_lr_scale multiplies the AdamW roles but not the scalar ones,
-    # matching GPT.setup_optimizer's tuned recipe.
+    # dmodel_lr_scale multiplies the AdamW roles but not the scalar ones, matching GPT.setup_optimizer's tuned recipe.
     scaled = build_qat_param_groups(
         tiny_gpt, matrix_lr=0.02, weight_decay=0.1, dmodel_lr_scale=2.0
     )
@@ -342,8 +330,7 @@ def test_when_optimizer_step_then_codebook_params_change(tiny_gpt_lcqat) -> None
         optimizer.step()
         model.zero_grad(set_to_none=True)
 
-    # Step 1 only moves the zero-initialized projections off zero (zero weights
-    # transmit zero gradient upstream, so codebook grads are still zero there).
+    # Step 1 only moves the zero-initialized projections off zero (zero weights transmit zero gradient upstream, so codebook grads are still zero there).
     step()
     before = {
         n: p.detach().clone() for n, p in model.named_parameters() if "deltas" in n
@@ -366,9 +353,7 @@ def test_when_checkpoint_helpers_then_state_detection_and_roundtrip_work(
     assert not is_lcqat_state(tiny_gpt.state_dict())
 
     fresh = tiny_gpt_factory()
-    # No meta and no requested config: the active config falls back to the
-    # default preset, which is now `asym` (not `small`). The roundtrip below
-    # therefore only holds because the fixture was built with that same preset.
+    # No meta and no requested config: the active config falls back to the default preset, which is now `asym` (not `small`). The roundtrip below therefore only holds because the fixture was built with that same preset.
     active = prepare_lcqat_before_load(fresh, state, None, None)
     assert active == PRESETS[DEFAULT_PRESET]
     fresh.load_state_dict(state, strict=True)

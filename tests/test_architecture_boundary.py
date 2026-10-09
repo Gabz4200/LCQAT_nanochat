@@ -23,8 +23,7 @@ CORE = REPO_ROOT / "nanochat" / "models"
 #: Shell packages the core must stay independent of.
 SHELL_PACKAGES = ("modules", "training", "data", "callbacks", "utils", "tasks")
 
-#: `ops` is the sanctioned boundary: it is how the core reaches the hardware
-#: (dispatcher, reference oracles, native kernels). Everything else is a leak.
+#: `ops` is the sanctioned boundary: it is how the core reaches the hardware (dispatcher, reference oracles, native kernels). Everything else is a leak.
 ALLOWED_CORE_DEPS = ("nanochat.ops", "nanochat.models")
 
 

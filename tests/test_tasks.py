@@ -81,8 +81,7 @@ def test_hub_dataset_rows():
 
 
 def test_hub_dataset_shuffle_matches_numpy():
-    # the shuffle must reproduce datasets.Dataset.shuffle(seed) exactly,
-    # which is a np.random.default_rng(seed) permutation
+    # the shuffle must reproduce datasets.Dataset.shuffle(seed) exactly, which is a np.random.default_rng(seed) permutation
     table = pa.table({"x": list(range(100))})
     ds = HubDataset(table).shuffle(seed=42)
     perm = np.random.default_rng(42).permutation(100)
@@ -93,6 +92,5 @@ def test_hub_dataset_shuffle_matches_numpy():
 
 def test_render_mc_letter_binding():
     query = render_mc("What is 1+1?", ("A", "B"), ("1", "2"))
-    # the letter must directly follow '=' with no whitespace, so that the
-    # prompt token for "A" matches the assistant's bare "A" response token
+    # the letter must directly follow '=' with no whitespace, so that the prompt token for "A" matches the assistant's bare "A" response token
     assert "=A\n" in query and "=B\n" in query

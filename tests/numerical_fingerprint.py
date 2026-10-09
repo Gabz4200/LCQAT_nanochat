@@ -77,9 +77,7 @@ def fingerprint() -> tuple[dict[str, str], dict[str, float]]:
     torch.manual_seed(0)
     torch.use_deterministic_algorithms(False)
 
-    # Small but non-degenerate: 4 layers, 128 wide. Big enough that a swapped
-    # layer or a re-ordered forward changes the value; small enough to run in
-    # seconds on CPU.
+    # Small but non-degenerate: 4 layers, 128 wide. Big enough that a swapped layer or a re-ordered forward changes the value; small enough to run in seconds on CPU.
     cfg = GPTConfig(
         sequence_len=64,
         vocab_size=512,
@@ -172,8 +170,7 @@ def fingerprint() -> tuple[dict[str, str], dict[str, float]]:
     perturb(m_sp)
     record("sparseprop", m_sp, x, y)
 
-    # 4. DiffusionBlocks -- the engine path, which routes through a different
-    #    forward and a different objective.
+    # 4. DiffusionBlocks -- the engine path, which routes through a different forward and a different objective.
     torch.manual_seed(0)
     m_db = GPT(cfg)
     m_db.init_weights()

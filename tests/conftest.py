@@ -6,9 +6,7 @@ from nanochat.models.backbone import GPT
 from nanochat.models.quant import PRESETS, retrofit_model
 from nanochat.models.quant.retrofit import DEFAULT_PRESET
 
-# The builders themselves live in the package, not here: the shipped ablation
-# harness imports them, and a package that imports `tests/` is only importable
-# when the repo root happens to be on sys.path.
+# The builders themselves live in the package, not here: the shipped ablation harness imports them, and a package that imports `tests/` is only importable when the repo root happens to be on sys.path.
 from nanochat.modules.experiments.tiny_models import (  # noqa: F401  (re-export)
     build_active_tiny_gpt,
     build_tiny_gpt,
@@ -28,25 +26,11 @@ def tiny_gpt_factory():
 
 @pytest.fixture
 def tiny_gpt_lcqat() -> GPT:
-    # Independent instance: retrofitting mutates the model in place, so it must
-    # not share state with the `tiny_gpt` fixture.
-    #
-    # Built with the DEFAULT preset so that a state_dict roundtrip through
-    # `prepare_lcqat_before_load(fresh, state, None, None)` -- which falls back
-    # to the default when no meta is supplied -- reconstructs the same config.
-    # Active (randomized) model: quantizer levels must be fitted to real ranges,
-    # not the zero-init span of c_proj (see build_active_tiny_gpt gotcha).
+    # Independent instance: retrofitting mutates the model in place, so it must not share state with the `tiny_gpt` fixture. Built with the DEFAULT preset so that a state_dict roundtrip through `prepare_lcqat_before_load(fresh, state, None, None)` -- which falls back to the default when no meta is supplied -- reconstructs the same config. Active (randomized) model: quantizer levels must be fitted to real ranges, not the zero-init span of c_proj (see build_active_tiny_gpt gotcha).
     return retrofit_model(build_active_tiny_gpt(), PRESETS[DEFAULT_PRESET])
 
 
-# ---------------------------------------------------------------------------
-# `base_train` subprocess harness
-# ---------------------------------------------------------------------------
-# Shared by test_w0_smoke.py and test_lm_mode.py, which both run the real entry
-# point rather than calling into it. The interpreter resolution and the smoke
-# argument list were duplicated in both; the argument lists had already drifted
-# (one carried `--eval-tokens 128` and the other did not), so the two suites were
-# validating different configurations while both claimed to test the smoke run.
+# --------------------------------------------------------------------------- `base_train` subprocess harness --------------------------------------------------------------------------- Shared by test_w0_smoke.py and test_lm_mode.py, which both run the real entry point rather than calling into it. The interpreter resolution and the smoke argument list were duplicated in both; the argument lists had already drifted (one carried `--eval-tokens 128` and the other did not), so the two suites were validating different configurations while both claimed to test the smoke run.
 
 import os as _os
 import subprocess as _subprocess
@@ -70,8 +54,7 @@ def subprocess_python() -> str:
     in-venv case and needs no special handling.
     """
     venv_python = _os.path.join(_sys.prefix, "bin", "python")
-    # A repo checkout inside a venv: the project root is two levels above the
-    # tests directory, and the venv interpreter sits beside bin/activate.
+    # A repo checkout inside a venv: the project root is two levels above the tests directory, and the venv interpreter sits beside bin/activate.
     candidate = _os.path.join(
         _os.path.dirname(
             _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
@@ -87,9 +70,7 @@ def subprocess_python() -> str:
     return _sys.executable
 
 
-#: d6 / seq 64 / batch 2 keeps a run inside the 7.6 GB host budget. Every knob
-#: that would make the run long or chatty is disabled; the loop still has to
-#: execute `--num-iterations 2` steps.
+#: d6 / seq 64 / batch 2 keeps a run inside the 7.6 GB host budget. Every knob that would make the run long or chatty is disabled; the loop still has to execute `--num-iterations 2` steps.
 SMOKE_ARGS = [
     "--depth",
     "6",

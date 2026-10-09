@@ -98,8 +98,7 @@ def test_when_denoise_step_then_noisy_suffix_conditions_on_clean_prefix() -> Non
     assert len(seen) == 1
     full, t = seen[0], idx.size(1)
     assert full.shape[1] == 2 * t, "input must be [clean | noisy] concatenation"
-    # The clean half is exactly the target embeddings: conditioning on the
-    # clean past, not on a second noisy draw.
+    # The clean half is exactly the target embeddings: conditioning on the clean past, not on a second noisy draw.
     assert torch.equal(full[:, :t, :], clean)
 
 
@@ -115,8 +114,7 @@ def test_when_packed_mask_then_concat_mask_respects_documents() -> None:
     full_bool = full if full.dtype == torch.bool else full > float("-inf")
     # Clean rows never see the noisy half: no information leakage into prefix.
     assert not full_bool[0, 0, :t, t:].any()
-    # A noisy token in doc 2 (position t + 6) sees clean doc-2 past (5..6),
-    # but not clean doc-1 positions (0..4) nor clean future (7).
+    # A noisy token in doc 2 (position t + 6) sees clean doc-2 past (5..6), but not clean doc-1 positions (0..4) nor clean future (7).
     assert full_bool[0, 0, t + 6, 5:8].tolist() == [True, True, False]
     assert not full_bool[0, 0, t + 6, 0:5].any()
     # Same document rule on the noisy half itself.
@@ -134,16 +132,14 @@ def test_when_documents_do_not_fill_the_sequence_then_padding_is_isolated() -> N
     """
     from nanochat.training.diffusion_blocks import block_diagonal_mask
 
-    # Two documents (lengths 5 and 2) packed into a sequence of 8:
-    # positions 7 is padding.
+    # Two documents (lengths 5 and 2) packed into a sequence of 8: positions 7 is padding.
     mask = block_diagonal_mask([5, 2], 8, device="cpu")
     m = mask[0, 0] if mask.ndim == 4 else mask
     # Position 7 (padding) attends to nothing: it is its own document.
     assert not m[7, :7].any(), "padding token attends to a real token"
     # A real token (position 6, doc 2) does NOT attend to padding (7).
     assert not m[6, 7], "real token attends to padding"
-    # Document 1 (positions 0..4) and document 2 (positions 5..6)
-    # stay mutually invisible.
+    # Document 1 (positions 0..4) and document 2 (positions 5..6) stay mutually invisible.
     assert not m[5, :5].any(), "doc 2 attends to doc 1"
     assert not m[0, 5:7].any(), "doc 1 attends to doc 2"
 
@@ -157,8 +153,7 @@ def test_when_documents_have_unequal_tails_then_each_keeps_its_own_past() -> Non
     # Doc 0 spans positions 0..5 (length 6); doc 1 spans 6..7 (length 2).
     mask = block_diagonal_mask([6, 2], 8, device="cpu")
     m = mask[0, 0] if mask.ndim == 4 else mask
-    # Position 7 (last token of doc 1) attends to its own past (6)
-    # and itself, but never to doc 0 (0..5).
+    # Position 7 (last token of doc 1) attends to its own past (6) and itself, but never to doc 0 (0..5).
     assert bool(m[7, 6]), "doc 1 misses its own past"
     assert not m[7, :6].any(), "doc 1 attends to doc 0"
     # Doc 0's last token (5) never sees doc 1 (6..7).

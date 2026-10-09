@@ -67,9 +67,7 @@ def test_when_sample_sigma_then_samples_stay_in_the_block_range() -> None:
     assert samples.shape == (64,)
     assert bool((samples >= lo).all()), "sample below block range"
     assert bool((samples <= hi).all()), "sample above block range"
-    # The draws are not all the same value: a degenerate sampler
-    # that returned the range midpoint would pass the bounds check
-    # but collapse the noise distribution.
+    # The draws are not all the same value: a degenerate sampler that returned the range midpoint would pass the bounds check but collapse the noise distribution.
     assert float(samples.std()) > 0.0, "sample_sigma returned a constant"
 
 

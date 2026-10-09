@@ -47,10 +47,7 @@ def test_when_joint_module_trains_then_loss_finite() -> None:
     module = JointTrainableModule(TinyModel(), lr=1e-2, meta_interval=2)
     t = trainer(max_steps=4)
     t.fit(module, dataloader())
-    # The training loop completed and logged a finite CE loss.
-    # A NaN/Inf loss would mean the FiLM update diverged, so the
-    # assertion is about the logged training loss, not just that
-    # fit returned.
+    # The training loop completed and logged a finite CE loss. A NaN/Inf loss would mean the FiLM update diverged, so the assertion is about the logged training loss, not just that fit returned.
     assert module.trainer is not None
     logged = module.trainer.callback_metrics.get("train_loss")
     assert logged is not None, "JointTrainableModule must log train_loss"
@@ -65,17 +62,11 @@ def test_when_meta_interval_hits_then_cell_trains() -> None:
     parameters must move once the meta-interval fires.
     """
     module = JointTrainableModule(TinyModel(), lr=1e-2, meta_interval=1)
-    # The Trainer adopts configure_optimizers' optimizer, so
-    # read the cell after fit (the module's own optimizer,
-    # not a freshly built one).
+    # The Trainer adopts configure_optimizers' optimizer, so read the cell after fit (the module's own optimizer, not a freshly built one).
     t = trainer(max_steps=4)
     t.fit(module, dataloader())
     opt = _inner_optimizer(module)
-    # After fit the cell has been through the closure
-    # meta-pass (meta_interval=1 fires every step). Its
-    # parameters differ from their zero-initialized film
-    # head only if the closure trained them -- check the
-    # film head moved off zero.
+    # After fit the cell has been through the closure meta-pass (meta_interval=1 fires every step). Its parameters differ from their zero-initialized film head only if the closure trained them -- check the film head moved off zero.
     film_bias = opt.cell.film_proj.bias.detach()
     assert float(film_bias.abs().sum()) > 0.0, (
         "the closure meta-pass must move the FiLM head off its zero init"
@@ -161,10 +152,7 @@ def test_when_sgd_and_mezo_modules_run_then_state_is_independent() -> None:
     mezo_opt = mezo_module.configure_optimizers()
     mezo_opt = mezo_opt[0] if isinstance(mezo_opt, list) else mezo_opt
     mezo_inner = getattr(mezo_opt, "_optimizer", mezo_opt)
-    # The two cells are distinct objects. The MeZO cell
-    # carries the FIR kernel (conv_w) the SGD cell lacks,
-    # so compare identity on the shared parameters, not
-    # the parameter count.
+    # The two cells are distinct objects. The MeZO cell carries the FIR kernel (conv_w) the SGD cell lacks, so compare identity on the shared parameters, not the parameter count.
     sgd_cell = list(sgd_opt.cell.parameters())
     mezo_cell = list(mezo_inner.cell.parameters())
     assert len(sgd_cell) < len(mezo_cell), (

@@ -294,12 +294,7 @@ def test_when_dard_is_on_then_lm_head_finally_receives_a_gradient_under_edm() ->
     grad_with = head_grad(engine)
     assert grad_with.abs().sum() > 0
     assert torch.isfinite(grad_with).all()
-    # Attaching DARD must not perturb the data term itself. Two `denoise_step`
-    # calls cannot be compared directly -- each resamples sigma and the noise,
-    # and `w(sigma) * ||pred - clean||^2` legitimately differs -- so the check
-    # is on the code path: with DARD attached and the penalty evaluated
-    # separately, the returned value is still exactly the EDM scalar (the
-    # engine adds nothing of its own).
+    # Attaching DARD must not perturb the data term itself. Two `denoise_step` calls cannot be compared directly -- each resamples sigma and the noise, and `w(sigma) * ||pred - clean||^2` legitimately differs -- so the check is on the code path: with DARD attached and the penalty evaluated separately, the returned value is still exactly the EDM scalar (the engine adds nothing of its own).
     engine.train()
     engine.zero_grad(set_to_none=True)
     data_only, _ = engine.denoise_step(idx, block_idx=0)

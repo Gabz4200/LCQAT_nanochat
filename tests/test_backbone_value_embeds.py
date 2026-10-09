@@ -96,12 +96,7 @@ class TestValueEmbedLookupSurvivesResize:
             assert _logits(model, torch.randint(0, 128, (1, 8))) is not None
 
 
-# Depth 1 is excluded: `resize_to` shrinks by truncating, and at depth 1 the one
-# surviving block came from a depth-2 model where layer 0 carries no value
-# embedding, so there is no `ve_gate` to copy the shape from. That is a
-# limitation of the resize *helper*, not of the forward pass -- a GPT built
-# natively at depth 1 is fine. Widening `resize_to` to synthesize a gate is out
-# of scope here.
+# Depth 1 is excluded: `resize_to` shrinks by truncating, and at depth 1 the one surviving block came from a depth-2 model where layer 0 carries no value embedding, so there is no `ve_gate` to copy the shape from. That is a limitation of the resize *helper*, not of the forward pass -- a GPT built natively at depth 1 is fine. Widening `resize_to` to synthesize a gate is out of scope here.
 @pytest.mark.parametrize("n_layer", [2, 3, 4, 5, 6])
 def test_every_depth_forward_runs(n_layer):
     model = build_active_tiny_gpt()

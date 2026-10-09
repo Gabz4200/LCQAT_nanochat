@@ -160,8 +160,7 @@ def test_when_the_model_puts_mass_on_the_conclusion_then_the_penalty_drops() -> 
     DARD would be silently doing nothing.
     """
     loss_fn = make_loss(num_rules=1, vocab=12)
-    # Rule 0 is `premise {0,1,2} <= conclusion {3,4,5}`, so mass on the premise
-    # is the violation and mass on the conclusion is the satisfaction.
+    # Rule 0 is `premise {0,1,2} <= conclusion {3,4,5}`, so mass on the premise is the violation and mass on the conclusion is the satisfaction.
     assert loss_fn(_sharp_on((3, 4, 5))) < loss_fn(_sharp_on((0, 1, 2)))
 
 
@@ -169,8 +168,7 @@ def test_when_every_rule_is_satisfied_then_the_penalty_is_at_its_floor() -> None
     """softplus(0)/gamma = log(2)/gamma, the minimum the hinge can reach."""
     torch.manual_seed(7)
     loss_fn = make_loss(num_rules=3, vocab=12)
-    # A uniform distribution gives v_premise == v_conclusion exactly (same
-    # cardinality on both sides), so every violation is 0.
+    # A uniform distribution gives v_premise == v_conclusion exactly (same cardinality on both sides), so every violation is 0.
     uniform = torch.zeros(1, 1, 12)
     expected = torch.log(torch.tensor(2.0)) / GAMMA
     assert loss_fn(uniform).item() == pytest.approx(expected.item(), abs=1e-5)
@@ -237,8 +235,7 @@ def test_when_a_premise_is_long_then_the_product_does_not_flush_to_zero() -> Non
     logits = torch.full((1, 1, vocab), -10.0)
     logits.requires_grad_(True)
     logits.retain_grad()
-    # Make conclusion token dominant so the order is satisfied, yet the premise
-    # product is astronomically small.
+    # Make conclusion token dominant so the order is satisfied, yet the premise product is astronomically small.
     with torch.no_grad():
         logits[0, 0, vocab - 1] = 10.0
     total = loss_fn(logits)
@@ -338,15 +335,10 @@ def test_when_warmup_ends_then_the_next_step_normalizes() -> None:
     """
     balancer = DardLossBalancer(ema_decay=0.9, lambda_global=0.5)
     balancer.train()
-    # First call: _update raises steps to 1, so the warmup branch
-    # fires and the total is the unweighted sum.
+    # First call: _update raises steps to 1, so the warmup branch fires and the total is the unweighted sum.
     total, _ = balancer(torch.tensor(2.0), torch.tensor(0.5))
     assert total.item() == pytest.approx(2.5, abs=1e-6)
-    # Second call: _update runs first (steps -> 2), seeding the
-    # EMA by one more decay step, then the normalized branch
-    # divides each term by its just-updated EMA and scales the
-    # aux term by lambda_global. Replicate the EMA math the
-    # forward is about to apply so the expected value is exact.
+    # Second call: _update runs first (steps -> 2), seeding the EMA by one more decay step, then the normalized branch divides each term by its just-updated EMA and scales the aux term by lambda_global. Replicate the EMA math the forward is about to apply so the expected value is exact.
     mu_ce = 0.2 * 0.9 + 2.0 * 0.1  # post-update, second call
     mu_aml = 0.05 * 0.9 + 0.5 * 0.1
     total, _ = balancer(torch.tensor(2.0), torch.tensor(0.5))

@@ -208,9 +208,7 @@ def test_when_cache_seqlen_before_tq_then_value_error() -> None:
 
 
 def test_when_lut_k_invalid_then_value_error() -> None:
-    # K=31 is out of range because the cache is nibble-packed (K <= 15), not
-    # because it is odd. Even K is legal: the asymmetric split makes one-sided
-    # codebooks, and therefore K=4, 8, 14, possible.
+    # K=31 is out of range because the cache is nibble-packed (K <= 15), not because it is odd. Even K is legal: the asymmetric split makes one-sided codebooks, and therefore K=4, 8, 14, possible.
     case: list = list(make_case(1, -1, 16, seed=16))
     case[3] = torch.sort(torch.randn(H_KV, 31), dim=-1).values
     case[4] = torch.sort(torch.randn(H_KV, 31), dim=-1).values

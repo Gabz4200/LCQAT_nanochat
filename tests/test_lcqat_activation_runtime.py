@@ -43,8 +43,7 @@ def test_when_exporting_then_activation_lut_wired_on_every_mlp(
 def test_when_exporting_then_lut_matches_value_path_quantizer_ids(
     tiny_gpt_factory, tmp_path
 ) -> None:
-    # Independent oracle: run the REAL out-quantizer -> relu^2 -> act-quantizer
-    # value path and require the compiled table to reproduce those exact IDs.
+    # Independent oracle: run the REAL out-quantizer -> relu^2 -> act-quantizer value path and require the compiled table to reproduce those exact IDs.
     from nanochat.models.quant import PRESETS
 
     model = retrofit_model(tiny_gpt_factory(), PRESETS["prd"])
@@ -56,9 +55,7 @@ def test_when_exporting_then_lut_matches_value_path_quantizer_ids(
         if not name.endswith("mlp.c_fc") or not isinstance(fc, LCQATLinear):
             continue
         parent = runtime.get_submodule(name[: -len(".c_fc")])
-        # `parent` is `nn.Module`; `.c_proj` resolves through
-        # `Module.__getattr__` (typed `-> Tensor` in the torch stubs), so
-        # narrow it before reading `act_quantizer`.
+        # `parent` is `nn.Module`; `.c_proj` resolves through `Module.__getattr__` (typed `-> Tensor` in the torch stubs), so narrow it before reading `act_quantizer`.
         proj = parent.c_proj
         assert isinstance(proj, LCQATLinear), (
             f"{name} sibling is not an LCQATLinear; the LUT cannot be checked"

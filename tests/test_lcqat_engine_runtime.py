@@ -65,9 +65,7 @@ def test_when_prefill_with_quantized_cache_then_logits_close_to_bf16_cache() -> 
 
 
 def test_when_forced_decode_steps_then_step_logits_close_to_bf16_cache() -> None:
-    # The real next-token parity metric: identical forced token trajectories
-    # through both cache types, comparing logits at every decode step (argmax
-    # agreement is noise-sensitive on an untrained model - see the Engine test).
+    # The real next-token parity metric: identical forced token trajectories through both cache types, comparing logits at every decode step (argmax agreement is noise-sensitive on an untrained model - see the Engine test).
     model = build_model()
     torch.manual_seed(4)
     prompt = torch.randint(0, model.config.vocab_size, (1, 8))
@@ -100,10 +98,7 @@ def test_when_greedy_decode_with_quantized_kv_then_matches_bf16_cache() -> None:
     ref, _ = engine.generate_batch(prompt, **kwargs)
     got, _ = engine.generate_batch(prompt, quantized_kv=True, **kwargs)
     assert len(got[0]) == len(ref[0])
-    # On an UNTRAINED model the top-1 logit margins sit below the KV-quant
-    # noise floor, so argmax flips after a few tokens are expected; the strict
-    # per-step logit tolerance is asserted in the forced-trajectory test.
-    # Here: the wiring must produce a long matching prefix, not garbage.
+    # On an UNTRAINED model the top-1 logit margins sit below the KV-quant noise floor, so argmax flips after a few tokens are expected; the strict per-step logit tolerance is asserted in the forced-trajectory test. Here: the wiring must produce a long matching prefix, not garbage.
     prefix = next(
         (i for i, (a, b) in enumerate(zip(ref[0], got[0])) if a != b),
         min(len(ref[0]), len(got[0])),

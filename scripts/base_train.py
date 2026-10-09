@@ -154,6 +154,15 @@ parser.add_argument(
     "--depth", type=int, default=20, help="depth of the Transformer model"
 )
 parser.add_argument(
+    "--backbone",
+    type=str,
+    default="gpt",
+    choices=["gpt", "lfm2"],
+    help="backbone architecture: 'gpt' (default, all-attention Transformer) "
+    "or 'lfm2' (Liquid Foundation Model 2 hybrid: mostly double-gated short "
+    "convolutions + a minority of grouped-query attention blocks; arXiv:2511.23404)",
+)
+parser.add_argument(
     "--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio"
 )
 parser.add_argument(

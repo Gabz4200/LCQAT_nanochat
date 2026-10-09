@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass
 import torch
 
 from nanochat.models.backbone import GPT, GPTConfig, Linear
+from nanochat.models.lfm2 import LFM2, LFM2Config
 from nanochat.models.quant import (
     finish_lcqat_after_load,
     lcqat_config_from_args,
@@ -52,11 +53,11 @@ from nanochat.utils.common import COMPUTE_DTYPE, get_base_dir, print0
 
 @dataclass
 class BaseModel:
-    """The bare GPT plus everything the retrofit/load path decided about it."""
+    """The bare backbone (GPT or LFM2) plus everything the retrofit/load path decided about it."""
 
-    model: GPT
-    orig_model: GPT
-    model_config: GPTConfig
+    model: GPT | LFM2
+    orig_model: GPT | LFM2
+    model_config: GPTConfig | LFM2Config
     model_config_kwargs: dict
     lcqat_requested: object | None
     lcqat_active: object | None
@@ -97,11 +98,38 @@ class RunConfig:
 
 def build_model_meta(depth, args, vocab_size):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
-    # Model dim is nudged up to nearest multiple of head_dim for clean division
-    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
+    # Model dim is nudged up to nearest multiple of head_dim for clean division (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    backbone = getattr(args, "backbone", "gpt")
+    if backbone == "lfm2":
+        # LFM2 hybrid: a minority of the layers are GQA attention blocks (the rest are double-gated short convolutions). The attention ratio defaults to the LFM2 design point (~6/16) but scales with depth so tiny smoke runs keep at least one attention layer for long-range recall. n_kv_head stays a small fixed GQA group (4 or fewer).
+        from nanochat.models.lfm2 import LFM2Config
+
+        num_attn = max(1, round(depth * (6 / 16)))
+        num_attn = min(num_attn, depth)
+        # GQA group: a small kv-head count that divides num_heads cleanly.
+        num_kv = num_heads
+        for candidate in (4, 2, 1):
+            if num_heads % candidate == 0 and candidate <= num_heads:
+                num_kv = candidate
+                break
+        config = LFM2Config(
+            sequence_len=args.max_seq_len,
+            vocab_size=vocab_size,
+            n_layer=depth,
+            n_head=num_heads,
+            n_kv_head=num_kv,
+            n_embd=model_dim,
+            window_pattern=args.window_pattern,
+            num_attention_blocks=num_attn,
+        )
+        with torch.device("meta"):
+            from nanochat.models.lfm2 import LFM2
+
+            model_meta = LFM2(config)
+        return model_meta
     config = GPTConfig(
         sequence_len=args.max_seq_len,
         vocab_size=vocab_size,

@@ -11,6 +11,7 @@ import torch
 
 from nanochat.data.tokenizer import get_tokenizer
 from nanochat.models.backbone import GPT, GPTConfig
+from nanochat.models.lfm2 import LFM2
 from nanochat.models.quant.retrofit import (
     LayerKConfig,
     finish_lcqat_after_load,
@@ -169,7 +170,7 @@ def build_model(
     device,
     phase,
     lcqat=None,
-) -> "tuple[GPT | DiffusionBlockEngine, object, dict]":
+) -> "tuple[GPT | LFM2 | DiffusionBlockEngine, object, dict]":
     """
     A bunch of repetitive code to build a model from a given checkpoint.
     Returns:
@@ -205,23 +206,26 @@ def build_model(
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
-    _patch_missing_keys(model_data, model_config)
-    with torch.device("meta"):
-        model = GPT(model_config)
+    # The saved config is an `asdict` of whichever backbone was trained: GPT's fields or LFM2's (which adds `num_attention_blocks`/`conv_kernel_size`/ `intermediate_size`). Reconstruct the matching config class so a resumed LFM2 checkpoint rebuilds the hybrid stack, not an all-attention GPT.
+    if "num_attention_blocks" in model_config_kwargs:
+        from nanochat.models.lfm2 import LFM2, LFM2Config
+
+        model_config = LFM2Config(**model_config_kwargs)
+        _patch_missing_keys(model_data, model_config)
+        with torch.device("meta"):
+            model = LFM2(model_config)
+    else:
+        model_config = GPTConfig(**model_config_kwargs)
+        _patch_missing_keys(model_data, model_config)
+        with torch.device("meta"):
+            model = GPT(model_config)
     model.to_empty(device=device)
     model.init_weights()  # need the rotary embeddings initialized; TODO: fix model re-init
-    # Check if DiffusionBlocks state was saved in metadata or state keys
-    # Do this BEFORE the strict load so malformed db checkpoints fail with
-    # the intended message instead of an incidental LUT key error.
+    # Check if DiffusionBlocks state was saved in metadata or state keys Do this BEFORE the strict load so malformed db checkpoints fail with the intended message instead of an incidental LUT key error.
     db_meta = meta_data.get("db")
     num_blocks = db_meta.get("num_blocks", 4) if db_meta is not None else 0
     if db_meta is not None:
-        # The block/noise map was corrected in v2 (block 0 now owns the
-        # highest sigma range, per the paper Fig. 6 / App. C; v1 had it
-        # backwards). A v1 checkpoint resumed under the corrected map would
-        # silently retarget every block's noise range, so refuse it loudly
-        # instead of training garbage that looks healthy. Absent key means v1.
+        # The block/noise map was corrected in v2 (block 0 now owns the highest sigma range, per the paper Fig. 6 / App. C; v1 had it backwards). A v1 checkpoint resumed under the corrected map would silently retarget every block's noise range, so refuse it loudly instead of training garbage that looks healthy. Absent key means v1.
         if db_meta.get("noise_map_version", 1) != NOISE_MAP_VERSION:
             raise RuntimeError(
                 f"checkpoint declares meta['db'] with noise_map_version="

@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.models.backbone import GPT, maybe_sigma_call
+from nanochat.models.lfm2 import LFM2
 
 
 def sinusoidal_noise_embedding(log_sigma: torch.Tensor, dim: int) -> torch.Tensor:
@@ -537,21 +538,15 @@ class DiffusionBlockEngine:
 
     def __init__(
         self,
-        model: GPT,
+        model: GPT | LFM2,
         partitioner: EquiProbabilityPartitioner,
         dtype: torch.dtype = torch.float32,
         cond_dim: int = 32,
         device=None,
         denoise_backend: str = "cpu",
     ) -> None:
-        # Annotated `GPT`, not `nn.Module`: the engine reads `model.transformer.h`,
-        # `model.lm_head`, `model.config` and `model._precompute_rotary_embeddings`,
-        # none of which exist on a bare `Module`. Declaring the parameter as
-        # `Module` made pyrefly widen every one of those attribute reads to
-        # `Module | Tensor`, which propagated ~50 spurious type errors into
-        # every consumer (including the DARD tests). The narrow type is the
-        # truth, and the constructor would fail at runtime regardless.
-        self.model: GPT = model
+        # Annotated `GPT | LFM2`, not `nn.Module`: the engine reads `model.transformer.h`, `model.lm_head`, `model.config` and `model._precompute_rotary_embeddings`, none of which exist on a bare `Module`. Declaring the parameter as `Module` made pyrefly widen every one of those attribute reads to `Module | Tensor`, which propagated ~50 spurious type errors into every consumer (including the DARD tests). The narrow type is the truth, and the constructor would fail at runtime regardless. LFM2 speaks the same interface (see nanochat.models.lfm2), so the DiffusionBlocks engine runs it unchanged.
+        self.model: GPT | LFM2 = model
         self.partitioner = partitioner
         self.dtype = dtype
         if denoise_backend not in ("naive", "cpu", "gpu"):

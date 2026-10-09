@@ -150,8 +150,7 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# The published table. `--out` defaults here for the documented command line;
-# a programmatic `main()` call must name its own destination instead.
+# The published table. `--out` defaults here for the documented command line; a programmatic `main()` call must name its own destination instead.
 PUBLISHED_LEADERBOARD = REPO_ROOT / "dev" / "LEADERBOARD.md"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -202,10 +201,7 @@ from nanochat.models.quant.sparseprop import (  # noqa: E402
     inject_sparseprop_layers,
 )
 
-# The measurements live in `nanochat.modules.experiments`, one module per
-# experiment. Every name below was defined in this file before the split and is
-# re-imported from that implementation, so any caller that did
-# `from scripts.lcqat_ablation import X` still resolves to the same object.
+# The measurements live in `nanochat.modules.experiments`, one module per experiment. Every name below was defined in this file before the split and is re-imported from that implementation, so any caller that did `from scripts.lcqat_ablation import X` still resolves to the same object.
 from nanochat.modules.experiments import (  # noqa: E402
     BASELINE_PRESET,
     BIAS_CODEBOOK_DEAD,
@@ -263,10 +259,7 @@ from nanochat.training.diffusion_blocks import (  # noqa: E402
     edm_preconditioning,
 )
 
-#: This module is consumed as a namespace: `tests/test_lcqat_ablation_driver.py`
-#: loads it by path and reaches the measurements through it. Module objects
-#: (`argparse`, `json`, `math`, `torch`, ...) are not part of that surface,
-#: and the five driver entry points were each listed twice.
+#: This module is consumed as a namespace: `tests/test_lcqat_ablation_driver.py` loads it by path and reaches the measurements through it. Module objects (`argparse`, `json`, `math`, `torch`, ...) are not part of that surface, and the five driver entry points were each listed twice.
 __all__ = [
     "PUBLISHED_LEADERBOARD",
     "REPO_ROOT",
@@ -426,10 +419,7 @@ def register_args(parser: argparse.ArgumentParser) -> None:
         help="Print the leaderboard instead of writing it.",
     )
 
-    # The knobs the six added experiments measure. Names and semantics match the
-    # training entry points, so a reader who knows `base_train --help` knows
-    # these; the defaults are the *probe's* defaults, not necessarily the
-    # trainer's, and the help text says which.
+    # The knobs the six added experiments measure. Names and semantics match the training entry points, so a reader who knows `base_train --help` knows these; the defaults are the *probe's* defaults, not necessarily the trainer's, and the help text says which.
     group.add_argument(
         "--db-objective",
         choices=[OBJECTIVE_CE, OBJECTIVE_EDM],
@@ -504,8 +494,7 @@ def register_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
 
-    # The bias codebook's size and the short training run that proves it moves.
-    # Steps and lr are the *probe's*, not a trainer's; see `run_bias_quant`.
+    # The bias codebook's size and the short training run that proves it moves. Steps and lr are the *probe's*, not a trainer's; see `run_bias_quant`.
     group.add_argument(
         "--bias-quant-k-bias",
         type=int,
@@ -544,9 +533,7 @@ def register_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
 
-    # Probe sizes. Every one of these is a micro-probe; see the "Reduced
-    # protocol" section of the module docstring for what that does and does not
-    # license anyone to conclude from the result.
+    # Probe sizes. Every one of these is a micro-probe; see the "Reduced protocol" section of the module docstring for what that does and does not license anyone to conclude from the result.
     group.add_argument(
         "--ablation-blocks",
         type=int,
@@ -595,12 +582,7 @@ def register_args(parser: argparse.ArgumentParser) -> None:
         default=2048,
         help="Sigma draws per diffusion block in the `overlap` experiment.",
     )
-    # The whole SparseProp surface (scope, sparsity, gradual schedule, dense
-    # threshold -- comes from the shared helper, so this driver cannot drift
-    # from `base_train` on a flag that changes what a pruning mask means. It
-    # includes `--sparseprop-sparsity`, which used to be registered here as well
-    # with driver-specific help text; two registrations of one flag is an
-    # argparse conflict, so the shared help wins.
+    # The whole SparseProp surface (scope, sparsity, gradual schedule, dense threshold -- comes from the shared helper, so this driver cannot drift from `base_train` on a flag that changes what a pruning mask means. It includes `--sparseprop-sparsity`, which used to be registered here as well with driver-specific help text; two registrations of one flag is an argparse conflict, so the shared help wins.
     add_sparseprop_pruning_args(group)
 
 
@@ -620,9 +602,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.ablation_blocks < 1:
         raise ValueError(f"--ablation-blocks must be >= 1, got {args.ablation_blocks}")
     if args.ablation_n_layer < args.ablation_blocks:
-        # The engine asserts `partitioner.num_blocks <= n_layer`, so asking for
-        # more blocks than layers dies inside `DiffusionBlockEngine.__init__`
-        # with a bare AssertionError. Said here, with the numbers, instead.
+        # The engine asserts `partitioner.num_blocks <= n_layer`, so asking for more blocks than layers dies inside `DiffusionBlockEngine.__init__` with a bare AssertionError. Said here, with the numbers, instead.
         raise ValueError(
             f"--ablation-n-layer ({args.ablation_n_layer}) must be >= "
             f"--ablation-blocks ({args.ablation_blocks}): every block needs at "
@@ -637,9 +617,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.objective_lr <= 0.0:
         raise ValueError(f"--objective-lr must be positive, got {args.objective_lr}")
     if args.block_sampling_micro_steps < 2:
-        # One micro-step is step-level sampling with extra steps in the name,
-        # and it is the case in which the retention metric is degenerate: with
-        # nothing accumulated, both arms trivially retain everything sampled.
+        # One micro-step is step-level sampling with extra steps in the name, and it is the case in which the retention metric is degenerate: with nothing accumulated, both arms trivially retain everything sampled.
         raise ValueError(
             f"--block-sampling-micro-steps must be >= 2 for a mode comparison, "
             f"got {args.block_sampling_micro_steps}"
@@ -652,9 +630,7 @@ def validate_args(args: argparse.Namespace) -> None:
             f"{args.db_overlap}"
         )
     if not 0.0 <= args.sparseprop_sparsity < 1.0:
-        # 1.0 is excluded on purpose: `magnitude_mask` at sparsity 1.0 keeps
-        # exactly one entry per row, so the "layer is pruned to zero" NMSE
-        # comparison would be measuring an all-ones layer the sweep invented.
+        # 1.0 is excluded on purpose: `magnitude_mask` at sparsity 1.0 keeps exactly one entry per row, so the "layer is pruned to zero" NMSE comparison would be measuring an all-ones layer the sweep invented.
         raise ValueError(
             f"--sparseprop-sparsity must be in [0.0, 1.0), got "
             f"{args.sparseprop_sparsity}"
@@ -687,21 +663,14 @@ def validate_args(args: argparse.Namespace) -> None:
             f"--db-sigma-codebook must be '', 'conditioned' or 'modulated', got "
             f"{args.db_sigma_codebook!r}"
         )
-    # The anchor count is validated *after* resolution, because 0 is not a
-    # request for zero anchors -- it is the documented "one per diffusion block"
-    # shorthand, and `run_sigma_cond` resolves it the same way. Testing the raw
-    # flag would reject the default outright.
+    # The anchor count is validated *after* resolution, because 0 is not a request for zero anchors -- it is the documented "one per diffusion block" shorthand, and `run_sigma_cond` resolves it the same way. Testing the raw flag would reject the default outright.
     resolved_anchors = args.db_sigma_anchors or args.ablation_blocks
     if (
         args.experiment in ("all", "sigma_cond")
         and args.db_sigma_codebook == "conditioned"
         and resolved_anchors < 2
     ):
-        # `SigmaConditionedCodebook.__init__` raises on a single anchor, and
-        # `install_sigma_codebooks` raises SystemExit. Caught at parse time
-        # instead, with the same numbers. Only checked when the experiment runs:
-        # the flag is inert for every other experiment, and rejecting an inert
-        # flag would make `--experiment all` fail for a knob it never reads.
+        # `SigmaConditionedCodebook.__init__` raises on a single anchor, and `install_sigma_codebooks` raises SystemExit. Caught at parse time instead, with the same numbers. Only checked when the experiment runs: the flag is inert for every other experiment, and rejecting an inert flag would make `--experiment all` fail for a knob it never reads.
         raise ValueError(
             f"--db-sigma-anchors must resolve to >= 2 with "
             f"--db-sigma-codebook=conditioned, got {resolved_anchors} "
@@ -710,10 +679,7 @@ def validate_args(args: argparse.Namespace) -> None:
             "diffusion block')"
         )
     if args.bias_quant_k_bias < 2:
-        # `MemoryEfficientLearnedCodebook.validate_split` requires
-        # `m_neg + m_pos >= 2`, so a K of 1 or 0 is unconstructible rather than
-        # merely a poor choice. Said here with the number, rather than as a
-        # `ValueError` from inside the codebook with no idea which flag set it.
+        # `MemoryEfficientLearnedCodebook.validate_split` requires `m_neg + m_pos >= 2`, so a K of 1 or 0 is unconstructible rather than merely a poor choice. Said here with the number, rather than as a `ValueError` from inside the codebook with no idea which flag set it.
         raise ValueError(
             f"--bias-quant-k-bias must be >= 2 (the zero anchor plus at least "
             f"one level), got {args.bias_quant_k_bias}"
@@ -775,13 +741,7 @@ def check_claims(rows: list[AblationRow], n_elements: int) -> list[str]:
                     "strictly fewer levels, so this is a real regression."
                 )
         elif row.experiment == "objective":
-            # Only the measurement's own soundness is gated. Neither objective
-            # is "better" -- they optimize different functions -- so a
-            # non-monotone or jittery loss is not a failure and is not asserted
-            # either way. What must hold is that both arms produced a finite
-            # number at all: a `nan` here means the block-output probe diverged
-            # or the loss never propagated, and rendering it as a number would
-            # be a false reading rather than a surprising one.
+            # Only the measurement's own soundness is gated. Neither objective is "better" -- they optimize different functions -- so a non-monotone or jittery loss is not a failure and is not asserted either way. What must hold is that both arms produced a finite number at all: a `nan` here means the block-output probe diverged or the loss never propagated, and rendering it as a number would be a false reading rather than a surprising one.
             for name, value in (
                 (row.baseline, row.value_baseline),
                 (row.variant, row.value_variant),
@@ -793,10 +753,7 @@ def check_claims(rows: list[AblationRow], n_elements: int) -> list[str]:
                         "propagated"
                     )
         elif row.experiment.startswith("block_sampling"):
-            # The reference must be non-empty and the two modes must be
-            # *distinguishable*. A tie means the metric stopped discriminating
-            # (the §12.3 failure: holding sigma fixed makes every block tie), so
-            # the comparison is reporting nothing even though it "passed".
+            # The reference must be non-empty and the two modes must be *distinguishable*. A tie means the metric stopped discriminating (the §12.3 failure: holding sigma fixed makes every block tie), so the comparison is reporting nothing even though it "passed".
             if row.value_baseline <= 0.0:
                 problems.append(
                     f"{row.experiment}: the isolated per-block reference gradient is "
@@ -811,11 +768,7 @@ def check_claims(rows: list[AblationRow], n_elements: int) -> list[str]:
                     "block ties and the metric stops discriminating (handoff 12.3)."
                 )
         elif row.experiment.startswith("sparsity_scope"):
-            # The two scopes prune to the same per-layer fraction on these two
-            # layers, so the NMSE rows tie by construction and the disagreement
-            # row is what carries the comparison. A disagreement of zero would
-            # mean the scope flag reached neither path, which is a wiring bug
-            # this row is the only thing that would catch.
+            # The two scopes prune to the same per-layer fraction on these two layers, so the NMSE rows tie by construction and the disagreement row is what carries the comparison. A disagreement of zero would mean the scope flag reached neither path, which is a wiring bug this row is the only thing that would catch.
             if row.value_variant <= 0.0:
                 problems.append(
                     f"{row.experiment}: the layer-scope and global-scope masks are "
@@ -824,15 +777,7 @@ def check_claims(rows: list[AblationRow], n_elements: int) -> list[str]:
                     "check that the schedule actually branched on `scope`."
                 )
         elif row.experiment.startswith("overlap_g"):
-            # The gate is the invariant that can actually be defended, not the
-            # handoff's "strictly decreases" framing, which this measurement
-            # contradicts by construction: `sample_sigma` draws from
-            # `[lo/alpha, hi*alpha]`, so the out-of-*nominal*-band fraction rises
-            # with g. Measuring against the widened interval would fall by
-            # construction and test nothing. What must hold is that the disjoint
-            # partition is genuinely disjoint -- at g=0 essentially nothing
-            # should leave its band, and a large value there means the sampler is
-            # not respecting the partition at all.
+            # The gate is the invariant that can actually be defended, not the handoff's "strictly decreases" framing, which this measurement contradicts by construction: `sample_sigma` draws from `[lo/alpha, hi*alpha]`, so the out-of-*nominal*-band fraction rises with g. Measuring against the widened interval would fall by construction and test nothing. What must hold is that the disjoint partition is genuinely disjoint -- at g=0 essentially nothing should leave its band, and a large value there means the sampler is not respecting the partition at all.
             if row.variant == "g=0" and row.value_variant > 0.01:
                 problems.append(
                     f"{row.experiment}: at overlap 0.0 (the disjoint partition) "
@@ -841,12 +786,7 @@ def check_claims(rows: list[AblationRow], n_elements: int) -> list[str]:
                     "so this is a sampler or boundary defect, not an overlap effect."
                 )
         elif row.experiment.startswith("sparsity_"):
-            # Pruning is expected to *raise* NMSE, so the sign is not gated.
-            # What is gated is the structural-zero contract: a pruned position
-            # must dequantize to exactly 0.0, or SparseProp is not legal on top
-            # of LC-QAT. The check reads the flag recorded in the note, because
-            # a silently-broken exact-zero would otherwise show up only as a
-            # slightly worse NMSE.
+            # Pruning is expected to *raise* NMSE, so the sign is not gated. What is gated is the structural-zero contract: a pruned position must dequantize to exactly 0.0, or SparseProp is not legal on top of LC-QAT. The check reads the flag recorded in the note, because a silently-broken exact-zero would otherwise show up only as a slightly worse NMSE.
             if "FAILED" in (row.notes or ""):
                 problems.append(
                     f"{row.experiment}: a pruned position did not dequantize to "
@@ -859,11 +799,7 @@ def check_claims(rows: list[AblationRow], n_elements: int) -> list[str]:
                     "convention (True = retained), so the row cannot be audited."
                 )
         elif row.experiment.startswith("act_lut_"):
-            # Two exact, free claims, gated only where they are actually
-            # asserted. The fp8 identity applies to the proximity relaxation
-            # alone: the free-logit matrix stores no knot positions, so there is
-            # nothing to export, and gating it there would demand a result the
-            # run never produced and fail a correct sweep.
+            # Two exact, free claims, gated only where they are actually asserted. The fp8 identity applies to the proximity relaxation alone: the free-logit matrix stores no knot positions, so there is nothing to export, and gating it there would demand a result the run never produced and fail a correct sweep.
             notes = row.notes or ""
             if (
                 "no fp8 export" not in notes
@@ -874,10 +810,7 @@ def check_claims(rows: list[AblationRow], n_elements: int) -> list[str]:
                     "bit-identical index table. `resolved_table()` reads levels only, "
                     "so it must be identical for any knot dtype."
                 )
-            # The parameter count is structural: proximity is K_in + K_out
-            # against a free K_in x K_out logit matrix. A proximity row that does
-            # not shrink the free-logit baseline is not the parameterization the
-            # count describes.
+            # The parameter count is structural: proximity is K_in + K_out against a free K_in x K_out logit matrix. A proximity row that does not shrink the free-logit baseline is not the parameterization the count describes.
             if (
                 row.variant.startswith(RELAXATION_PROXIMITY)
                 and row.value_variant >= row.value_baseline
@@ -889,11 +822,7 @@ def check_claims(rows: list[AblationRow], n_elements: int) -> list[str]:
                     "shrink. K_in + K_out must be smaller than K_in * K_out."
                 )
         elif row.experiment == "sigma_cond":
-            # Structural only, by design. The gate is that the structural claim
-            # holds -- the conditioned codebook is the anchor count times the
-            # shared one -- and that the unverified premise is still declared
-            # unverified. A row that quietly dropped the disclaimer would be
-            # reading as an accuracy result.
+            # Structural only, by design. The gate is that the structural claim holds -- the conditioned codebook is the anchor count times the shared one -- and that the unverified premise is still declared unverified. A row that quietly dropped the disclaimer would be reading as an accuracy result.
             if "UNVERIFIED" not in (row.notes or ""):
                 problems.append(
                     "sigma_cond: the note must record the distributional premise as "
@@ -907,26 +836,7 @@ def check_claims(rows: list[AblationRow], n_elements: int) -> list[str]:
                     "shared one. One codebook per anchor must cost proportionally more."
                 )
         elif row.experiment == "bias_quant_nmse":
-            # The probe's own soundness, not a verdict on the capability. Two
-            # things must hold for this number to mean anything, and both are
-            # falsifiable:
-            #
-            # * The quantized arm must be *worse* than the FP32 baseline. The
-            #   baseline scores 0 exactly, so an NMSE of 0 here means the table
-            #   reproduced the bias exactly -- which a K-level table over a
-            #   spread bias does not do. That is a broken measurement, not a
-            #   perfect one, and taking it at face value would report a "free
-            #   win" for a probe that never quantized anything.
-            # * It must be *below* 1.0. An NMSE of exactly 1.0 is the signature
-            #   of every entry bucketizing onto the zero anchor: the
-            #   reconstruction is all zeros, so the error equals the signal
-            #   power. `init_from_tensor` is called precisely to avoid it, and a
-            #   run that reports 1.0 has silently lost that call -- the
-            #   `per_channel.py` measurement `BiasQuantizer` cites.
-            #
-            # The row deliberately does NOT gate "is bias quantization worth
-            # it". That verdict needs a trained model, and the note says so;
-            # encoding either answer here would be a check that can only pass.
+            # The probe's own soundness, not a verdict on the capability. Two things must hold for this number to mean anything, and both are falsifiable: * The quantized arm must be *worse* than the FP32 baseline. The baseline scores 0 exactly, so an NMSE of 0 here means the table reproduced the bias exactly -- which a K-level table over a spread bias does not do. That is a broken measurement, not a perfect one, and taking it at face value would report a "free win" for a probe that never quantized anything. * It must be *below* 1.0. An NMSE of exactly 1.0 is the signature of every entry bucketizing onto the zero anchor: the reconstruction is all zeros, so the error equals the signal power. `init_from_tensor` is called precisely to avoid it, and a run that reports 1.0 has silently lost that call -- the `per_channel.py` measurement `BiasQuantizer` cites. The row deliberately does NOT gate "is bias quantization worth it". That verdict needs a trained model, and the note says so; encoding either answer here would be a check that can only pass.
             if row.value_variant <= 0.0:
                 problems.append(
                     f"{row.experiment}: the quantized bias reconstructs with NMSE "
@@ -946,10 +856,7 @@ def check_claims(rows: list[AblationRow], n_elements: int) -> list[str]:
                     "bias before this is measured."
                 )
         elif row.experiment == "bias_quant_cost":
-            # Structural, and falsifiable in one direction only: the FP32
-            # baseline carries the bias inline, so a bias codebook must add
-            # parameters. Zero would mean the flag never reached the layer and
-            # the whole experiment measured a bias-free module.
+            # Structural, and falsifiable in one direction only: the FP32 baseline carries the bias inline, so a bias codebook must add parameters. Zero would mean the flag never reached the layer and the whole experiment measured a bias-free module.
             if row.value_variant <= 0.0:
                 problems.append(
                     f"{row.experiment}: the bias codebook reports "
@@ -959,12 +866,7 @@ def check_claims(rows: list[AblationRow], n_elements: int) -> list[str]:
                     "rest of this experiment measured a bias-free layer."
                 )
         elif row.experiment == "bias_quant_liveness":
-            # The 9.8 trap, gated. A bias codebook that does not move is inert
-            # storage that looks like a feature on the parameter-count row, and
-            # the failure is silent: it prints no error and the error metric
-            # reads as a plausible number rather than as a sign of anything
-            # wrong. Read from the note's flag so the rendered leaderboard stays
-            # self-describing, exactly as the `sparsity` rows do.
+            # The 9.8 trap, gated. A bias codebook that does not move is inert storage that looks like a feature on the parameter-count row, and the failure is silent: it prints no error and the error metric reads as a plausible number rather than as a sign of anything wrong. Read from the note's flag so the rendered leaderboard stays self-describing, exactly as the `sparsity` rows do.
             if BIAS_CODEBOOK_DEAD in (row.notes or ""):
                 problems.append(
                     f"{row.experiment}: the bias codebook's parameters received no "
@@ -1003,10 +905,7 @@ def write_leaderboard(path: Path, table: str) -> None:
         text = path.read_text()
         if marker in text and end_marker in text:
             head = text.split(marker)[0]
-            # `tail` carries the hand-written prose that follows the end marker,
-            # including whatever trailing blank lines the previous run left.
-            # Re-appending it verbatim grows the file by one blank line per run,
-            # so normalize to exactly one final newline.
+            # `tail` carries the hand-written prose that follows the end marker, including whatever trailing blank lines the previous run left. Re-appending it verbatim grows the file by one blank line per run, so normalize to exactly one final newline.
             tail = text.split(end_marker, 1)[1].strip("\n")
             path.write_text(head + section + tail + "\n" if tail else head + section)
             return
@@ -1055,23 +954,13 @@ def main(argv: list[str] | None = None, *, from_cli: bool = False) -> int:
             json.dumps([row_to_dict(r) for r in rows], indent=2) + "\n"
         )
 
-    # Rendered once, in `main`, because the dry-run path prints exactly the text
-    # the file path writes. `write_leaderboard` takes the finished text rather
-    # than the rows, so passing both a rendered table *and* the rows made it
-    # render a second time and emit the table twice.
+    # Rendered once, in `main`, because the dry-run path prints exactly the text the file path writes. `write_leaderboard` takes the finished text rather than the rows, so passing both a rendered table *and* the rows made it render a second time and emit the table twice.
     table = render_leaderboard(rows, "Paired ablation results")
     if args.dry_run:
         print(table)
     else:
         if not from_cli and args.out == PUBLISHED_LEADERBOARD:
-            # `main()` is called both from the command line (where the
-            # documented default is right) and from tests, which pass an
-            # explicit argv. A caller that supplies its own argv but no `--out`
-            # would otherwise overwrite the published table with whatever
-            # ad-hoc arguments it used -- that is how a 1-seed `grad_scale` run
-            # replaced the full sweep, and the next full-suite run did it again.
-            # Only the real command line may write the published file by
-            # default; a programmatic caller must name its destination.
+            # `main()` is called both from the command line (where the documented default is right) and from tests, which pass an explicit argv. A caller that supplies its own argv but no `--out` would otherwise overwrite the published table with whatever ad-hoc arguments it used -- that is how a 1-seed `grad_scale` run replaced the full sweep, and the next full-suite run did it again. Only the real command line may write the published file by default; a programmatic caller must name its destination.
             raise SystemExit(
                 f"refusing to write the published {PUBLISHED_LEADERBOARD} from a "
                 "programmatic main() call without --out; pass an explicit path "

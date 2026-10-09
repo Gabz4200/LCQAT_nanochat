@@ -49,8 +49,7 @@ ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type
 model, tokenizer, meta = load_model(
     args.source, device, phase="eval", model_tag=args.model_tag, step=args.step
 )
-# `load_model` is duck-typed through `build_model`; the checkpoint always
-# round-trips a `RustBPETokenizer` (written by `save_checkpoint`).
+# `load_model` is duck-typed through `build_model`; the checkpoint always round-trips a `RustBPETokenizer` (written by `save_checkpoint`).
 assert isinstance(tokenizer, RustBPETokenizer)
 
 # Special tokens for the chat state machine
@@ -123,8 +122,7 @@ while True:
         token_text = tokenizer.decode([token])
         print(token_text, end="", flush=True)
     print()
-    # we have to ensure that the assistant end token is the last token
-    # so even if generation ends due to max tokens, we have to append it to the end
+    # we have to ensure that the assistant end token is the last token so even if generation ends due to max tokens, we have to append it to the end
     if response_tokens[-1] != assistant_end:
         response_tokens.append(assistant_end)
     conversation_tokens.extend(response_tokens)

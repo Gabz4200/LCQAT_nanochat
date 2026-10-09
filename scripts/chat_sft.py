@@ -66,13 +66,10 @@ from scripts._train.build import (
 from scripts._train.flags import add_optimizer_flags
 from scripts.chat_eval import run_chat_eval
 
-# -----------------------------------------------------------------------------
-# CLI arguments
+# ----------------------------------------------------------------------------- CLI arguments
 parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) the model")
 add_common_cli_args(parser, model_step=True)
-# Logging
-# Runtime
-# Model loading
+# Logging Runtime Model loading
 parser.add_argument(
     "--load-optimizer",
     type=int,
@@ -145,9 +142,7 @@ from nanochat.models.quant.pruning import (  # noqa: E402
 
 add_sparseprop_pruning_args(parser)
 add_db_args(parser)
-# W6 DiffusionBlocks features (sigma codebooks / EfQAT per-block latching /
-# denoiser KD) plus --lcqat-channel-center, registered through the same shared
-# helper base_train uses so the three entry points cannot drift apart.
+# W6 DiffusionBlocks features (sigma codebooks / EfQAT per-block latching / denoiser KD) plus --lcqat-channel-center, registered through the same shared helper base_train uses so the three entry points cannot drift apart.
 from nanochat.models.quant.w6 import (  # noqa: E402
     add_w6_args,
     build_denoiser_teacher,
@@ -157,8 +152,7 @@ from nanochat.models.quant.w6 import (  # noqa: E402
 )
 
 add_w6_args(parser)
-# DARD: always-on auxiliary rule loss, `--no-dard` to disable. Same shared
-# helper base_train uses so the three entry points cannot drift apart.
+# DARD: always-on auxiliary rule loss, `--no-dard` to disable. Same shared helper base_train uses so the three entry points cannot drift apart.
 from nanochat.models.dard.cli import (  # noqa: E402
     add_dard_args,
     build_dard,
@@ -260,16 +254,14 @@ model, tokenizer, meta = load_model(
     step=args.model_step,
     lcqat=lcqat_requested,
 )
-# `load_model` is duck-typed through `build_model`; the checkpoint
-# always round-trips a `RustBPETokenizer` (written by `save_checkpoint`).
+# `load_model` is duck-typed through `build_model`; the checkpoint always round-trips a `RustBPETokenizer` (written by `save_checkpoint`).
 assert isinstance(tokenizer, RustBPETokenizer)
 lcqat_started_from_float = lcqat_requested is not None and meta.get("lcqat") is None
 lcqat_meta = meta.get("lcqat")
 if lcqat_meta is None and lcqat_requested is not None:
     lcqat_meta = lcqat_requested.as_dict()
 if lcqat_requested is not None:
-    # `model` may be the engine (not an `nn.Module`), but
-    # `retrofit_summary` walks `modules()`, which both expose.
+    # `model` may be the engine (not an `nn.Module`), but `retrofit_summary` walks `modules()`, which both expose.
     print0(f"LC-QAT SFT: {retrofit_summary(model)}")
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
@@ -296,12 +288,7 @@ for name, fallback, source in [
     else:
         print0(f"Using {name}={arg_val}")
 
-# The ChatCORE samplers below need the *bare* GPT. `load_model` returns the
-# engine itself whenever the checkpoint declares `meta["db"]` -- the default for
-# anything this repo's `base_train` writes -- and `DiffusionBlockEngine` has no
-# `forward`, so aliasing `orig_model` before this unwrap hands the samplers an
-# object they cannot run. Unwrap first, then the GPT is `base_model`.
-# `scripts/base_eval.py` works around the same trap with `getattr`.
+# The ChatCORE samplers below need the *bare* GPT. `load_model` returns the engine itself whenever the checkpoint declares `meta["db"]` -- the default for anything this repo's `base_train` writes -- and `DiffusionBlockEngine` has no `forward`, so aliasing `orig_model` before this unwrap hands the samplers an object they cannot run. Unwrap first, then the GPT is `base_model`. `scripts/base_eval.py` works around the same trap with `getattr`.
 if isinstance(model, DiffusionBlockEngine):
     engine = model
     base_model = engine.model
@@ -319,9 +306,7 @@ else:
         base_model, partitioner, denoise_backend=args.db_denoise_backend
     )
 
-# LC-QAT: retrofit the engine-owned Linear layers (adapters + denoise heads)
-# so the whole training pipeline is LC-QAT. The base model was already
-# retrofitted by load_model/retrofit_model during checkpoint load.
+# LC-QAT: retrofit the engine-owned Linear layers (adapters + denoise heads) so the whole training pipeline is LC-QAT. The base model was already retrofitted by load_model/retrofit_model during checkpoint load.
 lcqat_active = lcqat_requested if lcqat_started_from_float else lcqat_meta
 if lcqat_active is not None and not isinstance(lcqat_active, LayerKConfig):
     lcqat_active = LayerKConfig.from_dict(lcqat_active)
@@ -329,9 +314,7 @@ if lcqat_active is not None:
     n_lcqat = engine.apply_lcqat(lcqat_active)
     print0(f"LC-QAT retrofitted {n_lcqat} diffusion-engine Linear layers")
 
-# Sigma-conditioned activation codebooks (PRD 3.2). Must follow apply_lcqat --
-# that is what creates the act quantizers to replace -- and precede SparseProp,
-# which rewraps the same modules.
+# Sigma-conditioned activation codebooks (PRD 3.2). Must follow apply_lcqat -- that is what creates the act quantizers to replace -- and precede SparseProp, which rewraps the same modules.
 if args.db_sigma_codebook:
     num_anchors = args.db_sigma_anchors or num_db_blocks
     n_conditioned = install_sigma_codebooks(
@@ -357,12 +340,7 @@ if args.sparseprop:
             f"(scope={sparse_schedule.scope})"
         )
 
-# Denoiser-distillation teacher (PRD 3.1, EDM form). Taken *here*, after the
-# engine load but before the training loop, so the twin inherits the checkpoint's
-# trained weights and `build_float_twin` strips the LC-QAT layers the retrofits
-# above installed. On a fresh run the base model was never retrofitted either.
-# `build_denoiser_teacher` returns `(None, 0)` when the flag is off,
-# so the pair starts there rather than as an unbound name.
+# Denoiser-distillation teacher (PRD 3.1, EDM form). Taken *here*, after the engine load but before the training loop, so the twin inherits the checkpoint's trained weights and `build_float_twin` strips the LC-QAT layers the retrofits above installed. On a fresh run the base model was never retrofitted either. `build_denoiser_teacher` returns `(None, 0)` when the flag is off, so the pair starts there rather than as an unbound name.
 float_twin: object | None
 n_twin_stripped: int
 float_twin, n_twin_stripped = (None, 0)
@@ -375,10 +353,7 @@ if args.kd_denoiser_alpha > 0.0:
         f"({n_twin_stripped} LC-QAT layers stripped)"
     )
 
-# Denoiser distillation (PRD 3.1, EDM form): hand the frozen float twin to the
-# engine, which adds the KD term to the EDM objective inside `denoise_step`.
-# Defined unconditionally because the per-step logging reads it on every step,
-# not only on the ones where the anchor is installed.
+# Denoiser distillation (PRD 3.1, EDM form): hand the frozen float twin to the engine, which adds the KD term to the EDM objective inside `denoise_step`. Defined unconditionally because the per-step logging reads it on every step, not only on the ones where the anchor is installed.
 kd_denoiser = None
 if float_twin is not None:
     from nanochat.models.quant.kd import DenoiserDistiller
@@ -390,9 +365,7 @@ if float_twin is not None:
         f"anchor = w(sigma)*||D_quant - D_float||^2 on the same noisy input"
     )
 
-# EfQAT per-block permanent latching (PRD 3.2). `>=` at the latch site so a
-# resumed run (which starts above the threshold) still latches; `latch_blocks`
-# is idempotent so the re-fire is free.
+# EfQAT per-block permanent latching (PRD 3.2). `>=` at the latch site so a resumed run (which starts above the threshold) still latches; `latch_blocks` is idempotent so the re-fire is free.
 block_latch_freezer = None
 efqat_latch_targets: list[int] = []
 if lcqat_active is not None:
@@ -434,9 +407,7 @@ if args.db_block_sampling == "micro" and grad_accum_steps > 1:
     )
 token_bytes = get_token_bytes(device=device)
 
-# Initialize the Optimizer (AdamW-only for DiffusionBlocks engine)
-# PRD section 5: codebook delta params get their own AdamW group with a
-# dedicated LR and zero weight decay, distinct from the matrix-weight group.
+# Initialize the Optimizer (AdamW-only for DiffusionBlocks engine) PRD section 5: codebook delta params get their own AdamW group with a dedicated LR and zero weight decay, distinct from the matrix-weight group.
 from nanochat.models.quant.optimizer import build_qat_param_groups, verify_partition
 
 param_groups = build_qat_param_groups(
@@ -451,14 +422,10 @@ param_groups = build_qat_param_groups(
 verify_partition(engine, param_groups)
 optimizer = make_optimizer(param_groups, device_type, args)
 
-# Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
-# Note: `restore_optimizer_momentum` overwrites param_group metadata (LRs, betas,
-# etc.) with the pretrained values. Since pretraining warmdown brings LRs to ~0,
-# we must save and restore our fresh SFT LRs after loading.
+# Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.) Note: `restore_optimizer_momentum` overwrites param_group metadata (LRs, betas, etc.) with the pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
 if args.load_optimizer and lcqat_started_from_float:
-    # Retrofit added a codebook param group that the float pretrain optimizer
-    # state does not have; warm-starting would fail the group-size check.
+    # Retrofit added a codebook param group that the float pretrain optimizer state does not have; warm-starting would fail the group-size check.
     print0(
         "LC-QAT starting from float checkpoint: using fresh optimizer (no warm-start)"
     )
@@ -516,9 +483,7 @@ val_dataset = TaskMixture(
         ),  # 1.32K rows in test set, use only 420 to match the train ratios
     ]
 )  # total: 24K + 5.2K + 0.42K ~= 29.6K rows
-# DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
-# A big problem is that we don't know the final num_iterations in advance. So we create
-# these two global variables and update them from within the data generator.
+# DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len) A big problem is that we don't know the final num_iterations in advance. So we create these two global variables and update them from within the data generator.
 last_step = (
     False  # we will toggle this to True when we reach the end of the training dataset
 )
@@ -569,8 +534,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         for _ in range(args.device_batch_size):
             row = []
             mask_row = []
-            # Set only on the padding branch; the full-row branch
-            # fills `row` to capacity, which is the length anyway.
+            # Set only on the padding branch; the full-row branch fills `row` to capacity, which is the length anyway.
             content_len = row_capacity
             while len(row) < row_capacity:
                 # Ensure buffer has conversations
@@ -595,8 +559,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
                     mask_row.extend(conv_mask)
                     consumed += ddp_world_size  # Track actual consumption
                 else:
-                    # No conversation fits - pad the remainder instead of cropping
-                    # This ensures we never discard any tokens
+                    # No conversation fits - pad the remainder instead of cropping This ensures we never discard any tokens
                     content_len = len(row)
                     row.extend([bos_token] * remaining)  # Pad with BOS tokens
                     mask_row.extend([0] * remaining)
@@ -637,15 +600,12 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             .contiguous()
         )
 
-        # Apply the loss mask from render_conversation (mask=1 for assistant completions,
-        # mask=0 for user prompts, BOS, special tokens, tool outputs). mask[1:] aligns
-        # with targets (shifted by 1). Unmasked positions get -1 (ignore_index).
+        # Apply the loss mask from render_conversation (mask=1 for assistant completions, mask=0 for user prompts, BOS, special tokens, tool outputs). mask[1:] aligns with targets (shifted by 1). Unmasked positions get -1 (ignore_index).
         mask_tensor = torch.tensor(mask_rows, dtype=torch.int8)
         mask_targets = mask_tensor[:, 1:].to(device=device)
         targets[mask_targets == 0] = -1
 
-        # Mask out padding positions in targets (set to -1 = ignore_index)
-        # For each row, positions >= (content_length - 1) in targets should be masked
+        # Mask out padding positions in targets (set to -1 = ignore_index) For each row, positions >= (content_length - 1) in targets should be masked
         for i, content_len in enumerate(row_lengths):
             if content_len < row_capacity:
                 targets[i, content_len - 1 :] = -1
@@ -663,9 +623,7 @@ def build_val_loader():
 progress = 0  # will go from 0 to 1 over the course of the epoch
 
 
-# Learning rate schedule (linear warmup, constant, linear warmdown)
-# Same shape as base_train but uses progress (0→1) instead of absolute step counts,
-# because SFT doesn't always know num_iterations in advance (dataset-driven stopping).
+# Learning rate schedule (linear warmup, constant, linear warmdown) Same shape as base_train but uses progress (0→1) instead of absolute step counts, because SFT doesn't always know num_iterations in advance (dataset-driven stopping).
 def lr_multiplier_from_progress(progress):
     if progress < args.warmup_ratio:
         return (progress + 1e-8) / args.warmup_ratio
@@ -676,15 +634,10 @@ def lr_multiplier_from_progress(progress):
         return (1 - decay) * 1.0 + decay * args.final_lr_frac
 
 
-# -----------------------------------------------------------------------------
-# Training loop
+# ----------------------------------------------------------------------------- Training loop
 x, y = next(train_loader)  # prefetch the very first batch of data
 
-# DARD rule set: mined from the first batch, or loaded from --dard-rules.
-# Built here rather than at flag time because mining needs real tokens, and
-# before the loop because the penalty is attached to the engine once and reused
-# every step. `--no-dard` leaves both None and every branch below computes the
-# objective it did before this feature existed.
+# DARD rule set: mined from the first batch, or loaded from --dard-rules. Built here rather than at flag time because mining needs real tokens, and before the loop because the penalty is attached to the engine once and reused every step. `--no-dard` leaves both None and every branch below computes the objective it did before this feature existed.
 validate_dard_args(args)
 dard_loss_fn, dard_balancer = (None, None)
 if args.dard:
@@ -703,10 +656,7 @@ if args.dard:
     engine.set_dard(dard_loss_fn)
 
 min_val_bpb = float("inf")
-# Written by the eval branch below; the checkpoint header and the
-# final summary read it even on a run that never hit `eval_every`
-# (last_step fires on the terminal step, so it is always set once
-# the loop runs, but the checker cannot see that).
+# Written by the eval branch below; the checkpoint header and the final summary read it even on a run that never hit `eval_every` (last_step fires on the terminal step, so it is always set once the loop runs, but the checker cannot see that).
 val_bpb = float("nan")
 smooth_train_loss = 0  # EMA of training loss
 ema_beta = 0.9  # EMA decay factor
@@ -742,15 +692,13 @@ while True:
         )
         model.train()
 
-    # once in a while: estimate the ChatCORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
+    # once in a while: estimate the ChatCORE metric (all ranks participate) use the original uncompiled model because the inputs keep changing shape
     chatcore_results = {}
     if args.chatcore_every > 0 and (
         last_step or (step > 0 and step % args.chatcore_every == 0)
     ):
         model.eval()
-        # ar_engine is the autoregressive sampler; it must not shadow the
-        # DiffusionBlockEngine bound to `engine`, which train_step runs on.
+        # ar_engine is the autoregressive sampler; it must not shadow the DiffusionBlockEngine bound to `engine`, which train_step runs on.
         ar_engine = Engine(base_model, tokenizer)
         all_tasks = ["ARC-Easy", "ARC-Challenge", "MMLU", "GSM8K", "HumanEval"]
         categorical_tasks = {"ARC-Easy", "ARC-Challenge", "MMLU"}
@@ -814,10 +762,7 @@ while True:
         save_checkpoint(
             checkpoint_dir,
             step,
-            # engine.state_dict(), not base_model.state_dict(): the engine owns
-            # db_adapters.* / db_denoise_heads.*, and this checkpoint declares
-            # meta["db"] below. Saving the bare model would write a checkpoint
-            # that claims a diffusion engine but carries none of its parameters.
+            # engine.state_dict(), not base_model.state_dict(): the engine owns db_adapters.* / db_denoise_heads.*, and this checkpoint declares meta["db"] below. Saving the bare model would write a checkpoint that claims a diffusion engine but carries none of its parameters.
             engine.state_dict(),
             optimizer.state_dict(),
             {
@@ -827,8 +772,7 @@ while True:
                     "sequence_len": args.max_seq_len,
                     "vocab_size": tokenizer.get_vocab_size(),
                     "n_layer": depth,
-                    # `base_model` is the bare GPT; the engine has
-                    # no `config`.
+                    # `base_model` is the bare GPT; the engine has no `config`.
                     "n_head": base_model.config.n_head,
                     "n_kv_head": base_model.config.n_kv_head,
                     "n_embd": base_model.config.n_embd,
@@ -836,11 +780,7 @@ while True:
                 },
                 "user_config": user_config,  # inputs to the training script
                 "lcqat": lcqat_meta,
-                # Written by the objects that own them: `build_model`
-                # rebuilds the partitioner and reads these keys back, so
-                # restating the partitioner's defaults as literals here
-                # (as this used to) is three chances to disagree with the
-                # model actually being saved.
+                # Written by the objects that own them: `build_model` rebuilds the partitioner and reads these keys back, so restating the partitioner's defaults as literals here (as this used to) is three chances to disagree with the model actually being saved.
                 "db": engine.partitioner.to_meta(
                     sigma_codebook=describe_sigma_codebooks(args)
                 ),
@@ -854,18 +794,11 @@ while True:
     if last_step:
         break
 
-    # -------------------------------------------------------------------------
-    # single training step
-    # evaluate the gradient
-    # `train_loss` is set inside the grad-accumulation loop below;
-    # the EMA after it reads it, so it starts as NaN rather than
-    # unbound (the loop always runs at least once before the EMA).
+    # ------------------------------------------------------------------------- single training step evaluate the gradient `train_loss` is set inside the grad-accumulation loop below; the EMA after it reads it, so it starts as NaN rather than unbound (the loop always runs at least once before the EMA).
     train_loss = torch.tensor(float("nan"))
     synchronize()
     t0 = time.time()
-    # EfQAT per-block latch (PRD 3.2). Fires before the forward, so the retired
-    # block is already frozen in the very step the latch lands; latching after
-    # the forward would let one more update through.
+    # EfQAT per-block latch (PRD 3.2). Fires before the forward, so the retired block is already frozen in the very step the latch lands; latching after the forward would let one more update through.
     if block_latch_freezer is not None and step >= max(args.efqat_latch_after, 0):
         n_new = block_latch_freezer.latch_blocks(efqat_latch_targets)
         if n_new:
@@ -874,9 +807,7 @@ while True:
                 f"{step} ({n_new} parameters frozen; total latched: "
                 f"{block_latch_freezer.latched_blocks()})"
             )
-    # Gradual magnitude pruning, before the forward so the mask and the values
-    # agree in the same step. Monotone: a pruned weight is exactly 0.0 and can
-    # never win the |W| ranking again.
+    # Gradual magnitude pruning, before the forward so the mask and the values agree in the same step. Monotone: a pruned weight is exactly 0.0 and can never win the |W| ranking again.
     if args.sparseprop:
         pruned = sparse_schedule.apply(engine, step)
         if pruned is not None:
@@ -885,9 +816,7 @@ while True:
                 f"{len(sparse_schedule.layers_above_threshold(engine))} layers "
                 f"past the {sparse_schedule.dense_threshold:.0%} threshold"
             )
-    # Block drawn once per optimizer step (see base_train: per-micro-step
-    # sampling would turn block-wise training into ordinary gradient
-    # accumulation). The diffusion target is hoisted for the same reason.
+    # Block drawn once per optimizer step (see base_train: per-micro-step sampling would turn block-wise training into ordinary gradient accumulation). The diffusion target is hoisted for the same reason.
     block_idx = (
         engine.sample_block()
         if args.db_objective == "edm" and args.db_block_sampling == "step"
@@ -898,13 +827,9 @@ while True:
         with torch.no_grad():
             clean = F.normalize(engine.model.transformer.wte(x).float(), dim=-1)
 
-    # Reported alongside the total so an enabled anchor is observable in the
-    # log: a KD term that stays at 0.0 for a whole run means the twin is not
-    # actually being compared against, not that the gap vanished.
+    # Reported alongside the total so an enabled anchor is observable in the log: a KD term that stays at 0.0 for a whole run means the twin is not actually being compared against, not that the gap vanished.
     step_kd_logged = 0.0
-    # The raw rule penalty, logged for the same reason as the KD term: the
-    # balanced total is normalized to ~1, so a rule set that stopped enforcing
-    # anything would otherwise be invisible in the loss curve.
+    # The raw rule penalty, logged for the same reason as the KD term: the balanced total is normalized to ~1, so a rule set that stopped enforcing anything would otherwise be invisible in the loss curve.
     step_dard_logged = 0.0
 
     for micro_step in range(grad_accum_steps):
@@ -921,8 +846,7 @@ while True:
                 step_kd_logged = step_kd_logged + float(engine.last_kd_loss)
             d_logits = engine.last_dard_logits
         elif dard_loss_fn is not None:
-            # The CE path has no logits unless asked, so the penalty branch
-            # computes the CE term here from them. Mirrors GPT.forward exactly.
+            # The CE path has no logits unless asked, so the penalty branch computes the CE term here from them. Mirrors GPT.forward exactly.
             d_logits = base_model(x, targets=None)
             loss = F.cross_entropy(
                 d_logits.reshape(-1, d_logits.size(-1)),
@@ -1008,9 +932,7 @@ while True:
     )
     manage_gc(step, first_step_of_run=(step == 1))
 
-# `bpb_places=4`: chat SFT has always printed bits-per-byte to 4 places,
-# while the pretraining loop prints 6. The helper owns the report's shape, so
-# the precision is the only thing that has to differ.
+# `bpb_places=4`: chat SFT has always printed bits-per-byte to 4 places, while the pretraining loop prints 6. The helper owns the report's shape, so the precision is the only thing that has to differ.
 print_run_summary(
     get_max_memory, total_training_time, val_bpb, min_val_bpb, bpb_places=4
 )

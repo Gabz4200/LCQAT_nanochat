@@ -44,8 +44,7 @@ from nanochat.utils.common import (
     print0,
 )
 
-# -----------------------------------------------------------------------------
-# CORE evaluation
+# ----------------------------------------------------------------------------- CORE evaluation
 
 EVAL_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
 
@@ -140,8 +139,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
     return out
 
 
-# -----------------------------------------------------------------------------
-# Main
+# ----------------------------------------------------------------------------- Main
 
 
 def main():
@@ -200,16 +198,9 @@ def main():
     model, tokenizer, meta = load_model(
         "base", device, phase="eval", model_tag=args.model_tag, step=args.step
     )
-    # `load_model` is duck-typed through `build_model`; the
-    # checkpoint always round-trips a `RustBPETokenizer`.
+    # `load_model` is duck-typed through `build_model`; the checkpoint always round-trips a `RustBPETokenizer`.
     assert isinstance(tokenizer, RustBPETokenizer)
-    # `load_model` returns the DiffusionBlocks engine itself when the checkpoint
-    # declares meta["db"], but the autoregressive `Engine` below needs the bare
-    # GPT that engine wraps -- `base_train` does the same thing by passing
-    # `orig_model`. Without this, Engine.forward hits the engine and dies with
-    # "'DiffusionBlockEngine' object has no attribute 'forward'". The loss
-    # evaluations above are unaffected: they go through `model(...)`, which the
-    # engine implements as the block-isolated objective.
+    # `load_model` returns the DiffusionBlocks engine itself when the checkpoint declares meta["db"], but the autoregressive `Engine` below needs the bare GPT that engine wraps -- `base_train` does the same thing by passing `orig_model`. Without this, Engine.forward hits the engine and dies with "'DiffusionBlockEngine' object has no attribute 'forward'". The loss evaluations above are unaffected: they go through `model(...)`, which the engine implements as the block-isolated objective.
     base_model = getattr(model, "model", model)
     sequence_len = meta["model_config"]["sequence_len"]
     token_bytes = get_token_bytes(device=device)

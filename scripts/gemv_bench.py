@@ -74,9 +74,7 @@ def bench_gemv(args) -> None:
                 "naive backend disagrees with F.linear dequant baseline"
             )
             for backend in backends:
-                # `time_fn` calls the closure synchronously within
-                # this iteration, so capturing `backend` directly is
-                # exact; a default arg would widen it to `str`.
+                # `time_fn` calls the closure synchronously within this iteration, so capturing `backend` directly is exact; a default arg would widen it to `str`.
                 ms = time_fn(
                     lambda: dispatch_gemv(act, lut, w, s_neg, s_pos, backend=backend),
                     args.iters,

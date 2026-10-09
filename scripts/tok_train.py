@@ -13,8 +13,7 @@ from nanochat.data.dataset import parquets_iter_batched
 from nanochat.data.tokenizer import RustBPETokenizer, token_bytes_path
 from nanochat.utils.common import get_base_dir
 
-# -----------------------------------------------------------------------------
-# Parse command line arguments
+# ----------------------------------------------------------------------------- Parse command line arguments
 
 parser = argparse.ArgumentParser(description="Train a BPE tokenizer")
 parser.add_argument(
@@ -40,8 +39,7 @@ print(f"max_chars: {args.max_chars:,}")
 print(f"doc_cap: {args.doc_cap:,}")
 print(f"vocab_size: {args.vocab_size:,}")
 
-# -----------------------------------------------------------------------------
-# Text iterator
+# ----------------------------------------------------------------------------- Text iterator
 
 
 def text_iterator():
@@ -64,22 +62,19 @@ def text_iterator():
 
 text_iter = text_iterator()
 
-# -----------------------------------------------------------------------------
-# Train the tokenizer
+# ----------------------------------------------------------------------------- Train the tokenizer
 t0 = time.time()
 tokenizer = RustBPETokenizer.train_from_iterator(text_iter, args.vocab_size)
 t1 = time.time()
 train_time = t1 - t0
 print(f"Training time: {train_time:.2f}s")
 
-# -----------------------------------------------------------------------------
-# Save the tokenizer to disk
+# ----------------------------------------------------------------------------- Save the tokenizer to disk
 base_dir = get_base_dir()
 tokenizer_dir = os.path.join(base_dir, "tokenizer")
 tokenizer.save(tokenizer_dir)
 
-# -----------------------------------------------------------------------------
-# Quick inline sanity check
+# ----------------------------------------------------------------------------- Quick inline sanity check
 test_text = """Hello world! This is a test.
 Numbers: 123, 4567, 89
 Contractions: I'm, you're, it's
@@ -89,11 +84,7 @@ encoded = tokenizer.encode(test_text)
 decoded = tokenizer.decode(encoded)
 assert decoded == test_text
 
-# -----------------------------------------------------------------------------
-# One more thing: we wish to cache a mapping from token id to number of bytes of that token
-# for efficient evaluation of bits per byte. Unlike the typical mean loss, this
-# allows us to report a loss that is invariant to the vocab size of the tokenizer.
-# The bits per byte on the validation set is then one of the primary metrics we care about.
+# ----------------------------------------------------------------------------- One more thing: we wish to cache a mapping from token id to number of bytes of that token for efficient evaluation of bits per byte. Unlike the typical mean loss, this allows us to report a loss that is invariant to the vocab size of the tokenizer. The bits per byte on the validation set is then one of the primary metrics we care about.
 vocab_size = tokenizer.get_vocab_size()
 special_ids = set(tokenizer.encode_special(s) for s in tokenizer.get_special_tokens())
 token_bytes = []
@@ -101,8 +92,7 @@ for token_id in range(vocab_size):
     if token_id in special_ids:
         token_bytes.append(0)  # special tokens are not counted
     else:
-        # use the raw bytes of the token: decoding to a string first corrupts
-        # tokens that are not valid standalone UTF-8 (e.g. the raw bytes >= 0x80)
+        # use the raw bytes of the token: decoding to a string first corrupts tokens that are not valid standalone UTF-8 (e.g. the raw bytes >= 0x80)
         num_bytes = len(tokenizer.decode_single_token_bytes(token_id))
         token_bytes.append(num_bytes)
 token_bytes = torch.tensor(token_bytes, dtype=torch.int32, device="cpu")

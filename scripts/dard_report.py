@@ -105,14 +105,9 @@ def main() -> None:
     )
 
     for i, prompt in enumerate(PROMPTS):
-        # `GPT.generate` streams: it takes a list of ids and yields one id at a
-        # time, so the full sequence is the prompt plus everything yielded.
+        # `GPT.generate` streams: it takes a list of ids and yields one id at a time, so the full sequence is the prompt plus everything yielded.
         ids = tokenizer.encode(prompt)
-        # A distinct seed per prompt. `generate` seeds its own generator from
-        # this argument, and the default is a constant 42 -- so without it
-        # every prompt draws from the *same* RNG stream and, at a small token
-        # budget, comes back with the same continuation. That reads as "the
-        # model ignores the prompt", which is a different (and wrong) finding.
+        # A distinct seed per prompt. `generate` seeds its own generator from this argument, and the default is a constant 42 -- so without it every prompt draws from the *same* RNG stream and, at a small token budget, comes back with the same continuation. That reads as "the model ignores the prompt", which is a different (and wrong) finding.
         generated = list(
             model.generate(
                 ids,
@@ -137,18 +132,13 @@ def main() -> None:
         print(f"(skipping val bpb: {e})")
         return
 
-    # Respect the model's trained context: asking for more tokens than the
-    # rotary cache holds trips an assertion inside `GPT.forward`, which is a
-    # confusing failure for what is meant to be a read-only report.
+    # Respect the model's trained context: asking for more tokens than the rotary cache holds trips an assertion inside `GPT.forward`, which is a confusing failure for what is meant to be a read-only report.
     ctx = model.config.sequence_len
     n = min(4096, ctx)
     ids = torch.tensor(tokenizer.encode(text)[:n], dtype=torch.long).unsqueeze(0)
     with torch.no_grad():
         per_token = model(ids, targets=ids, loss_reduction="none")
-    # Same normalisation the trainer uses (`evaluate_bpb`): sum nats over sum
-    # BYTES of the target tokens, not over token count. Dividing by tokens
-    # instead overstates the number by ~4x on this tokenizer, which is how an
-    # earlier version of this script reported 15.2 where the trainer said 3.7.
+    # Same normalisation the trainer uses (`evaluate_bpb`): sum nats over sum BYTES of the target tokens, not over token count. Dividing by tokens instead overstates the number by ~4x on this tokenizer, which is how an earlier version of this script reported 15.2 where the trainer said 3.7.
     token_bytes = token_bytes_table()
     target = ids.view(-1)
     n_bytes = int(token_bytes[target].sum())

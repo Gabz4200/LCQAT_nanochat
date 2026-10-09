@@ -104,8 +104,7 @@ def run_samples(ctx):
         "My favorite color is",
         "If 5*x + 3 = 13, then x is",
     ]
-    # `ar_engine` is the autoregressive sampler; it must not shadow the
-    # DiffusionBlockEngine bound to `engine`, which is what train_step runs on.
+    # `ar_engine` is the autoregressive sampler; it must not shadow the DiffusionBlockEngine bound to `engine`, which is what train_step runs on.
     ar_engine = Engine(ctx.orig_model, ctx.tokenizer)  # orig_model avoids recompilation
     for prompt in prompts:
         tokens = ctx.tokenizer(prompt, prepend="<|bos|>")

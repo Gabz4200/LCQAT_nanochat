@@ -29,8 +29,7 @@ from nanochat.utils.common import (
     print0,
 )
 
-# -----------------------------------------------------------------------------
-# Generative evaluation loop (we go one problem at a time, sample, evaluate)
+# ----------------------------------------------------------------------------- Generative evaluation loop (we go one problem at a time, sample, evaluate)
 
 
 def run_generative_eval(
@@ -110,10 +109,7 @@ def run_generative_eval(
     return num_passed / total
 
 
-# -----------------------------------------------------------------------------
-# Categorical evaluation loop
-# A lot easier because we don't have to sample. Therefore, we can actually go
-# batches at a time and check the logits for correct answer choices.
+# ----------------------------------------------------------------------------- Categorical evaluation loop A lot easier because we don't have to sample. Therefore, we can actually go batches at a time and check the logits for correct answer choices.
 
 
 def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=None):
@@ -157,12 +153,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
         with torch.no_grad():
             logits = model(prompt_ids)  # (B, T, V)
 
-        # Focus on the available letters corresponding to choices.
-        # This helps the evaluation a lot because it specifically narrows the
-        # focus to only the available letters. The much harder alternative would
-        # be to generate from the Assistant and check if it responded with the
-        # correct letter (e.g. A, B, C, D), but evaluations typically make the
-        # task easier in this way.
+        # Focus on the available letters corresponding to choices. This helps the evaluation a lot because it specifically narrows the focus to only the available letters. The much harder alternative would be to generate from the Assistant and check if it responded with the correct letter (e.g. A, B, C, D), but evaluations typically make the task easier in this way.
         for idx, conversation in enumerate(conversations):
             # get the token ids of all the available letters of this problem
             letters = conversation["letters"]
@@ -326,8 +317,7 @@ if __name__ == "__main__":
         results[task_name] = acc
         print0(f"{task_name} accuracy: {100 * acc:.2f}%")
 
-    # calculate the ChatCORE metric if we can (similar to CORE, it's the mean centered accuracy)
-    # this way, ChatCORE ranges from 0 (at random baseline) to 1 (peak performance)
+    # calculate the ChatCORE metric if we can (similar to CORE, it's the mean centered accuracy) this way, ChatCORE ranges from 0 (at random baseline) to 1 (peak performance)
     all_tasks_were_evaluated = all(task_name in results for task_name in all_tasks)
     if all_tasks_were_evaluated:
         centered_mean = 0

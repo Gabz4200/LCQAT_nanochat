@@ -36,9 +36,7 @@ def add_common_cli_args(
         default="",
         help="cuda|cpu|mps (empty = autodetect)",
     )
-    # One wording for both directions: pretraining reads it as the tag to save
-    # under, the chat stages as the tag to load from, and the flag is the same
-    # either way.
+    # One wording for both directions: pretraining reads it as the tag to save under, the chat stages as the tag to load from, and the flag is the same either way.
     parser.add_argument(
         "--model-tag",
         type=str,

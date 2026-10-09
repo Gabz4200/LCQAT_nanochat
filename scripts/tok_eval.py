@@ -220,8 +220,7 @@ def print_comparison(baseline_name, baseline_results, ours_results, all_text):
         baseline_data = baseline_results[name]
         ours_data = ours_results[name]
 
-        # Calculate relative difference (positive means ours is better, negative means worse)
-        # Using tokens: fewer tokens is better, so we calculate (baseline_tokens - ours_tokens) / baseline_tokens
+        # Calculate relative difference (positive means ours is better, negative means worse) Using tokens: fewer tokens is better, so we calculate (baseline_tokens - ours_tokens) / baseline_tokens
         relative_diff = (
             (baseline_data["tokens"] - ours_data["tokens"]) / baseline_data["tokens"]
         ) * 100

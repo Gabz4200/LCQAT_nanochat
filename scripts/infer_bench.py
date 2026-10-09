@@ -52,10 +52,7 @@ from nanochat.utils.common import (
     get_peak_flops,
 )
 
-# -----------------------------------------------------------------------------
-# Measurement
-# (the architecture-side cost accounting - FLOPs, KV cache bytes - lives on the
-# GPT model itself: estimate_decode_flops, estimate_prefill_flops, kv_bytes_per_token, kv_read_bytes)
+# ----------------------------------------------------------------------------- Measurement (the architecture-side cost accounting - FLOPs, KV cache bytes - lives on the GPT model itself: estimate_decode_flops, estimate_prefill_flops, kv_bytes_per_token, kv_read_bytes)
 
 
 def weight_bytes(model):
@@ -75,8 +72,7 @@ def bench_generate(engine, prompt_tokens, batch_size, decode_tokens, temperature
         max_tokens=decode_tokens,
         temperature=temperature,
     )
-    # The first next() runs the batch=1 prefill, the KV cache replication to
-    # batch_size rows, and samples the first token: that is the TTFT.
+    # The first next() runs the batch=1 prefill, the KV cache replication to batch_size rows, and samples the first token: that is the TTFT.
     t_start = time.perf_counter()
     next(generator)
     torch.cuda.synchronize(device)
@@ -156,10 +152,7 @@ def main():
     model, tokenizer, meta = load_model(
         args.source, device, phase="eval", model_tag=args.model_tag, step=args.step
     )
-    # `load_model` returns the `DiffusionBlockEngine` when the checkpoint
-    # carries db state, else the bare `GPT`. The FLOPs / KV-byte accounting
-    # below lives on `GPT`, so unwrap the engine here; `Engine` itself keeps
-    # whatever `load_model` returned.
+    # `load_model` returns the `DiffusionBlockEngine` when the checkpoint carries db state, else the bare `GPT`. The FLOPs / KV-byte accounting below lives on `GPT`, so unwrap the engine here; `Engine` itself keeps whatever `load_model` returned.
     gpt = model.model if isinstance(model, DiffusionBlockEngine) else model
     config = gpt.config
     engine = Engine(model, tokenizer)
@@ -173,8 +166,7 @@ def main():
         )
     prompt_tokens = build_prompt(tokenizer, prompt_len)
 
-    # ------------------------------------------------------------------------
-    # Static card: inference cost implied by the architecture, before measuring
+    # ------------------------------------------------------------------------ Static card: inference cost implied by the architecture, before measuring
     device_name = torch.cuda.get_device_name(device)
     peak_bw = get_peak_bandwidth(device_name)
     peak_flops = get_peak_flops(device_name)
@@ -245,9 +237,7 @@ def main():
         "sweep": [],
     }
 
-    # ------------------------------------------------------------------------
-    # Prefill measurement: batch 1, a single decode step, so TTFT ~= prefill time.
-    # Prefill is compute-bound, so MFU (not MBU) is its distance from the roofline.
+    # ------------------------------------------------------------------------ Prefill measurement: batch 1, a single decode step, so TTFT ~= prefill time. Prefill is compute-bound, so MFU (not MBU) is its distance from the roofline.
     bench_generate(engine, prompt_tokens, 1, 2, args.temperature)  # warmup
     prefill_result = bench_generate(engine, prompt_tokens, 1, 2, args.temperature)
     prefill_time = prefill_result["ttft"]
@@ -264,10 +254,7 @@ def main():
         "time_sec": round(prefill_time, 6),
     }
 
-    # ------------------------------------------------------------------------
-    # Measured sweep over batch sizes. Decode reads all weights + KV every step:
-    # MBU is the distance from the bandwidth roofline (binds at small batch),
-    # MFU the distance from the compute roofline (binds at large batch).
+    # ------------------------------------------------------------------------ Measured sweep over batch sizes. Decode reads all weights + KV every step: MBU is the distance from the bandwidth roofline (binds at small batch), MFU the distance from the compute roofline (binds at large batch).
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
     header = f"{'batch':>6} {'TTFT ms':>9} {'TPOT ms':>9} {'tok/s':>10} {'MBU %':>7} {'MFU %':>7} {'VRAM GiB':>9} {'steps':>6}"
     print(header)

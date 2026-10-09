@@ -26,8 +26,7 @@ VOCAB = 32768
 KV_CONTEXT = 32768
 # PRD section 7 published rows
 PRD = dict(weights_gb=1.58, luts_mb=0.40, kv_gb=0.45, workspace_gb=0.20, total_gb=2.23)
-# The 0.45 GB / 32K row implies L * H_kv * D ~= 13,824 (0.45e9 / 32768);
-# one factorization with valid transformer dims is used for the RSS measure.
+# The 0.45 GB / 32K row implies L * H_kv * D ~= 13,824 (0.45e9 / 32768); one factorization with valid transformer dims is used for the RSS measure.
 PRD_KV_DIMS = (36, 6, 64)
 WORKSPACE_BYTES = int(0.20 * 1e9)  # PRD row: C++ AVX-512 engine workspace
 

@@ -49,13 +49,10 @@ from scripts._cli import add_common_cli_args
 from scripts._train.build import make_optimizer
 from scripts._train.flags import add_optimizer_flags
 
-# -----------------------------------------------------------------------------
-# CLI arguments
+# ----------------------------------------------------------------------------- CLI arguments
 parser = argparse.ArgumentParser(description="Reinforcement learning on GSM8K")
 add_common_cli_args(parser, model_step=True)
-# Logging
-# Runtime
-# Model loading
+# Logging Runtime Model loading
 add_lcqat_args(parser)
 # Training horizon
 parser.add_argument(
@@ -120,12 +117,7 @@ from nanochat.models.quant.pruning import (  # noqa: E402
 
 add_sparseprop_pruning_args(parser)
 add_db_args(parser)
-# W6 DiffusionBlocks features (sigma codebooks / EfQAT per-block latching /
-# denoiser KD) plus --lcqat-channel-center, registered through the same shared
-# helper base_train and chat_sft use so the three entry points cannot drift
-# apart. Only the latch and the per-channel quantizer are usable here; the two
-# EDM-only features are rejected at startup by `require_edm_objective` in the
-# guard below, for the same structural reason `--db-objective edm` is.
+# W6 DiffusionBlocks features (sigma codebooks / EfQAT per-block latching / denoiser KD) plus --lcqat-channel-center, registered through the same shared helper base_train and chat_sft use so the three entry points cannot drift apart. Only the latch and the per-channel quantizer are usable here; the two EDM-only features are rejected at startup by `require_edm_objective` in the guard below, for the same structural reason `--db-objective edm` is.
 from nanochat.models.quant.w6 import (  # noqa: E402
     add_w6_args,
     describe_sigma_codebooks,
@@ -134,9 +126,7 @@ from nanochat.models.quant.w6 import (  # noqa: E402
 )
 
 add_w6_args(parser)
-# DARD: always-on auxiliary rule loss, `--no-dard` to disable. Same shared
-# helper base_train and chat_sft use so the three entry points cannot drift
-# apart. Here it rides on the policy gradient's logits (see the RL loop).
+# DARD: always-on auxiliary rule loss, `--no-dard` to disable. Same shared helper base_train and chat_sft use so the three entry points cannot drift apart. Here it rides on the policy gradient's logits (see the RL loop).
 from nanochat.models.dard.cli import (  # noqa: E402
     add_dard_args,
     build_dard,
@@ -186,8 +176,7 @@ model, tokenizer, meta = load_model(
     step=args.model_step,
     lcqat=lcqat_requested,
 )
-# `load_model` is duck-typed through `build_model`; the
-# checkpoint always round-trips a `RustBPETokenizer`.
+# `load_model` is duck-typed through `build_model`; the checkpoint always round-trips a `RustBPETokenizer`.
 assert isinstance(tokenizer, RustBPETokenizer)
 lcqat_meta = meta.get("lcqat")
 if lcqat_meta is None and lcqat_requested is not None:
@@ -215,9 +204,7 @@ else:
         base_model, partitioner, denoise_backend=args.db_denoise_backend
     )
 
-# LC-QAT: retrofit the engine-owned Linear layers (adapters + denoise heads)
-# so the whole training pipeline is LC-QAT. The base model was already
-# retrofitted by load_model/retrofit_model during checkpoint load.
+# LC-QAT: retrofit the engine-owned Linear layers (adapters + denoise heads) so the whole training pipeline is LC-QAT. The base model was already retrofitted by load_model/retrofit_model during checkpoint load.
 if lcqat_active is not None:
     n_lcqat = db_engine.apply_lcqat(lcqat_active)
     print0(f"LC-QAT retrofitted {n_lcqat} diffusion-engine Linear layers")
@@ -238,8 +225,7 @@ if args.sparseprop:
 
 ar_engine = Engine(base_model, tokenizer)  # for sampling rollouts
 
-# -----------------------------------------------------------------------------
-# Rollout / sampling generator loop that yields batches of examples for training
+# ----------------------------------------------------------------------------- Rollout / sampling generator loop that yields batches of examples for training
 
 train_task = GSM8K(subset="main", split="train")
 val_task = GSM8K(subset="main", split="test")
@@ -259,8 +245,7 @@ def get_batch():
         # First get the full conversation of both user and assistant messages
         conversation = train_task[example_idx]
 
-        # Tokenize the conversation, deleting the last Assistant message and priming the Assistant for a completion instead
-        # (i.e. keep the <|assistant_start|>, but delete everything after it)
+        # Tokenize the conversation, deleting the last Assistant message and priming the Assistant for a completion instead (i.e. keep the <|assistant_start|>, but delete everything after it)
         tokens = tokenizer.render_for_completion(conversation)
         prefix_length = len(tokens)
 
@@ -315,8 +300,7 @@ def get_batch():
         targets[
             mask_ids[:, 1:] == 0
         ] = -1  # <-- inplace modification right here. -1 is the ignore index
-        # NOTE also that the Engine returns mask=0 for BOTH the prompt tokens AND the tool use tokens.
-        # So we will (correctly) end up not training on the prompt tokens, or the tool use forced tokens.
+        # NOTE also that the Engine returns mask=0 for BOTH the prompt tokens AND the tool use tokens. So we will (correctly) end up not training on the prompt tokens, or the tool use forced tokens.
         rewards = torch.tensor(rewards, dtype=torch.float, device=device)
         # Calculate the advantages by subtracting the mean (instead of z-score (x-mu)/sigma)
         mu = rewards.mean()
@@ -325,8 +309,7 @@ def get_batch():
         yield generated_token_sequences, inputs, targets, rewards, advantages
 
 
-# -----------------------------------------------------------------------------
-# Simple evaluation loop for GSM8K pass@k
+# ----------------------------------------------------------------------------- Simple evaluation loop for GSM8K pass@k
 def run_gsm8k_eval(
     task,
     tokenizer,
@@ -376,15 +359,9 @@ def run_gsm8k_eval(
         yield record
 
 
-# -----------------------------------------------------------------------------
-# Training loop
+# ----------------------------------------------------------------------------- Training loop
 
-# Init the optimizer (AdamW over the engine, LC-QAT codebook group included).
-# RL needs per-token log-probabilities to form the policy gradient, and
-# `DiffusionBlockEngine.logprobs` produces them via next-token cross-entropy.
-# The EDM objective predicts denoised embeddings and has no logits, so it
-# cannot drive a PG objective at all -- `--db-objective` therefore defaults to
-# `ce` here and `edm` is rejected at startup rather than silently ignored.
+# Init the optimizer (AdamW over the engine, LC-QAT codebook group included). RL needs per-token log-probabilities to form the policy gradient, and `DiffusionBlockEngine.logprobs` produces them via next-token cross-entropy. The EDM objective predicts denoised embeddings and has no logits, so it cannot drive a PG objective at all -- `--db-objective` therefore defaults to `ce` here and `edm` is rejected at startup rather than silently ignored.
 if args.db_objective != "ce":
     raise SystemExit(
         "chat_rl requires --db-objective ce: the policy gradient is built from "
@@ -392,23 +369,12 @@ if args.db_objective != "ce":
         "denoising objective emits embeddings, not logits. Use base_train or "
         "chat_sft for --db-objective edm."
     )
-# The two W6 features that are defined against the denoising forward are
-# rejected here rather than silently accepted. Same reason as the guard above,
-# one level down: `--kd-denoiser-alpha` anchors on the float twin's denoiser
-# prediction (no logits to distill) and `--db-sigma-codebook` needs the
-# per-batch sigma that only `denoise_step` carries. `require_edm_objective`
-# raises the same `SystemExit` the other two scripts raise, so the message and
-# the exit style stay uniform across the trio.
-#
-# `--efqat-latch-*` is deliberately NOT rejected: the latch is a `requires_grad`
-# arbiter, orthogonal to the objective, and `DiffusionBlockEngine._requires_grad_for`
-# consults it on the `logprobs` path exactly as on `denoise_step`.
+# The two W6 features that are defined against the denoising forward are rejected here rather than silently accepted. Same reason as the guard above, one level down: `--kd-denoiser-alpha` anchors on the float twin's denoiser prediction (no logits to distill) and `--db-sigma-codebook` needs the per-batch sigma that only `denoise_step` carries. `require_edm_objective` raises the same `SystemExit` the other two scripts raise, so the message and the exit style stay uniform across the trio. `--efqat-latch-*` is deliberately NOT rejected: the latch is a `requires_grad` arbiter, orthogonal to the objective, and `DiffusionBlockEngine._requires_grad_for` consults it on the `logprobs` path exactly as on `denoise_step`.
 require_edm_objective("--kd-denoiser-alpha", args.db_objective)
 if args.db_sigma_codebook:
     require_edm_objective("--db-sigma-codebook", args.db_objective)
 
-# W6 metadata + latch freezer. `make_latch_freezer` is a no-op when
-# `--efqat-latch-blocks` is empty (the default), so this is the normal path.
+# W6 metadata + latch freezer. `make_latch_freezer` is a no-op when `--efqat-latch-blocks` is empty (the default), so this is the normal path.
 db_freezer, latch_targets = make_latch_freezer(
     db_engine, args.efqat_latch_blocks, num_db_blocks
 )
@@ -452,9 +418,7 @@ print0(f"Calculated examples per rank: {examples_per_rank}")
 # Kick off the training loop
 batch_iterator = get_batch()
 
-# DARD rule set: mined from the first rollout's tokens, or loaded from
-# --dard-rules. Attached to the engine so the rule penalty reads the same
-# distribution the policy gradient does.
+# DARD rule set: mined from the first rollout's tokens, or loaded from --dard-rules. Attached to the engine so the rule penalty reads the same distribution the policy gradient does.
 validate_dard_args(args)
 dard_loss_fn, dard_balancer = (None, None)
 if args.dard:
@@ -517,9 +481,7 @@ for step in range(num_steps):
     # Forward/Backward on rollouts over multiple examples in the dataset
     rewards_list = []
     sequence_lengths = []
-    # Gradual magnitude pruning, before the forward so the mask and the values
-    # agree in the same step. Monotone: a pruned weight is exactly 0.0 and can
-    # never win the |W| ranking again.
+    # Gradual magnitude pruning, before the forward so the mask and the values agree in the same step. Monotone: a pruned weight is exactly 0.0 and can never win the |W| ranking again.
     if args.sparseprop:
         pruned = sparse_schedule.apply(db_engine, step)
         if pruned is not None:
@@ -548,25 +510,17 @@ for step in range(num_steps):
             targets = targets_all[b0:b1]
             rewards = rewards_all[b0:b1]
             advantages = advantages_all[b0:b1]
-            # Calculate log probabilities via DiffusionBlocks engine.
-            # db_engine.logprobs evaluates cross-entropy loss with block-isolation (L/B layers active)
-            # and returns per-token NLL = -logp, so we negate
+            # Calculate log probabilities via DiffusionBlocks engine. db_engine.logprobs evaluates cross-entropy loss with block-isolation (L/B layers active) and returns per-token NLL = -logp, so we negate
             logp = -db_engine.logprobs(inputs, targets).view_as(inputs)  # (B, T)
             # Calculate the PG objective. ignore_index=-1 ensures that invalid tokens have loss 0.
             pg_obj = (logp * advantages.unsqueeze(-1)).sum()
             # normalize by the number of valid tokens, number of passes, and examples_per_rank
             num_valid = (targets >= 0).sum().clamp(min=1)
             pg_obj = pg_obj / (num_valid * num_passes * examples_per_rank)
-            # Note, there is no need to add PPO ratio+clip because we are on policy
-            # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
+            # Note, there is no need to add PPO ratio+clip because we are on policy Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
             loss = -pg_obj
             if dard_loss_fn is not None:
-                # The rule penalty is a *policy-regularizer*, added to the
-                # gradient the same way. It is deliberately a uniform additive
-                # term rather than a per-position one: weighting positions by
-                # advantage here would make the aux loss reinforce the same
-                # tokens REINFORCE already liked, which is a different (and
-                # self-reinforcing) objective rather than a rule constraint.
+                # The rule penalty is a *policy-regularizer*, added to the gradient the same way. It is deliberately a uniform additive term rather than a per-position one: weighting positions by advantage here would make the aux loss reinforce the same tokens REINFORCE already liked, which is a different (and self-reinforcing) objective rather than a rule constraint.
                 aux = dard_loss_fn(db_engine.last_dard_logits)
                 if dard_balancer is not None:
                     loss, _ = dard_balancer(loss, aux)
@@ -621,18 +575,13 @@ for step in range(num_steps):
         (step > 0 and step % args.save_every == 0) or step == num_steps - 1
     ):
         base_dir = get_base_dir()
-        # `model` is the DiffusionBlocks engine when the SFT
-        # checkpoint declared meta["db"]; `base_model` is the
-        # bare GPT in both branches, so its config is the one
-        # to read and re-save.
+        # `model` is the DiffusionBlocks engine when the SFT checkpoint declared meta["db"]; `base_model` is the bare GPT in both branches, so its config is the one to read and re-save.
         depth = base_model.config.n_layer
         output_dirname = (
             args.model_tag if args.model_tag else f"d{depth}"
         )  # base the model tag on the depth of the base model
         checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
-        # `asdict` (already used for the same meta key in `_train/build.py`)
-        # rather than `config.__dict__`, which hands the caller a live alias
-        # into the model's own config object.
+        # `asdict` (already used for the same meta key in `_train/build.py`) rather than `config.__dict__`, which hands the caller a live alias into the model's own config object.
         model_config_kwargs = asdict(base_model.config)
         save_checkpoint(
             checkpoint_dir,
@@ -642,12 +591,7 @@ for step in range(num_steps):
             {
                 "model_config": model_config_kwargs,
                 "lcqat": lcqat_meta,
-                # `sigma_codebook` is recorded so a resumed run reports the
-                # codebook structure it is actually training.
-                # `--db-sigma-codebook` is rejected above under RL, so this
-                # is always the disabled form here; it is written anyway
-                # because omitting it would make a resume read the key as
-                # missing rather than as "off".
+                # `sigma_codebook` is recorded so a resumed run reports the codebook structure it is actually training. `--db-sigma-codebook` is rejected above under RL, so this is always the disabled form here; it is written anyway because omitting it would make a resume read the key as missing rather than as "off".
                 "db": db_engine.partitioner.to_meta(
                     sigma_codebook=describe_sigma_codebooks(args)
                 ),

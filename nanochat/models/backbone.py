@@ -34,9 +34,7 @@ class GPTConfig:
     n_head: int = 6  # number of query heads
     n_kv_head: int = 6  # number of key/value heads (GQA)
     n_embd: int = 768
-    # Sliding window attention pattern string, tiled across layers. Final layer always L.
-    # Characters: L=long (full context), S=short (quarter context)
-    # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
+    # Sliding window attention pattern string, tiled across layers. Final layer always L. Characters: L=long (full context), S=short (quarter context) Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
 
 
@@ -55,8 +53,7 @@ class Linear(nn.Linear):
 
 
 def _is_codebook_param(name: str) -> bool:
-    # Stable name contract with nanochat.models.quant.codebook parameters (LC-QAT PRD section 5):
-    # these get their own AdamW group and must never be handed to AdamW matrix groups (they are 1-D).
+    # Stable name contract with nanochat.models.quant.codebook parameters (LC-QAT PRD section 5): these get their own AdamW group and must never be handed to AdamW matrix groups (they are 1-D).
     return name.endswith(("raw_pos_deltas", "raw_neg_deltas"))
 
 
@@ -68,8 +65,7 @@ def has_ve(layer_idx: int, n_layer: int) -> bool:
 def apply_rotary_emb(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
-    # note: this rotates by -theta, the transpose of the textbook convention. Functionally
-    # equivalent (only the relative q/k rotation matters), kept for checkpoint compatibility.
+    # note: this rotates by -theta, the transpose of the textbook convention. Functionally equivalent (only the relative q/k rotation matters), kept for checkpoint compatibility.
     assert x.ndim == 4  # multihead attention
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]  # split up last dim into two halves
@@ -102,8 +98,7 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, ve, cos_sin, window_size, kv_cache=None, attn_mask=None):
         B, T, C = x.size()
 
-        # Project the input to get queries, keys, and values
-        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
+        # Project the input to get queries, keys, and values Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -129,8 +124,7 @@ class CausalSelfAttention(nn.Module):
         )  # sharper attention (split scale between Q and K); open question: derive the split rather than hard-code 1.2
         k = k * 1.2
 
-        # Flash Attention (FA3 or SDPA fallback)
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+        # Flash Attention (FA3 or SDPA fallback) window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window and custom mask
             y = flash_attn.flash_attn_func(
@@ -139,10 +133,7 @@ class CausalSelfAttention(nn.Module):
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             if getattr(kv_cache, "quantized", False):
-                # Quantized KV (LC-QAT PRD 7.1): write this step's K/V as
-                # packed IDs, then resolve the window through per-head LUTs
-                # inside the index-native op. Lazy import: the lcqat package
-                # imports gpt, so a module-level import here would cycle.
+                # Quantized KV (LC-QAT PRD 7.1): write this step's K/V as packed IDs, then resolve the window through per-head LUTs inside the index-native op. Lazy import: the lcqat package imports gpt, so a module-level import here would cycle.
                 from nanochat.ops import dispatch_quant_attn
 
                 kv_cache.write(self.layer_idx, k, v)
@@ -197,26 +188,12 @@ def maybe_sigma_call(layer, x, sigma):
 class MLP(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
-        # Typed `nn.Linear`, not `Linear`: the MLP forward duck-types on the
-        # quantizer (`getattr(..., "act_quantizer", ...)`) and on the
-        # `learnable_activation_lut` buffer, so a *plain* `nn.Linear` is a
-        # valid member -- and wiring tests construct exactly that to exercise
-        # the non-quantized path. `Linear` is a subclass, so the runtime
-        # behavior is unchanged wherever one is installed.
+        # Typed `nn.Linear`, not `Linear`: the MLP forward duck-types on the quantizer (`getattr(..., "act_quantizer", ...)`) and on the `learnable_activation_lut` buffer, so a *plain* `nn.Linear` is a valid member -- and wiring tests construct exactly that to exercise the non-quantized path. `Linear` is a subclass, so the runtime behavior is unchanged wherever one is installed.
         self.c_fc: nn.Linear = Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj: nn.Linear = Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x, sigma=None):
-        # Quantized-inference runtime (LC-QAT PRD 6): once export has installed
-        # packed weights + the relu^2 index table, the elementwise op runs as
-        # an index->index gather instead of float math. Duck-typed so gpt.py
-        # keeps no import-time dependency on the lcqat package.
-        #
-        # `sigma` is forwarded only to the float path: the fused index path
-        # reads static LUTs, and a sigma-conditioned codebook would need a
-        # per-sigma table it does not have. Guarded rather than assumed, so a
-        # conditioned codebook + exported buffers fails loudly instead of
-        # silently quantizing with the wrong levels.
+        # Quantized-inference runtime (LC-QAT PRD 6): once export has installed packed weights + the relu^2 index table, the elementwise op runs as an index->index gather instead of float math. Duck-typed so gpt.py keeps no import-time dependency on the lcqat package. `sigma` is forwarded only to the float path: the fused index path reads static LUTs, and a sigma-conditioned codebook would need a per-sigma table it does not have. Guarded rather than assumed, so a conditioned codebook + exported buffers fails loudly instead of silently quantizing with the wrong levels.
         c_fc = self.c_fc
         buffers = (
             dict(c_fc.named_buffers()) if isinstance(c_fc, torch.nn.Module) else {}
@@ -230,31 +207,16 @@ class MLP(nn.Module):
                     "level. Export with a static codebook, or keep this layer in "
                     "the float path."
                 )
-            # Duck-typed like everything else on this path: only an exported
-            # LCQATLinear carries `quantized_mlp_chain`, and `getattr` keeps
-            # this file free of the import cycle (quant imports backbone).
+            # Duck-typed like everything else on this path: only an exported LCQATLinear carries `quantized_mlp_chain`, and `getattr` keeps this file free of the import cycle (quant imports backbone).
             quantized_chain = getattr(c_fc, "quantized_mlp_chain", None)
             assert quantized_chain is not None, (
                 "activation_lut + packed_weight_indices are present but "
                 "quantized_mlp_chain is missing; export did not finish"
             )
             return quantized_chain(x, self.c_proj)
-        # `sigma` is forwarded only to sigma-conditioned layers. A plain
-        # `nn.Linear` does not accept the keyword, and duck-typing on the
-        # quantizer -- not on the class -- is what keeps the float path working
-        # without a second code path here.
+        # `sigma` is forwarded only to sigma-conditioned layers. A plain `nn.Linear` does not accept the keyword, and duck-typing on the quantizer -- not on the class -- is what keeps the float path working without a second code path here.
         x = maybe_sigma_call(self.c_fc, x, sigma)
-        # When a *trained* activation table is attached, the elementwise op runs
-        # through it instead of `F.relu(x).square()`. This is what makes
-        # `--lcqat-lut-relaxation` / `--lcqat-act-body` do anything: the table is
-        # only reachable from the export-time fused chain otherwise, so its
-        # parameters would never receive a gradient and training would silently
-        # optimise the float activation while export baked a different one.
-        #
-        # The emitted value is identical either way -- `LearnableIndexLut.forward`
-        # returns exactly what `resolved_table()` gathers -- so switching this on
-        # changes the gradient, not the forward number. A layer without a table
-        # (every layer by default) takes the float path unchanged.
+        # When a *trained* activation table is attached, the elementwise op runs through it instead of `F.relu(x).square()`. This is what makes `--lcqat-lut-relaxation` / `--lcqat-act-body` do anything: the table is only reachable from the export-time fused chain otherwise, so its parameters would never receive a gradient and training would silently optimise the float activation while export baked a different one. The emitted value is identical either way -- `LearnableIndexLut.forward` returns exactly what `resolved_table()` gathers -- so switching this on changes the gradient, not the forward number. A layer without a table (every layer by default) takes the float path unchanged.
         if getattr(c_fc, "learnable_activation_lut", None) is not None:
             apply_trained = getattr(c_fc, "apply_trained_activation", None)
             assert apply_trained is not None, (
@@ -375,11 +337,9 @@ class GPT(nn.Module):
         self.config = config
         if config.n_embd < 24:
             raise ValueError(f"smear reads 24 channels, got n_embd={config.n_embd}")
-        # Compute per-layer window sizes for sliding window attention
-        # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
+        # Compute per-layer window sizes for sliding window attention window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
-        # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
-        # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
+        # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward(). https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
         padded_vocab_size = (
             (config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to
         ) * pad_vocab_size_to
@@ -391,10 +351,7 @@ class GPT(nn.Module):
             )
         self.transformer = TransformerTrunk(config, padded_vocab_size)
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
-        # Per-layer learnable scalars (inspired by modded-nanogpt)
-        # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
-        # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
-        # Separate parameters so they can have different optimizer treatment
+        # Per-layer learnable scalars (inspired by modded-nanogpt) resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral) x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled) Separate parameters so they can have different optimizer treatment
         self.resid_lambdas = nn.Parameter(
             torch.ones(config.n_layer)
         )  # fake init, real init in init_weights()
@@ -416,10 +373,7 @@ class GPT(nn.Module):
                 if has_ve(i, config.n_layer)
             }
         )
-        # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
-        # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
-        # so let's over-compute them by 10X, but assert fail if we ever reach that amount.
-        # In the future we can dynamically grow the cache, for now it's fine.
+        # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only. As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory, so let's over-compute them by 10X, but assert fail if we ever reach that amount. In the future we can dynamically grow the cache, for now it's fine.
         self.rotary_seq_len = (
             config.sequence_len * 10
         )  # 10X over-compute should be enough; growth path is a dynamic cache (see above)
@@ -467,8 +421,7 @@ class GPT(nn.Module):
             )  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
-        # Per-layer scalars
-        # Per-layer resid init: stronger residual at early layers, weaker at deep layers
+        # Per-layer scalars Per-layer resid init: stronger residual at early layers, weaker at deep layers
         n_layer = self.config.n_layer
         for i in range(n_layer):
             self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
@@ -496,9 +449,7 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
 
-        # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
-        # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
-        # because GradScaler cannot unscale fp16 gradients.
+        # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision embeddings and it saves memory. Exception: fp16 requires fp32 embeddings because GradScaler cannot unscale fp16 gradients.
         if COMPUTE_DTYPE != torch.float16:
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
@@ -508,8 +459,7 @@ class GPT(nn.Module):
     def _precompute_rotary_embeddings(
         self, seq_len, head_dim, base=100000, device=None
     ):
-        # open question: bump base theta more? e.g. 100K is more common more recently
-        # autodetect the device from model embeddings
+        # open question: bump base theta more? e.g. 100K is more common more recently autodetect the device from model embeddings
         if device is None:
             device = self.transformer.wte.weight.device
         # stride the channels
@@ -666,13 +616,11 @@ class GPT(nn.Module):
         Returns a dict with counts for each parameter group, so downstream analysis
         can experiment with which combination gives the cleanest scaling laws.
         """
-        # Count each group separately (mirrors the role split in
-        # nanochat.models.quant.optimizer.build_qat_param_groups)
+        # Count each group separately (mirrors the role split in nanochat.models.quant.optimizer.build_qat_param_groups)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        # Codebook step params are excluded from transformer_matrices so scaling-law
-        # token horizons match the equivalent float run (they are ~0.001% of params)
+        # Codebook step params are excluded from transformer_matrices so scaling-law token horizons match the equivalent float run (they are ~0.001% of params)
         codebooks = sum(
             p.numel()
             for n, p in self.transformer.h.named_parameters()
@@ -767,17 +715,7 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
-        # Int-keyed view of `value_embeds`, built once per forward from the
-        # live ModuleDict. `str(i) in ...` followed by `...[str(i)]` built the
-        # key twice and hashed it twice per layer; this builds it once.
-        #
-        # Derived from the module rather than cached in `__init__` on purpose:
-        # `resize_to` replaces `value_embeds` wholesale when the depth changes
-        # (the has_ve predicate depends on n_layer), so anything cached at
-        # construction goes stale, and a list indexed by `range(n_layer)` raises
-        # IndexError when `transformer.h` is longer than the config's n_layer.
-        # `i in ve_by_layer` degrades to `ve=None`, which is what every other
-        # mismatch in this loop already does.
+        # Int-keyed view of `value_embeds`, built once per forward from the live ModuleDict. `str(i) in ...` followed by `...[str(i)]` built the key twice and hashed it twice per layer; this builds it once. Derived from the module rather than cached in `__init__` on purpose: `resize_to` replaces `value_embeds` wholesale when the depth changes (the has_ve predicate depends on n_layer), so anything cached at construction goes stale, and a list indexed by `range(n_layer)` raises IndexError when `transformer.h` is longer than the config's n_layer. `i in ve_by_layer` degrades to `ve=None`, which is what every other mismatch in this loop already does.
         ve_by_layer = {int(k): v for k, v in self.value_embeds.items() if k.isdigit()}
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
@@ -802,8 +740,7 @@ class GPT(nn.Module):
         logits = softcap * torch.tanh(logits / softcap)  # squash the logits
 
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # open question: experiment with chunked cross-entropy?
+            # training: given the targets, compute and return the loss open question: experiment with chunked cross-entropy?
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),

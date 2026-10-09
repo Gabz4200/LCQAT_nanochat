@@ -58,9 +58,7 @@ def _find_atoms(sequences: list[frozenset[int]]) -> list[frozenset[int]]:
     candidates: set[frozenset[int]] = set()
     for seq in sequences:
         items = sorted(seq)
-        # A co-occurrence witness is at most `MAX_ATOM_TOKENS` wide. Without a
-        # cap the candidate set is every subset of every sequence, which for
-        # real text is the whole corpus.
+        # A co-occurrence witness is at most `MAX_ATOM_TOKENS` wide. Without a cap the candidate set is every subset of every sequence, which for real text is the whole corpus.
         for start, _ in enumerate(items):
             for width in range(1, MAX_ATOM_TOKENS + 1):
                 end = start + width
@@ -79,16 +77,11 @@ def _find_atoms(sequences: list[frozenset[int]]) -> list[frozenset[int]]:
             if not any(o <= c for o in smaller):
                 atoms.append(c)
         smaller.extend(by_size[size])
-    # Deterministic order: sets of ints iterate in a hash order that depends on
-    # insertion history, and the atom order decides which unions are tried
-    # first, so a run must not depend on it.
+    # Deterministic order: sets of ints iterate in a hash order that depends on insertion history, and the atom order decides which unions are tried first, so a run must not depend on it.
     return sorted(atoms, key=lambda a: (len(a), sorted(a)))
 
 
-#: Cap on how many tokens one co-occurrence atom may span. AML's own examples
-#: use constants per feature position; for a token stream the analogous unit is
-#: a short n-gram. Four keeps atoms discriminative (the paper's 4x4 Sudoku
-#: images use 4-token atoms) while bounding the candidate set.
+#: Cap on how many tokens one co-occurrence atom may span. AML's own examples use constants per feature position; for a token stream the analogous unit is a short n-gram. Four keeps atoms discriminative (the paper's 4x4 Sudoku images use 4-token atoms) while bounding the candidate set.
 MAX_ATOM_TOKENS = 4
 
 
@@ -127,13 +120,7 @@ def atomize_shard(shard: torch.Tensor, max_rules: int = 4096) -> ShardRules:
         raise ValueError(f"max_rules must be >= 1, got {max_rules}")
 
     tokens = [int(t) for t in shard.tolist()]
-    # Premises are built at *every* width from 1 to PREMISE_WIDTH, not just the
-    # widest. A rule is only informative when both sides carry comparable
-    # arity (see MIN_BALANCED_ARITY), and on real text a 4-token window rarely
-    # recurs often enough to accumulate a multi-token conclusion -- so mining
-    # only the widest window yields either unsatisfiable rules (narrow
-    # conclusion) or none at all (no recurrence). Starting narrow and widening
-    # lets the shard's own statistics choose the arity it can support.
+    # Premises are built at *every* width from 1 to PREMISE_WIDTH, not just the widest. A rule is only informative when both sides carry comparable arity (see MIN_BALANCED_ARITY), and on real text a 4-token window rarely recurs often enough to accumulate a multi-token conclusion -- so mining only the widest window yields either unsatisfiable rules (narrow conclusion) or none at all (no recurrence). Starting narrow and widening lets the shard's own statistics choose the arity it can support.
     occurrences: dict[frozenset[int], list[int]] = {}
     for width in range(1, PREMISE_WIDTH + 1):
         for start in range(len(tokens) - width):
@@ -178,10 +165,7 @@ def atomize_shard(shard: torch.Tensor, max_rules: int = 4096) -> ShardRules:
     )
 
 
-#: How many leading tokens form a premise. Four positions is wide enough that
-#: the mined relation is a multi-token pattern (which is the case the log-domain
-#: product t-norm exists for) and narrow enough that premises stay frequent
-#: enough to survive the cross-shard frequency threshold.
+#: How many leading tokens form a premise. Four positions is wide enough that the mined relation is a multi-token pattern (which is the case the log-domain product t-norm exists for) and narrow enough that premises stay frequent enough to survive the cross-shard frequency threshold.
 PREMISE_WIDTH = 4
 
 
@@ -210,21 +194,7 @@ def _premise_successors(tokens: list[int]) -> dict[frozenset[int], set[frozenset
     return out
 
 
-#: A rule is only informative if its two sides carry *comparable* numbers of
-#: tokens, because the penalty compares two product t-norms and a longer
-#: product is exponentially smaller.
-#:
-#: With a 4-token premise against a 1-token conclusion, `v(premise)` is
-#: O(p^4) and `v(conclusion)` is O(p): the premise is smaller by construction
-#: for any p < 1, the order can never be violated, and the penalty sits at the
-#: hinge floor forever. Measured on a real model: 0.0000 of rules violated,
-#: penalty 0.069299 against a floor of 0.069315.
-#:
-#: So the conclusion is widened to the same arity as the premise, by taking the
-#: tokens that follow the window across *all* its occurrences in the shard. A
-#: premise that recurs is thereby paired with the distribution of what actually
-#: follows it, which is both the right logical statement ("this context licenses
-#: these continuations") and arity-balanced so the penalty can activate.
+#: : A rule is only informative if its two sides carry *comparable* numbers of tokens, because the penalty compares two product t-norms and a longer product is exponentially smaller. : With a 4-token premise against a 1-token conclusion, `v(premise)` is O(p^4) and `v(conclusion)` is O(p): the premise is smaller by construction for any p < 1, the order can never be violated, and the penalty sits at the hinge floor forever. Measured on a real model: 0.0000 of rules violated, penalty 0.069299 against a floor of 0.069315. : So the conclusion is widened to the same arity as the premise, by taking the tokens that follow the window across *all* its occurrences in the shard. A premise that recurs is thereby paired with the distribution of what actually follows it, which is both the right logical statement ("this context licenses these continuations") and arity-balanced so the penalty can activate.
 MIN_BALANCED_ARITY = 2
 
 
@@ -245,9 +215,7 @@ def _balanced_conclusion(
         following.add(tokens[start + width])
     disjoint = following - premise
     if len(disjoint) < MIN_BALANCED_ARITY:
-        # Not enough distinct continuations to balance the premise. Keeping a
-        # 1-token conclusion here would recreate the unsatisfiable asymmetry,
-        # so the pair is dropped instead -- see MIN_BALANCED_ARITY.
+        # Not enough distinct continuations to balance the premise. Keeping a 1-token conclusion here would recreate the unsatisfiable asymmetry, so the pair is dropped instead -- see MIN_BALANCED_ARITY.
         return set()
     return {frozenset(disjoint)}
 
@@ -277,14 +245,10 @@ def _cross(
     if not conclusion:
         return False
     if premise & conclusion:
-        # Sides share a token: the conclusion's product already contains a
-        # factor of the premise's, so v(premise) <= v(conclusion) holds by
-        # construction and the rule is vacuous.
+        # Sides share a token: the conclusion's product already contains a factor of the premise's, so v(premise) <= v(conclusion) holds by construction and the rule is vacuous.
         return False
     if len(premise) - len(conclusion) >= MAX_ARITY_GAP:
-        # The premise's product t-norm is exponentially smaller than the
-        # conclusion's, so the order can never be violated and the penalty is
-        # pinned at its floor. See MIN_BALANCED_ARITY.
+        # The premise's product t-norm is exponentially smaller than the conclusion's, so the order can never be violated and the penalty is pinned at its floor. See MIN_BALANCED_ARITY.
         return False
     conclusion_atoms = [a for a in atoms if a <= conclusion]
     for atom in atoms:
@@ -293,9 +257,7 @@ def _cross(
     return False
 
 
-#: Largest arity difference a rule may have and still be violable. One token is
-#: the safe bound: with |premise| = |conclusion| + 2 the premise product is
-#: O(p^2) smaller for small p, which in practice means never violated.
+#: Largest arity difference a rule may have and still be violable. One token is the safe bound: with |premise| = |conclusion| + 2 the premise product is O(p^2) smaller for small p, which in practice means never violated.
 MAX_ARITY_GAP = 1
 
 

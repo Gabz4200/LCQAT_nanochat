@@ -35,11 +35,7 @@ from nanochat.models.quant.codebook import (
 )
 from nanochat.models.quant.packing import index_dtype_for_k
 
-# Log-sigma buckets are laid out symmetrically about log(SIGMA_PIVOT), which is
-# the sigma at which the EDM preconditioner makes the data and noise terms
-# comparable (`sigma_data`). Bucketing around that point means the boundaries
-# are meaningful in the model's own units rather than in raw sigma, where
-# everything below 1 and above 10 would be crowded together.
+# Log-sigma buckets are laid out symmetrically about log(SIGMA_PIVOT), which is the sigma at which the EDM preconditioner makes the data and noise terms comparable (`sigma_data`). Bucketing around that point means the boundaries are meaningful in the model's own units rather than in raw sigma, where everything below 1 and above 10 would be crowded together.
 SIGMA_PIVOT = 0.5
 
 
@@ -64,8 +60,7 @@ def log_sigma_anchor_index(sigma: torch.Tensor, anchors: torch.Tensor) -> torch.
         raise ValueError("anchors must be strictly increasing")
     log_a = torch.log(anchors.to(torch.float64))
     log_s = torch.log(sigma.to(torch.float64).clamp_min(1e-12))
-    # bucketize is right-closed, so comparing log(s) against the midpoints in log
-    # space yields the nearest anchor.
+    # bucketize is right-closed, so comparing log(s) against the midpoints in log space yields the nearest anchor.
     mids = (log_a[:-1] + log_a[1:]) * 0.5
     return torch.bucketize(log_s, mids).to(torch.int64)
 
@@ -147,8 +142,7 @@ class SigmaConditionedCodebook(nn.Module):
             )
         if not bool(torch.all(anchors[1:] > anchors[:-1])):
             raise ValueError("anchors must be strictly increasing")
-        # Persistent so a run with custom `anchors=` resumes with the same
-        # bucket boundaries instead of silently re-bucketing to defaults.
+        # Persistent so a run with custom `anchors=` resumes with the same bucket boundaries instead of silently re-bucketing to defaults.
         self.register_buffer("anchors", anchors, persistent=True)
 
         self.codebooks = nn.ModuleList(
@@ -211,10 +205,7 @@ class SigmaConditionedCodebook(nn.Module):
         ]
         value = torch.stack([q.value for q in per_row], dim=0)
         indices = torch.stack([q.indices for q in per_row], dim=0)
-        # The per-row codebook gather is returned as a [K, B] table: index
-        # kernels index the *last* axis by an integer, so this is the layout
-        # that makes `codebook[indices]` resolve per row. Training and the
-        # `_forward_quantized` path both rely on it.
+        # The per-row codebook gather is returned as a [K, B] table: index kernels index the *last* axis by an integer, so this is the layout that makes `codebook[indices]` resolve per row. Training and the `_forward_quantized` path both rely on it.
         codebook = torch.stack([q.codebook for q in per_row], dim=1)  # [K, B]
         return QuantizedOutput(value=value, indices=indices, codebook=codebook)
 
@@ -276,9 +267,7 @@ class SigmaModulatedCodebook(nn.Module):
             init_max=init_max,
             device=device,
         )
-        # A two-layer MLP on log(sigma). The output layer starts at exactly
-        # zero, so the gain is `exp(0) == 1.0` at init and the module is a
-        # bit-exact drop-in for the unconditional codebook it replaces.
+        # A two-layer MLP on log(sigma). The output layer starts at exactly zero, so the gain is `exp(0) == 1.0` at init and the module is a bit-exact drop-in for the unconditional codebook it replaces.
         self.gain_net = nn.Sequential(
             nn.Linear(1, hidden, device=device),
             nn.SiLU(),
@@ -341,13 +330,9 @@ class SigmaModulatedCodebook(nn.Module):
     ) -> QuantizedOutput:
         sigma = resolve_batch_sigma(sigma, x.shape[0])
         x_fp32 = x.to(torch.float32)
-        # Bucketize and gather against the *same* effective codebook, so the
-        # bucket boundaries and the fetched values cannot drift apart.
+        # Bucketize and gather against the *same* effective codebook, so the bucket boundaries and the fetched values cannot drift apart.
         effective = self.effective_codebook(sigma)
-        # A single sigma shared by the whole batch collapses to a 1-D table, so
-        # the two ranks have to be handled separately: `gather` needs the index
-        # to have the same rank as the table, which is not true of a shared
-        # table against a 3-D index.
+        # A single sigma shared by the whole batch collapses to a 1-D table, so the two ranks have to be handled separately: `gather` needs the index to have the same rank as the table, which is not true of a shared table against a 3-D index.
         if effective.shape[0] == 1:
             table = effective[0]
             idx = self.bucketize_against(table, x_fp32)
@@ -355,20 +340,12 @@ class SigmaModulatedCodebook(nn.Module):
             codebook = table
         else:
             idx = self.bucketize_against(effective, x_fp32)
-            # Row-batched gather: the lookup is `effective[b, idx[b, t, d]]` for
-            # every element. Flattening the token/feature axes into the gather
-            # axis is what makes this a single call -- `gather` requires every
-            # non-index dimension to match exactly, and `T`/`D` are free.
+            # Row-batched gather: the lookup is `effective[b, idx[b, t, d]]` for every element. Flattening the token/feature axes into the gather axis is what makes this a single call -- `gather` requires every non-index dimension to match exactly, and `T`/`D` are free.
             dequant = effective.gather(1, idx.reshape(effective.shape[0], -1)).reshape(
                 x_fp32.shape
             )
             codebook = effective
-        # STE: identity on the input, live gather on the codebook. The gain's
-        # own gradient arrives through `dequant` directly, which is what lets
-        # the modulation learn.
-        # `scale` shrinks only the codebook gradient (PRD 2.4 1/sqrt(N)); the
-        # STE identity term is added after it, so the gradient reaching the
-        # input activation is untouched.
+        # STE: identity on the input, live gather on the codebook. The gain's own gradient arrives through `dequant` directly, which is what lets the modulation learn. `scale` shrinks only the codebook gradient (PRD 2.4 1/sqrt(N)); the STE identity term is added after it, so the gradient reaching the input activation is untouched.
         scaled = dequant * scale + (dequant * (1.0 - scale)).detach()
         x_q = scaled + (x_fp32 - x_fp32.detach())
         idx_dtype = index_dtype_for_k(self.K)
@@ -387,9 +364,7 @@ class SigmaModulatedCodebook(nn.Module):
             return torch.bucketize(x, (effective[:-1] + effective[1:]) * 0.5)
         # [B, K-1] boundaries broadcast over the token/feature axes.
         mids = (effective[:, :-1] + effective[:, 1:]) * 0.5
-        # Flatten everything after the batch, bucketize each row, then restore
-        # `x`'s exact shape. Rebuilding the shape from `x.shape[1:-1]` plus the
-        # flattened width would double-count the last axis.
+        # Flatten everything after the batch, bucketize each row, then restore `x`'s exact shape. Rebuilding the shape from `x.shape[1:-1]` plus the flattened width would double-count the last axis.
         flat = x.reshape(x.shape[0], -1)
         out = torch.empty(flat.shape, dtype=torch.int64, device=x.device)
         for b in range(flat.shape[0]):

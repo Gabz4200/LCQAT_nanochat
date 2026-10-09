@@ -30,9 +30,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-#: Matches the logit softcap in `GPT.forward` and `DiffusionBlockEngine.generate`.
-#: Duplicated as a module constant rather than imported so this file does not
-#: depend on backbone internals; the test that checks it asserts the two agree.
+#: Matches the logit softcap in `GPT.forward` and `DiffusionBlockEngine.generate`. Duplicated as a module constant rather than imported so this file does not depend on backbone internals; the test that checks it asserts the two agree.
 LOGCAP_SOFTMAX = 15.0
 
 

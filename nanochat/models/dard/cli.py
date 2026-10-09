@@ -293,8 +293,7 @@ def shard_size_for(args, tokens: torch.Tensor) -> int:
     return max(min(want, MAX_SHARD_SIZE), MIN_SHARD_TOKENS)
 
 
-#: Below this a shard cannot form a single premise/conclusion pair, so mining it
-#: yields nothing. Sizing shards under it would only manufacture empty ones.
+#: Below this a shard cannot form a single premise/conclusion pair, so mining it yields nothing. Sizing shards under it would only manufacture empty ones.
 MIN_SHARD_TOKENS = PREMISE_WIDTH + 1
 
 

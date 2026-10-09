@@ -43,11 +43,7 @@ from nanochat.models.quant.packing import (
     unpack_weight_indices,
 )
 
-#: Smallest compacted alphabet an exported artifact may declare. `packing`
-#: picks a storage format from K and the densest one (trits) starts at 3, so a
-#: K=1 or K=2 artifact has no valid format and `pack_weight_indices` raises.
-#: Compaction is free to *under*-report what is stored -- the padded levels are
-#: never referenced -- but it is not free to report an unrepresentable K.
+#: Smallest compacted alphabet an exported artifact may declare. `packing` picks a storage format from K and the densest one (trits) starts at 3, so a K=1 or K=2 artifact has no valid format and `pack_weight_indices` raises. Compaction is free to *under*-report what is stored -- the padded levels are never referenced -- but it is not free to report an unrepresentable K.
 MIN_EXPORT_ALPHABET = 3
 
 
@@ -116,18 +112,13 @@ def plan_sparse_export(
     row_ptr = torch.zeros(m + 1, dtype=torch.int64, device=indices.device)
     torch.cumsum(counts, dim=0, out=row_ptr[1:])
 
-    # Alphabet compaction: only the levels the surviving weights actually
-    # reference are kept. `used` is ascending, so `remap` is monotone and the
-    # compacted codebook preserves the original level order -- no level can be
-    # re-sorted past another by the remap.
+    # Alphabet compaction: only the levels the surviving weights actually reference are kept. `used` is ascending, so `remap` is monotone and the compacted codebook preserves the original level order -- no level can be re-sorted past another by the remap.
     if k is None:
         k = max(3, int(indices.max()) + 1) if indices.numel() else 3
     used = torch.unique(original)
     remap = torch.full((k,), -1, dtype=torch.int64, device=indices.device)
     if used.numel() == 0:
-        # An all-pruned layer keeps no alphabet at all. Emit the minimum legal
-        # codebook rather than K=1: `index_format_for_k` rejects K < 3 (the
-        # trit format starts at 3), so a K=1 artifact would fail to pack.
+        # An all-pruned layer keeps no alphabet at all. Emit the minimum legal codebook rather than K=1: `index_format_for_k` rejects K < 3 (the trit format starts at 3), so a K=1 artifact would fail to pack.
         used = torch.zeros(
             min(MIN_EXPORT_ALPHABET, k), dtype=torch.int64, device=indices.device
         )

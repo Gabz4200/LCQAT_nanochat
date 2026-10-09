@@ -23,29 +23,17 @@ from typing import Any
 
 import torch.nn as nn
 
-#: Parameter-name suffixes identifying a codebook step parameter. Stable
-#: contract shared with `nanochat.models.backbone._is_codebook_param` and relied on by
-#: SparseProp's re-parenting, which must survive module surgery.
+#: Parameter-name suffixes identifying a codebook step parameter. Stable contract shared with `nanochat.models.backbone._is_codebook_param` and relied on by SparseProp's re-parenting, which must survive module surgery.
 CODEBOOK_SUFFIXES = ("raw_pos_deltas", "raw_neg_deltas")
 
-#: Suffixes identifying a *learned activation-LUT* parameter
-#: (`LearnableIndexLut.logits`, or its proximity form's `knots`/`levels`).
-#:
-#: These are table step parameters, not matrix weights, so they belong to the
-#: codebook group -- their own LR, and no weight decay. Left out of
-#: `CODEBOOK_SUFFIXES` deliberately: that frozenset is the PRD 5 *name
-#: contract* that SparseProp's re-parenting and `retrofit.is_lcqat_state` both
-#: key on to decide whether a checkpoint is LC-QAT at all. Widening it would
-#: make every model carrying a learnable LUT report itself as quantized even
-#: with no codebook parameters at all.
+#: : Suffixes identifying a *learned activation-LUT* parameter (`LearnableIndexLut.logits`, or its proximity form's `knots`/`levels`). : These are table step parameters, not matrix weights, so they belong to the codebook group -- their own LR, and no weight decay. Left out of `CODEBOOK_SUFFIXES` deliberately: that frozenset is the PRD 5 *name contract* that SparseProp's re-parenting and `retrofit.is_lcqat_state` both key on to decide whether a checkpoint is LC-QAT at all. Widening it would make every model carrying a learnable LUT report itself as quantized even with no codebook parameters at all.
 LEARNED_LUT_SUFFIXES = (
     "learnable_activation_lut.logits",
     "learnable_activation_lut.knots",
     "learnable_activation_lut.levels",
 )
 
-#: Scalar / gate parameter names, by role. Matched exactly: a `startswith` here
-#: would swallow unrelated submodules.
+#: Scalar / gate parameter names, by role. Matched exactly: a `startswith` here would swallow unrelated submodules.
 _SCALAR_ROLES: dict[str, str] = {
     "resid_lambdas": "resid",
     "x0_lambdas": "x0",
@@ -54,9 +42,7 @@ _SCALAR_ROLES: dict[str, str] = {
     "backout_lambda": "smear",
 }
 
-# Per-role optimizer hyperparameters, ported from the (now deleted)
-# `GPT.setup_optimizer` so the
-# tuned recipe carries over unchanged. `matrix` takes the caller's values.
+# Per-role optimizer hyperparameters, ported from the (now deleted) `GPT.setup_optimizer` so the tuned recipe carries over unchanged. `matrix` takes the caller's values.
 _ROLE_BETAS: dict[str, tuple[float, float]] = {
     "lm_head": (0.8, 0.96),
     "embed": (0.8, 0.995),
@@ -76,8 +62,7 @@ _ROLE_WD: dict[str, float] = {
     "codebook": 0.0,  # PRD 5: codebook steps get no weight decay
 }
 
-#: Group order in the emitted list, so the layout is deterministic and
-#: checkpoint optimizer warm-starts stay comparable across runs.
+#: Group order in the emitted list, so the layout is deterministic and checkpoint optimizer warm-starts stay comparable across runs.
 ROLE_ORDER = (
     "lm_head",
     "embed",
@@ -123,8 +108,7 @@ def role_for_name(name: str) -> str:
         return "embed"
     if ".value_embeds." in f".{name}.":
         return "value_embed"
-    # Everything else: transformer block weights, engine-owned adapters and
-    # denoise heads, and any module added later under the model tree.
+    # Everything else: transformer block weights, engine-owned adapters and denoise heads, and any module added later under the model tree.
     return "matrix"
 
 

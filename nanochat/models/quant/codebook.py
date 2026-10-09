@@ -17,9 +17,7 @@ import torch.nn.functional as F
 
 from nanochat.models.quant.packing import index_dtype_for_k
 
-#: Smallest legal level count. K = m_neg + 1 + m_pos with both sides >= 1 gives
-#: K >= 3; a one-sided codebook (m_neg = 0) needs m_pos >= 2 so the zero anchor
-#: is not also the maximum level (which would make every positive input clamp).
+#: Smallest legal level count. K = m_neg + 1 + m_pos with both sides >= 1 gives K >= 3; a one-sided codebook (m_neg = 0) needs m_pos >= 2 so the zero anchor is not also the maximum level (which would make every positive input clamp).
 MIN_CODEBOOK_K = 3
 
 
@@ -34,8 +32,7 @@ def validate_split(m_neg: int, m_pos: int) -> tuple[int, int]:
             raise ValueError(f"{name} must be an int, got {value!r}")
         if value < 0:
             raise ValueError(f"{name} must be non-negative, got {value}")
-    # A zero anchor that is also an endpoint gives bucketize no interior
-    # midpoint on that side, so a one-sided codebook needs two positive levels.
+    # A zero anchor that is also an endpoint gives bucketize no interior midpoint on that side, so a one-sided codebook needs two positive levels.
     if m_pos == 0 and m_neg < 2:
         raise ValueError(
             "m_pos=0 requires m_neg >= 2 so the zero anchor is not also the "
@@ -158,18 +155,14 @@ class MemoryEfficientLearnedCodebook(nn.Module):
         self.m_pos = m_pos
         self.K = m_neg + 1 + m_pos
 
-        # Floor the init span: a zero span (e.g. zero-initialized weights) would
-        # make inverse softplus diverge to -inf and freeze the codebook at 0.0.
+        # Floor the init span: a zero span (e.g. zero-initialized weights) would make inverse softplus diverge to -inf and freeze the codebook at 0.0.
         span_pos = max(abs(init_max), 1e-6) if m_pos > 0 else 0.0
         span_neg = max(abs(init_min), 1e-6) if m_neg > 0 else 0.0
 
         if m_pos > 0:
             init_pos = torch.linspace(0, span_pos, m_pos + 1, device=device)[1:]
             pos_deltas = init_pos - torch.cat([init_pos.new_zeros(1), init_pos[:-1]])
-            # Inverse softplus, in the numerically stable form
-            # `delta + log(-expm1(-delta))`: `log(expm1(delta))` overflows to inf
-            # for spans above ~88 in FP32, which would make large-init codebooks
-            # unconstructible. Same convention as nanochat.models.quant.ablation.
+            # Inverse softplus, in the numerically stable form `delta + log(-expm1(-delta))`: `log(expm1(delta))` overflows to inf for spans above ~88 in FP32, which would make large-init codebooks unconstructible. Same convention as nanochat.models.quant.ablation.
             self.raw_pos_deltas = nn.Parameter(_inverse_softplus(pos_deltas))
         else:
             self.register_parameter("raw_pos_deltas", None)
@@ -181,15 +174,7 @@ class MemoryEfficientLearnedCodebook(nn.Module):
         else:
             self.register_parameter("raw_neg_deltas", None)
 
-        # Static FP32 LUT for deployment; only read after compile_for_inference().
-        #
-        # `zeros`, not `empty`: this buffer is persistent, so it is written into
-        # every checkpoint. With `empty` the saved tensor is uninitialized memory,
-        # which in practice means NaN garbage for every codebook in every saved
-        # model -- harmless at runtime (the values are overwritten by
-        # compile_for_inference and never read before then) but it makes
-        # save/load round-trip comparisons fail unpredictably, and it ships
-        # meaningless bytes.
+        # Static FP32 LUT for deployment; only read after compile_for_inference(). `zeros`, not `empty`: this buffer is persistent, so it is written into every checkpoint. With `empty` the saved tensor is uninitialized memory, which in practice means NaN garbage for every codebook in every saved model -- harmless at runtime (the values are overwritten by compile_for_inference and never read before then) but it makes save/load round-trip comparisons fail unpredictably, and it ships meaningless bytes.
         self.register_buffer(
             "compiled_codebook",
             torch.zeros(self.K, dtype=torch.float32, device=device),
@@ -198,11 +183,7 @@ class MemoryEfficientLearnedCodebook(nn.Module):
         self.is_compiled = False
 
     def get_codebook(self) -> torch.Tensor:
-        # Deliberately no eval-mode auto-caching (PRD 3.1 caches on first eval
-        # forward): that would freeze codebook gradients for any trainer that
-        # runs forward passes under model.eval() (chat_rl does) and would mutate
-        # buffers inside torch.compile graphs. Freezing happens only explicitly,
-        # via compile_for_inference().
+        # Deliberately no eval-mode auto-caching (PRD 3.1 caches on first eval forward): that would freeze codebook gradients for any trainer that runs forward passes under model.eval() (chat_rl does) and would mutate buffers inside torch.compile graphs. Freezing happens only explicitly, via compile_for_inference().
         if self.is_compiled:
             return self.compiled_codebook
         parts = []
@@ -212,15 +193,12 @@ class MemoryEfficientLearnedCodebook(nn.Module):
         if self.m_pos > 0:
             pos_steps = F.softplus(self.raw_pos_deltas)
             parts.append(torch.cumsum(pos_steps, dim=0))
-        # The zero anchor sits between the two sides, so it takes its device and
-        # dtype from whichever side exists; at least one always does by
-        # construction (`validate_split` requires m_neg + m_pos >= 2).
+        # The zero anchor sits between the two sides, so it takes its device and dtype from whichever side exists; at least one always does by construction (`validate_split` requires m_neg + m_pos >= 2).
         anchor = parts[0].new_zeros(1) if parts else self.compiled_codebook.new_zeros(1)
         if self.m_pos > 0:
             # [neg..., 0.0, pos...]
             return torch.cat([*parts[:-1], anchor, parts[-1]])
-        # m_pos == 0: only the negative side exists, and it is already ascending,
-        # so the anchor goes on its right.
+        # m_pos == 0: only the negative side exists, and it is already ascending, so the anchor goes on its right.
         return torch.cat([*parts, anchor])
 
     def forward(self, x: torch.Tensor, scale: float = 1.0) -> QuantizedOutput:
@@ -241,10 +219,7 @@ class MemoryEfficientLearnedCodebook(nn.Module):
         if scale != 1.0:
             x_dequant = x_dequant * scale + (x_dequant * (1.0 - scale)).detach()
 
-        # STE (PRD 1.3): forward value is exactly C[Q]; the zero-valued identity
-        # term routes dL/dx, and the live gather routes dL/dC = scatter of dL/dy
-        # over assigned buckets. A plain `x + (C[Q] - x).detach()` would zero out
-        # the codebook gradient.
+        # STE (PRD 1.3): forward value is exactly C[Q]; the zero-valued identity term routes dL/dx, and the live gather routes dL/dC = scatter of dL/dy over assigned buckets. A plain `x + (C[Q] - x).detach()` would zero out the codebook gradient.
         x_q = x_dequant + (x_fp32 - x_fp32.detach())
 
         idx_dtype = index_dtype_for_k(self.K)
@@ -302,18 +277,13 @@ class MemoryEfficientLearnedCodebook(nn.Module):
         self.compiled_codebook.copy_(cb)
         self.is_compiled = True
 
-        # del, not `= None`: a one-sided codebook already registered the missing
-        # side as None, and `del` on a None entry is a no-op on the _parameters
-        # dict, so this is correct for both the two-sided and one-sided shapes.
+        # del, not `= None`: a one-sided codebook already registered the missing side as None, and `del` on a None entry is a no-op on the _parameters dict, so this is correct for both the two-sided and one-sided shapes.
         for name in ("raw_pos_deltas", "raw_neg_deltas"):
             if getattr(self, name, None) is not None:
                 delattr(self, name)
-                # Re-register as None so attribute access keeps working (and
-                # returns None) for callers that introspect the split.
+                # Re-register as None so attribute access keeps working (and returns None) for callers that introspect the split.
                 self.register_parameter(name, None)
 
 
-# Public alias matching the PRD section 4 class name. The asymmetric split
-# codebook (M_neg + 1 + M_pos = K) is the only learned codebook in this
-# codebase; the name is kept stable so PRD-named imports resolve.
+# Public alias matching the PRD section 4 class name. The asymmetric split codebook (M_neg + 1 + M_pos = K) is the only learned codebook in this codebase; the name is kept stable so PRD-named imports resolve.
 AsymmetricLearnedCodebook = MemoryEfficientLearnedCodebook

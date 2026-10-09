@@ -57,9 +57,7 @@ class GradualPruningSchedule:
     ramp_steps: int = 8
     every: int = 0
     scope: str = SCOPE_LAYER
-    # Bound to the constant, not a literal: this is the value argparse fills in
-    # when --sparseprop-dense-threshold is absent, and the two drifting apart
-    # would silently change which layers take the sparse path.
+    # Bound to the constant, not a literal: this is the value argparse fills in when --sparseprop-dense-threshold is absent, and the two drifting apart would silently change which layers take the sparse path.
     dense_threshold: float = DEFAULT_DENSE_THRESHOLD
 
     def __post_init__(self) -> None:
@@ -153,28 +151,17 @@ class GradualPruningSchedule:
         else:
             with torch.no_grad():
                 for layer in layers:
-                    # Only layers below the target need re-pruning, and a layer
-                    # already past the target is left alone: raising the target
-                    # is monotone, so this is the only direction that can occur.
+                    # Only layers below the target need re-pruning, and a layer already past the target is left alone: raising the target is monotone, so this is the only direction that can occur.
                     current = (
                         1.0 - int(layer.sparsity_mask.sum()) / layer.weight.numel()
                     )
                     if current >= target:
                         continue
-                    # `mask & magnitude_mask(W, target)`, not a fresh
-                    # magnitude_mask: re-selecting per row independently does
-                    # NOT yield a nested mask. Two weights of equal magnitude in
-                    # one row swap in and out as the threshold drops, so a plain
-                    # re-mask can hand a slot back to an entry a previous prune
-                    # already removed. Gradual Magnitude Pruning is defined to be
-                    # monotone, and intersecting with the previous mask is both
-                    # correct and free.
+                    # `mask & magnitude_mask(W, target)`, not a fresh magnitude_mask: re-selecting per row independently does NOT yield a nested mask. Two weights of equal magnitude in one row swap in and out as the threshold drops, so a plain re-mask can hand a slot back to an entry a previous prune already removed. Gradual Magnitude Pruning is defined to be monotone, and intersecting with the previous mask is both correct and free.
                     layer.sparsity_mask.logical_and_(
                         magnitude_mask(layer.weight, target)
                     )
-                    # The AND can empty a row whose survivors were all pruned
-                    # by the intersection; give the row back its largest
-                    # remaining entry so no row is ever annihilated.
+                    # The AND can empty a row whose survivors were all pruned by the intersection; give the row back its largest remaining entry so no row is ever annihilated.
                     _give_back_empty_rows(layer, layer.sparsity_mask)
                     layer._apply_mask()
             total = sum(m.weight.numel() for m in layers)

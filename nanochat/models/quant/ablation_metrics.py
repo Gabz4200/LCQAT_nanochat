@@ -173,8 +173,7 @@ def quantization_error(
             f"shape mismatch: original {tuple(original.shape)} vs "
             f"reconstructed {tuple(reconstructed.shape)}"
         )
-    # Detached: these are measurement numbers, and a codebook parameter carried
-    # into them would both warn and build a graph nobody needs.
+    # Detached: these are measurement numbers, and a codebook parameter carried into them would both warn and build a graph nobody needs.
     diff = (
         original.detach().to(torch.float32) - reconstructed.detach().to(torch.float32)
     ).abs()
@@ -229,8 +228,7 @@ def reconstruct_layer(layer, x: torch.Tensor, which: str = "weight") -> torch.Te
     quantizer = select_quantizer(layer, which)
     indices = quantizer.bucketize(x.to(torch.float32))
     codebook = quantizer.get_codebook()
-    # Detached deliberately: this measures the exported artifact's fidelity, so
-    # the value must not carry the codebook's autograd graph into the metric.
+    # Detached deliberately: this measures the exported artifact's fidelity, so the value must not carry the codebook's autograd graph into the metric.
     return codebook.detach()[indices.long()]
 
 
@@ -250,8 +248,7 @@ def measure_reconstruction(
 
     quantizer = select_quantizer(layer, which)
     indices = quantizer.bucketize(original)
-    # "Used" means a level is hit by at least one element. Count distinct
-    # values rather than distinct indices so a repeated index is one level.
+    # "Used" means a level is hit by at least one element. Count distinct values rather than distinct indices so a repeated index is one level.
     used = int(torch.unique(indices).numel())
     k_total = int(quantizer.K)
     return ReconstructionResult(
@@ -352,9 +349,7 @@ def observe_grad_scale(
         raise ValueError(f"steps must be >= 1, got {steps}")
 
     previous = layer.grad_scale
-    # The codebook's own trainable parameters, addressed by name: `get_codebook`
-    # returns a *derived* tensor, so stepping that would not be an optimizer
-    # step at all.
+    # The codebook's own trainable parameters, addressed by name: `get_codebook` returns a *derived* tensor, so stepping that would not be an optimizer step at all.
     target = list(layer.weight_quantizer.parameters())
     if not target:
         raise ValueError("weight_quantizer exposes no trainable parameters")
@@ -364,8 +359,7 @@ def observe_grad_scale(
     try:
         layer.zero_grad(set_to_none=True)
         out = layer(x.to(torch.float32))
-        # A fixed scalar target so the loss is a real signal in both arms; the
-        # only thing that differs is how the gradient reaches the codebook.
+        # A fixed scalar target so the loss is a real signal in both arms; the only thing that differs is how the gradient reaches the codebook.
         loss = out.square().mean()
         loss.backward()
         grad_norm = math.sqrt(

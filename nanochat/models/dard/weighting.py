@@ -31,13 +31,10 @@ import torch
 
 from nanochat.models.dard.types import AmlRule, ShardRules
 
-#: Guard added inside every `log` so a rule with zero frequency (K=0 or a
-#: rule only ever seen in the shard being weighted) yields a finite score
-#: rather than `-inf`, which would poison the log_softmax for its neighbours.
+#: Guard added inside every `log` so a rule with zero frequency (K=0 or a rule only ever seen in the shard being weighted) yields a finite score rather than `-inf`, which would poison the log_softmax for its neighbours.
 LOG_GUARD = 1e-8
 
-#: PRD §5: hard floor guaranteeing every active rule keeps non-zero gradient
-#: transmission. See the module docstring for why this must be fp32.
+#: PRD §5: hard floor guaranteeing every active rule keeps non-zero gradient transmission. See the module docstring for why this must be fp32.
 EPS_FLOOR = 1e-6
 
 
@@ -80,9 +77,7 @@ def composite_rule_weights(
     if not shards:
         raise ValueError("need at least one shard to compute rule weights")
 
-    # f_r: how many shards rediscovered each rule, and the mean compression
-    # over exactly those f_r shards (not all K) -- the PRD defines C_bar_r as a
-    # mean over the shards that emitted the rule.
+    # f_r: how many shards rediscovered each rule, and the mean compression over exactly those f_r shards (not all K) -- the PRD defines C_bar_r as a mean over the shards that emitted the rule.
     frequency: dict[tuple[frozenset[int], frozenset[int]], int] = {}
     compression_sum: dict[tuple[frozenset[int], frozenset[int]], float] = {}
     for shard in shards:

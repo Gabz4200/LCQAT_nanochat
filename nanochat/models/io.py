@@ -17,10 +17,7 @@ from dataclasses import dataclass
 
 import torch.nn as nn
 
-#: A codebook cardinality: a total level count `K`, or an explicit
-#: ``(m_neg, m_pos)`` split around the zero anchor. Defined here rather than in
-#: `lcqat.retrofit` so that both the contract and its consumer can import it
-#: without a cycle.
+#: A codebook cardinality: a total level count `K`, or an explicit ``(m_neg, m_pos)`` split around the zero anchor. Defined here rather than in `lcqat.retrofit` so that both the contract and its consumer can import it without a cycle.
 CodebookSpec = int | tuple[int, int]
 
 
@@ -63,8 +60,7 @@ class LayerQuantSpec:
 
     def __post_init__(self) -> None:
         if self.output is None:
-            # Inert when the output is not quantized; mirroring the
-            # activation spec is what `LCQATLinear` does when `out_k is None`.
+            # Inert when the output is not quantized; mirroring the activation spec is what `LCQATLinear` does when `out_k is None`.
             object.__setattr__(self, "output", self.activation)
 
     @property

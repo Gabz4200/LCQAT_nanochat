@@ -40,10 +40,7 @@ SCOPE_LAYER = "layer"
 SCOPE_GLOBAL = "global"
 PRUNE_SCOPES = (SCOPE_LAYER, SCOPE_GLOBAL)
 
-#: SparseProp Sec. 4.1: a module stays on the dense kernel until it reaches
-#: this sparsity, then the sparse kernel is chosen by measured forward+backward
-#: time. The paper's own number (80%) is the default; the flag exists because
-#: the crossover is hardware- and shape-dependent.
+#: SparseProp Sec. 4.1: a module stays on the dense kernel until it reaches this sparsity, then the sparse kernel is chosen by measured forward+backward time. The paper's own number (80%) is the default; the flag exists because the crossover is hardware- and shape-dependent.
 DEFAULT_DENSE_THRESHOLD = 0.8
 
 
@@ -110,10 +107,7 @@ class SparsePropLinearFunction(torch.autograd.Function):
         ctx.B = B
         ctx.has_bias = bias is not None
         ctx.x_shape = x.shape  # save original batch shape for backward reshape
-        # Only x and weight are needed by the backward: the CSR/CSC
-        # structures and both gathered value listings are rebuilt from
-        # the saved weight, so they can never go stale relative to the
-        # weight the gradients are computed against.
+        # Only x and weight are needed by the backward: the CSR/CSC structures and both gathered value listings are rebuilt from the saved weight, so they can never go stale relative to the weight the gradients are computed against.
         ctx.save_for_backward(x_flat, weight)
         ctx.mask = mask
         ctx.w_ptr = w_ptr
@@ -126,10 +120,7 @@ class SparsePropLinearFunction(torch.autograd.Function):
             out = x_flat @ weight.t()  # [B, out_f]
         else:
             w_val = gather_values_from_dense(weight, w_col, w_ptr, out_f)
-            # No bias here: the op adds it inside its kernel, and
-            # the dense GEMM cannot take one, so the sparse path
-            # must not either -- bias is applied once, below, on
-            # both paths.
+            # No bias here: the op adds it inside its kernel, and the dense GEMM cannot take one, so the sparse path must not either -- bias is applied once, below, on both paths.
             y = dispatch_sparseprop_forward(
                 x_flat.t(),
                 weight,
@@ -161,24 +152,13 @@ class SparsePropLinearFunction(torch.autograd.Function):
         grad_y_flat = grad_y.reshape(B, out_f)
 
         if ctx.kernel == "dense":
-            # Dense masked GEMMs. The mask multiply zeroes precisely
-            # the positions the sparse walk skips, so the two agree
-            # to fp32 summation-order noise (~1e-7 relative). dX sums
-            # over the already-masked weight, whose pruned entries
-            # hold the exact zero anchor, so that product is
-            # bit-identical.
+            # Dense masked GEMMs. The mask multiply zeroes precisely the positions the sparse walk skips, so the two agree to fp32 summation-order noise (~1e-7 relative). dX sums over the already-masked weight, whose pruned entries hold the exact zero anchor, so that product is bit-identical.
             grad_x_flat = grad_y_flat @ weight  # [B, in_f]
             grad_w = grad_y_flat.t() @ x_flat  # [out_f, in_f]
-            # Zero grad at masked positions (frozen pruned weights).
-            # The multiply is what keeps pruned weights frozen: the
-            # GEMM above computes a gradient at every position,
-            # including ones the sparse walk skipped.
+            # Zero grad at masked positions (frozen pruned weights). The multiply is what keeps pruned weights frozen: the GEMM above computes a gradient at every position, including ones the sparse walk skipped.
             grad_w = grad_w * ctx.mask.to(grad_w.dtype)
         else:
-            # Sparse kernels: gather the weight in both listings from
-            # the saved weight (the dW pass walks CSR, the dX pass
-            # walks CSC), then route through the dispatcher so the
-            # backend choice made at forward time is honoured here.
+            # Sparse kernels: gather the weight in both listings from the saved weight (the dW pass walks CSR, the dX pass walks CSC), then route through the dispatcher so the backend choice made at forward time is honoured here.
             w_val = gather_values_from_dense(weight, ctx.w_col, ctx.w_ptr, out_f)
             w_val_csc = gather_values_from_dense_csc(weight, ctx.w_row, ctx.w_cptr)
             gX, gW_val = dispatch_sparseprop_backward(
@@ -197,10 +177,7 @@ class SparsePropLinearFunction(torch.autograd.Function):
                 backend=ctx.kernel,
             )
             grad_x_flat = gX.t()
-            # Scatter the nnz gradients into the dense [M, K] gradient.
-            # The scatter (not a mask multiply) is what makes pruned
-            # slots *exactly* zero: the sparse backward never computes
-            # a gradient for them, so nothing can accumulate there.
+            # Scatter the nnz gradients into the dense [M, K] gradient. The scatter (not a mask multiply) is what makes pruned slots *exactly* zero: the sparse backward never computes a gradient for them, so nothing can accumulate there.
             grad_w = torch.zeros(out_f, in_f, dtype=weight.dtype, device=weight.device)
             row_idx = _nnz_row_indices(ctx.w_ptr, out_f)
             lin_idx = row_idx.long() * in_f + ctx.w_col.long()
@@ -238,13 +215,7 @@ class SparsePropLinear(Linear):
         bias: whether to include a bias term
     """
 
-    # Class-level default for the kernel choice. The engine's
-    # in-place wrap (DiffusionBlockEngine._reparent_sparseprop_in_place)
-    # swaps the class and adopts the scratch module's buffers, but a
-    # plain attribute like `_kernel_choice` is not a buffer, so a
-    # swapped module would raise AttributeError on its first forward
-    # without this default: it reads the class's None until its own
-    # first forward resolves (and caches) the choice.
+    # Class-level default for the kernel choice. The engine's in-place wrap (DiffusionBlockEngine._reparent_sparseprop_in_place) swaps the class and adopts the scratch module's buffers, but a plain attribute like `_kernel_choice` is not a buffer, so a swapped module would raise AttributeError on its first forward without this default: it reads the class's None until its own first forward resolves (and caches) the choice.
     _kernel_choice: str | None = None
 
     def __init__(
@@ -257,11 +228,7 @@ class SparsePropLinear(Linear):
     ):
         super().__init__(in_features, out_features, bias=bias, device=device)
         self.sparsity = float(sparsity)
-        # Static boolean mask [out, in]. persistent=True: the sparsity pattern is
-        # trained state, and a non-persistent mask means resume silently re-rolls
-        # a random pattern instead of restoring the one the weights were pruned
-        # against. The CSR/CSC structures are buffers (not bare attributes) so
-        # .to(device) moves them and they reach the checkpoint.
+        # Static boolean mask [out, in]. persistent=True: the sparsity pattern is trained state, and a non-persistent mask means resume silently re-rolls a random pattern instead of restoring the one the weights were pruned against. The CSR/CSC structures are buffers (not bare attributes) so .to(device) moves them and they reach the checkpoint.
         self.register_buffer(
             "sparsity_mask",
             torch.zeros(out_features, in_features, dtype=torch.bool, device=device),
@@ -282,12 +249,7 @@ class SparsePropLinear(Linear):
         self.register_buffer(
             "w_row", torch.zeros(0, dtype=torch.int32, device=device), persistent=True
         )
-        # The kernel this layer trains through: None = unresolved (the
-        # first forward after a mask change resolves it, measuring the
-        # paper's Sec. 4.2 crossover), "dense" below the crossover,
-        # the measured winner ("dense" / "cpu" / "gpu") above it.
-        # Plain attribute, not a buffer: it is per-run state, not
-        # checkpointed state -- a resumed run re-measures once.
+        # The kernel this layer trains through: None = unresolved (the first forward after a mask change resolves it, measuring the paper's Sec. 4.2 crossover), "dense" below the crossover, the measured winner ("dense" / "cpu" / "gpu") above it. Plain attribute, not a buffer: it is per-run state, not checkpointed state -- a resumed run re-measures once.
         self._kernel_choice: str | None = None
         self._init_sparsity()
 
@@ -304,8 +266,7 @@ class SparsePropLinear(Linear):
         """Rebuild CSR/CSC index buffers from current mask."""
         mask = self.sparsity_mask
         w_ptr, w_col, w_ptr_csc, w_row = build_csr_csc_from_mask(mask)
-        # Assign through the buffer names so nn.Module keeps the registration
-        # (and moves them on .to(device)); a fresh local would shadow the buffer.
+        # Assign through the buffer names so nn.Module keeps the registration (and moves them on .to(device)); a fresh local would shadow the buffer.
         self.w_ptr = w_ptr
         self.w_col = w_col
         self.w_ptr_csc = w_ptr_csc
@@ -316,11 +277,7 @@ class SparsePropLinear(Linear):
         with torch.no_grad():
             self.weight.data[~self.sparsity_mask] = 0.0
         self._build_sparse_structure()
-        # The mask change may have crossed the dense/sparse crossover in
-        # either direction (a gradual-prune ramp only crosses upward, but
-        # a fresh `_set_mask` can land anywhere), so the kernel choice is
-        # invalidated and re-resolved -- measured again if above the
-        # threshold -- on the next forward.
+        # The mask change may have crossed the dense/sparse crossover in either direction (a gradual-prune ramp only crosses upward, but a fresh `_set_mask` can land anywhere), so the kernel choice is invalidated and re-resolved -- measured again if above the threshold -- on the next forward.
         self._kernel_choice = None
 
     def _set_mask(self, mask: torch.Tensor) -> None:
@@ -381,11 +338,7 @@ class SparsePropLinear(Linear):
         gY = torch.randn(out_f, B, dtype=torch.float32, device=x_flat.device)
         mask_f = self.sparsity_mask.to(effective_weight.dtype)
 
-        # Dense masked GEMM: the path below-threshold layers train on.
-        # gY is in the kernel layout [M, B], so the gradient probes
-        # transpose it to [B, M] first: gX = gY.T @ W, gW = gY @ x.
-        # Probe results are discarded -- the arithmetic is what
-        # is timed, so the expressions stand alone.
+        # Dense masked GEMM: the path below-threshold layers train on. gY is in the kernel layout [M, B], so the gradient probes transpose it to [B, M] first: gX = gY.T @ W, gW = gY @ x. Probe results are discarded -- the arithmetic is what is timed, so the expressions stand alone.
         def _sync() -> None:
             if x_flat.is_cuda:
                 torch.cuda.synchronize()
@@ -421,8 +374,7 @@ class SparsePropLinear(Linear):
         )
 
         def _cpu() -> None:
-            # Forward probe: the output is discarded, the kernel
-            # walk is what is timed.
+            # Forward probe: the output is discarded, the kernel walk is what is timed.
             sparseprop_forward_cpu(
                 x_flat.t(), w_val, self.w_col, self.w_ptr, self.bias, out_f
             )
@@ -512,8 +464,7 @@ class SparsePropLinear(Linear):
             module.weight.copy_(linear.weight)
             if linear.bias is not None:
                 module.bias.copy_(linear.bias)
-            # copy_ into the buffer: a bare attribute assignment would replace the
-            # buffer's tensor object and detach it from the module's device/dtype.
+            # copy_ into the buffer: a bare attribute assignment would replace the buffer's tensor object and detach it from the module's device/dtype.
             module.sparsity_mask.copy_(magnitude_mask(module.weight, sparsity))
             module._apply_mask()
         return module
@@ -539,12 +490,7 @@ class SparsePropLinearLCQAT(SparsePropLinear):
     garbage-collected after its weight/bias/quantizers are re-parented.
     """
 
-    # Re-parented from the wrapped LCQATLinear in `__init__` (only the
-    # quantizers that are not None are present -- a sparse-wrapped layer
-    # whose out_quantizer was None has no such attribute, so readers
-    # must still `getattr` for it). Declared so the checker sees the
-    # real types instead of `Module.__getattr__`; assignments below do
-    # not change (setattr of the same values).
+    # Re-parented from the wrapped LCQATLinear in `__init__` (only the quantizers that are not None are present -- a sparse-wrapped layer whose out_quantizer was None has no such attribute, so readers must still `getattr` for it). Declared so the checker sees the real types instead of `Module.__getattr__`; assignments below do not change (setattr of the same values).
     weight_quantizer: MemoryEfficientLearnedCodebook | None
     act_quantizer: MemoryEfficientLearnedCodebook | None
     out_quantizer: MemoryEfficientLearnedCodebook | None
@@ -556,8 +502,7 @@ class SparsePropLinearLCQAT(SparsePropLinear):
     def __init__(self, lcqat_linear, sparsity: float = 0.75):
         from nanochat.models.quant.linear import is_lcqat_layer
 
-        # Both shapes: a plain LCQATLinear on the first wrap, and an
-        # already-sparse SparsePropLinearLCQAT on a ramp re-wrap.
+        # Both shapes: a plain LCQATLinear on the first wrap, and an already-sparse SparsePropLinearLCQAT on a ramp re-wrap.
         assert is_lcqat_layer(lcqat_linear), (
             f"Expected an LC-QAT layer, got {type(lcqat_linear)}"
         )
@@ -569,17 +514,11 @@ class SparsePropLinearLCQAT(SparsePropLinear):
             bias=lcqat_linear.bias is not None,
             device=lcqat_linear.weight.device,
         )
-        # Re-parent the LCQATLinear's weight/bias into this module so the
-        # codebook quantizers stay live and trainable, and so the module tree
-        # registers every parameter exactly once (sharing the Parameter
-        # object means nn.Module registers it under this module only).
+        # Re-parent the LCQATLinear's weight/bias into this module so the codebook quantizers stay live and trainable, and so the module tree registers every parameter exactly once (sharing the Parameter object means nn.Module registers it under this module only).
         self.weight = lcqat_linear.weight
         if lcqat_linear.bias is not None:
             self.bias = lcqat_linear.bias
-        # Re-parent EVERYTHING the LCQATLinear owns, not just the two primary
-        # quantizers. `out_quantizer` in particular is mandatory: c_q/c_k/c_v and
-        # c_fc carry one, and dropping it silently disables the KV-cache
-        # quantization path and the fused `quantized_mlp_chain`.
+        # Re-parent EVERYTHING the LCQATLinear owns, not just the two primary quantizers. `out_quantizer` in particular is mandatory: c_q/c_k/c_v and c_fc carry one, and dropping it silently disables the KV-cache quantization path and the fused `quantized_mlp_chain`.
         for attr in (
             "weight_quantizer",
             "act_quantizer",
@@ -593,9 +532,7 @@ class SparsePropLinearLCQAT(SparsePropLinear):
         self.K_act = lcqat_linear.K_act
         self.matmul_backend = lcqat_linear.matmul_backend
         self.grad_scale = getattr(lcqat_linear, "grad_scale", "inv_sqrt_n")
-        # Export-time buffers (packed_weight_indices / weight_index_format /
-        # activation_lut) live on _buffers, not as attributes. Copy them so a
-        # re-wrapped module keeps its quantized inference path.
+        # Export-time buffers (packed_weight_indices / weight_index_format / activation_lut) live on _buffers, not as attributes. Copy them so a re-wrapped module keeps its quantized inference path.
         for buf_name, buf in lcqat_linear._buffers.items():
             if buf is None:
                 continue
@@ -604,30 +541,11 @@ class SparsePropLinearLCQAT(SparsePropLinear):
                 buf,
                 persistent=buf_name not in lcqat_linear._non_persistent_buffers_set,
             )
-        # Submodules owned by the LCQATLinear must be re-parented too, not just
-        # its buffers. `learnable_activation_lut` (the D9 learned activation
-        # table) is registered in `_modules` by attach_learnable_activation_luts,
-        # so the buffer copy above misses it and the `NOTE` below discards the
-        # rest of the tree: the table's `logits` / `initial_table` parameters
-        # were silently dropped the moment this wrapper replaced a `c_fc`, and
-        # the checkpoint then saved without them. Loading such a checkpoint
-        # failed the strict load with "unexpected key(s)" for every wrapped
-        # layer. Copy the whole `_modules` mapping, not a fixed attribute list.
+        # Submodules owned by the LCQATLinear must be re-parented too, not just its buffers. `learnable_activation_lut` (the D9 learned activation table) is registered in `_modules` by attach_learnable_activation_luts, so the buffer copy above misses it and the `NOTE` below discards the rest of the tree: the table's `logits` / `initial_table` parameters were silently dropped the moment this wrapper replaced a `c_fc`, and the checkpoint then saved without them. Loading such a checkpoint failed the strict load with "unexpected key(s)" for every wrapped layer. Copy the whole `_modules` mapping, not a fixed attribute list.
         for mod_name, mod in lcqat_linear._modules.items():
             if mod is not None:
                 setattr(self, mod_name, mod)
-        # NOTE: do NOT keep a reference to lcqat_linear as an attribute —
-        # nn.Module.__setattr__ would register it as a submodule, re-registering
-        # its weight/bias/quantizers under a second path and recreating the
-        # orphan + duplicate-parameter bug. The re-parented attributes above are
-        # the only references needed; lcqat_linear is left to be GC'd.
-        #
-        # That is exactly why the *engine-owned* layers must not go through this
-        # path: `apply_lcqat` replaces the adapter/head Linears in place, so
-        # wrapping them here would re-parent a module that is still registered
-        # elsewhere in the tree and duplicate every codebook parameter. The
-        # engine therefore wraps its own layers via `_wrap_sparseprop`.
-        # Apply static sparsity mask (Sparse Transfer) on the shared weight.
+        # NOTE: do NOT keep a reference to lcqat_linear as an attribute — nn.Module.__setattr__ would register it as a submodule, re-registering its weight/bias/quantizers under a second path and recreating the orphan + duplicate-parameter bug. The re-parented attributes above are the only references needed; lcqat_linear is left to be GC'd. That is exactly why the *engine-owned* layers must not go through this path: `apply_lcqat` replaces the adapter/head Linears in place, so wrapping them here would re-parent a module that is still registered elsewhere in the tree and duplicate every codebook parameter. The engine therefore wraps its own layers via `_wrap_sparseprop`. Apply static sparsity mask (Sparse Transfer) on the shared weight.
         _init_sparsity_mask(self, sparsity)
 
     def apply_trained_activation(self, y: torch.Tensor) -> torch.Tensor:
@@ -684,20 +602,11 @@ class SparsePropLinearLCQAT(SparsePropLinear):
 
         # Quantize through codebooks (STE — builds autograd graph to codebook params)
         x_q = self._quantize(self.act_quantizer, x_flat, x_flat.numel())
-        # No post-dequantization mask multiply: pruned positions already hold an
-        # exact 0.0 in the shadow weight, and 0.0 is a codebook *level* (the
-        # zero anchor at index m_neg), so it quantizes to exactly 0.0. The old
-        # `w_q.value * mask` was numerically identical but discarded the anchor,
-        # which cost the codebook any gradient signal from the anchor bin's width
-        # and would have made the exported indices disagree with the sparse
-        # pattern.
+        # No post-dequantization mask multiply: pruned positions already hold an exact 0.0 in the shadow weight, and 0.0 is a codebook *level* (the zero anchor at index m_neg), so it quantizes to exactly 0.0. The old `w_q.value * mask` was numerically identical but discarded the anchor, which cost the codebook any gradient signal from the anchor bin's width and would have made the exported indices disagree with the sparse pattern.
         w_q = self._quantize(self.weight_quantizer, self.weight, self.weight.numel())
 
         bias = self.bias if self.bias is not None else None
-        # The quantized weight value is what actually flows through the
-        # layer, so it is the weight the kernel choice is measured
-        # against (the structures are built from the mask, which matches
-        # the pruned positions of the quantized value).
+        # The quantized weight value is what actually flows through the layer, so it is the weight the kernel choice is measured against (the structures are built from the mask, which matches the pruned positions of the quantized value).
         kernel = self._resolve_kernel(w_q.value, x)
         out = SparsePropLinearFunction.apply(
             x_q.value,
@@ -713,15 +622,7 @@ class SparsePropLinearLCQAT(SparsePropLinear):
 
         if orig_shape[:-1] != out.shape[:-1] or out.shape[-1] != self.out_features:
             out = out.reshape(*orig_shape[:-1], self.out_features)
-        # Output quantization, mirroring `LCQATLinear.forward`.
-        #
-        # This was missing, and that was not a speedup -- it was a silent change
-        # to what SparseProp trains. `__init__` re-parents `out_quantizer` (it
-        # must, or c_q/c_k/c_v and c_fc lose it and the KV-cache quantization
-        # path dies), but the forward never called it. Every SparseProp run was
-        # therefore training the 24 layers that carry an out_quantizer with an
-        # *unquantized* output, unlike the dense layer, which made the sparse arm
-        # look ~30-47% faster end to end because it was doing less work.
+        # Output quantization, mirroring `LCQATLinear.forward`. This was missing, and that was not a speedup -- it was a silent change to what SparseProp trains. `__init__` re-parents `out_quantizer` (it must, or c_q/c_k/c_v and c_fc lose it and the KV-cache quantization path dies), but the forward never called it. Every SparseProp run was therefore training the 24 layers that carry an out_quantizer with an *unquantized* output, unlike the dense layer, which made the sparse arm look ~30-47% faster end to end because it was doing less work.
         if getattr(self, "out_quantizer", None) is not None:
             out = self._quantize(self.out_quantizer, out, out.numel()).value
         return out
@@ -841,25 +742,20 @@ def magnitude_mask(weight: torch.Tensor, sparsity: float) -> torch.Tensor:
     if sparsity <= 0.0:
         return torch.ones(out_f, in_f, dtype=torch.bool, device=weight.device)
     if sparsity >= 1.0:
-        # An all-zero layer annihilates the input; every row keeps exactly one
-        # entry (the largest) so the layer stays rank-1 rather than dead.
+        # An all-zero layer annihilates the input; every row keeps exactly one entry (the largest) so the layer stays rank-1 rather than dead.
         keep = 1
     else:
         keep = max(1, round(in_f * (1.0 - sparsity)))
     if keep >= in_f:
         return torch.ones(out_f, in_f, dtype=torch.bool, device=weight.device)
     magnitudes = weight.detach().abs().float()
-    # topk over the flattened row; -inf at pruned positions keeps a uniform
-    # threshold mask on ties instead of an arbitrary subset.
+    # topk over the flattened row; -inf at pruned positions keeps a uniform threshold mask on ties instead of an arbitrary subset.
     threshold = magnitudes.topk(keep, dim=1).values[:, -1:].contiguous()
     mask = magnitudes >= threshold
-    # Rows whose top-`keep` threshold is exactly 0.0 are all-zero rows, which the
-    # `>=` above keeps entirely. Fall back to a topk selection for those, so
-    # the per-row keep count is honoured regardless of the weight values.
+    # Rows whose top-`keep` threshold is exactly 0.0 are all-zero rows, which the `>=` above keeps entirely. Fall back to a topk selection for those, so the per-row keep count is honoured regardless of the weight values.
     degenerate = threshold.squeeze(1) == 0.0
     if bool(degenerate.any()):
-        # `topk` on the magnitudes: positions with the largest |W| survive, ties
-        # resolved by index order, which is deterministic.
+        # `topk` on the magnitudes: positions with the largest |W| survive, ties resolved by index order, which is deterministic.
         order = magnitudes.topk(keep, dim=1).indices
         fallback = torch.zeros_like(mask)
         fallback.scatter_(1, order, True)
@@ -910,11 +806,9 @@ def apply_global_pruning(
         )
         if target_nnz > 0:
             threshold = magnitudes.topk(target_nnz).values[-1]
-            # `>=` may keep more than target_nnz under ties; that is fine (the
-            # achieved sparsity is recomputed below and reported truthfully).
+            # `>=` may keep more than target_nnz under ties; that is fine (the achieved sparsity is recomputed below and reported truthfully).
             flat_mask = magnitudes >= threshold
-        # 2. Intersect with what is already kept (monotonicity), then
-        #    re-impose the per-row guarantee on the survivors.
+        # 2. Intersect with what is already kept (monotonicity), then re-impose the per-row guarantee on the survivors.
         offset = 0
         for module in modules:
             n = module.weight.numel()
@@ -978,10 +872,7 @@ def inject_sparseprop_layers(
             if isinstance(module, SparsePropLinearLCQAT):
                 continue
             if isinstance(module, LCQATLinear):
-                # SparsePropLinearLCQAT absorbs the LCQATLinear's weight/
-                # quantizers in-tree and does not retain the LCQATLinear as a
-                # submodule, so any LCQATLinear seen here is a genuine one to
-                # wrap (no orphan-skip needed).
+                # SparsePropLinearLCQAT absorbs the LCQATLinear's weight/ quantizers in-tree and does not retain the LCQATLinear as a submodule, so any LCQATLinear seen here is a genuine one to wrap (no orphan-skip needed).
                 kind = "lcqat"
         else:
             if isinstance(module, LCQATLinear):

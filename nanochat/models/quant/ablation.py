@@ -122,10 +122,7 @@ class StrictLearnableGrid(nn.Module):
                 f"{high_init} <= {low_init}"
             )
 
-        # Slack must be strictly positive: a zero (or negative) slack has no
-        # inverse softplus, it would put raw_span at -inf and freeze the grid at
-        # exactly min_spacing, which is the collapsed configuration this class
-        # exists to avoid.
+        # Slack must be strictly positive: a zero (or negative) slack has no inverse softplus, it would put raw_span at -inf and freeze the grid at exactly min_spacing, which is the collapsed configuration this class exists to avoid.
         slack = high_init - low_init - self.min_span
         if slack <= 0.0:
             raise ValueError(
@@ -176,8 +173,7 @@ class StrictLearnableGrid(nn.Module):
         return floor + (1.0 - self.intervals * floor) * weights
 
 
-# A falloff argument: a Python number, or a scalar/broadcastable tensor (which
-# keeps the center and the radius learnable).
+# A falloff argument: a Python number, or a scalar/broadcastable tensor (which keeps the center and the radius learnable).
 FalloffScalar = float | torch.Tensor
 
 # Signature shared by the kernels and the registry: (x, center, radius) -> Tensor.
@@ -435,8 +431,7 @@ def _soft_codebook_weights(
             device=x32.device,
         )
 
-    # Clamp inputs into the learned domain before computing distances.
-    # This avoids inf-driven NaNs and gives sane endpoint behavior.
+    # Clamp inputs into the learned domain before computing distances. This avoids inf-driven NaNs and gives sane endpoint behavior.
     x_clamped = torch.minimum(torch.maximum(x32, c32[0]), c32[-1])
 
     temp = _grid_temperature(c32, sharpness)
@@ -448,8 +443,7 @@ def _soft_codebook_weights(
     d_min = dist.amin(dim=-1, keepdim=True)
     rel = dist - d_min
 
-    # Keep logits in a sane range. sqrt(50) gives logits >= -50,
-    # which is already effectively zero weight but avoids overflow/underflow.
+    # Keep logits in a sane range. sqrt(50) gives logits >= -50, which is already effectively zero weight but avoids overflow/underflow.
     rel = torch.clamp(rel, min=0.0, max=math.sqrt(50.0))
 
     logits = -rel * rel
@@ -497,8 +491,7 @@ def _falloff_weights(
     # Reuse `sharpness` to derive the falloff radius.
     radius = _grid_temperature(c32, sharpness)
 
-    # The existing `falloff()` implementation expects a 1-D axis. Flatten the
-    # pairwise problem into a 1-D problem, then reshape back.
+    # The existing `falloff()` implementation expects a 1-D axis. Flatten the pairwise problem into a 1-D problem, then reshape back.
     x_expanded = x_flat.unsqueeze(-1).expand(n, k).reshape(-1)
     c_expanded = c32.unsqueeze(0).expand(n, k).reshape(-1)
 
@@ -554,8 +547,7 @@ def _piecewise_linear_lookup(
 
     denom = x1 - x0
 
-    # StrictLearnableGrid should make denom > 0. This guard avoids division by
-    # zero in pathological dtype/rounding cases.
+    # StrictLearnableGrid should make denom > 0. This guard avoids division by zero in pathological dtype/rounding cases.
     scale = torch.clamp_min(
         torch.maximum(x0.abs(), x1.abs()),
         torch.finfo(xs32.dtype).tiny,
@@ -673,8 +665,7 @@ class LearnableLinearLut(nn.Module):
                 kind=self.falloff_kind,
             )
 
-            # Normalize when there is mass. If compact-support falloffs give zero
-            # mass, fall back to the softmax kernel so the lookup stays defined.
+            # Normalize when there is mass. If compact-support falloffs give zero mass, fall back to the softmax kernel so the lookup stays defined.
             denom = raw_weights.sum(dim=-1, keepdim=True)
             eps = torch.finfo(raw_weights.dtype).eps
 
@@ -691,8 +682,7 @@ class LearnableLinearLut(nn.Module):
                 fallback_weights,
             )
 
-        # weights: x.shape + (K,)
-        # codebook: (K,)
+        # weights: x.shape + (K,) codebook: (K,)
         out = (weights * codebook.to(torch.float32)).sum(dim=-1)
 
         return out.to(codebook.dtype)
@@ -844,8 +834,7 @@ class LearnableActivationLut(nn.Module):
             else _finite_float("y_high_init", y_high_init)
         )
 
-        # The y-values are free parameters. They do not need to be increasing
-        # unless you explicitly want a monotonic activation.
+        # The y-values are free parameters. They do not need to be increasing unless you explicitly want a monotonic activation.
         self.codebook_y = nn.Parameter(
             torch.linspace(y_low, y_high, n_points, dtype=dtype_y)
         )
@@ -899,8 +888,7 @@ class LearnableActivationLut(nn.Module):
             raise ValueError(f"fit must be 'exact' or 'lsq', got {fit!r}")
 
         if min_spacing is None:
-            # Strictly below uniform so the grid is initially strictly
-            # increasing without letting the slack swallow the domain.
+            # Strictly below uniform so the grid is initially strictly increasing without letting the slack swallow the domain.
             min_spacing = (high - low) / (n_points - 1) * 0.5
         min_spacing = _finite_float("min_spacing", min_spacing)
         if min_spacing <= 0.0:
@@ -921,9 +909,7 @@ class LearnableActivationLut(nn.Module):
             if fit == "exact":
                 ys = act_fn(xs).to(torch.float32)
             else:
-                # Least squares against a dense sample: the interpolant matches
-                # the function in a least-squares sense over the whole domain,
-                # not just at the knots, which is what a coarse grid needs.
+                # Least squares against a dense sample: the interpolant matches the function in a least-squares sense over the whole domain, not just at the knots, which is what a coarse grid needs.
                 dense = torch.linspace(low, high, max(256, n_points * 32))
                 target = act_fn(dense.to(torch.float32))
                 basis = _linear_interpolation_basis(dense, xs)
@@ -951,19 +937,12 @@ class LearnableActivationLut(nn.Module):
                 sharpness=self.sharpness,
             )
 
-            # weights: x.shape + (K,)
-            # ys: (K,)
+            # weights: x.shape + (K,) ys: (K,)
             out = (weights * ys.to(torch.float32)).sum(dim=-1)
 
             return out.to(ys.dtype)
 
-        # self.mode == "falloff"
-        #
-        # Requested behavior:
-        #   f(x) = sum_i falloff(x; codebook_x_i, radius) * codebook_y_i
-        #
-        # This is intentionally left unnormalized. It is a smooth basis-function
-        # expansion centered on the learned x-knots.
+        # self.mode == "falloff" Requested behavior: f(x) = sum_i falloff(x; codebook_x_i, radius) * codebook_y_i This is intentionally left unnormalized. It is a smooth basis-function expansion centered on the learned x-knots.
         weights = _falloff_weights(
             x=x,
             centers=xs,
@@ -1136,16 +1115,7 @@ class ValueCenteredQuantizationLUT(nn.Module):
                 persistent=True,
             )
 
-        # Shared magnitude codebook:
-        #
-        #   [0, m_1, m_2, ..., m_n]
-        #
-        # The full centered codebook is:
-        #
-        #   [-m_n, ..., -m_2, -m_1, center, m_1, m_2, ..., m_n]
-        #
-        # Because the same magnitude LUT is used on both sides, the function is
-        # symmetric around the center by construction.
+        # Shared magnitude codebook: [0, m_1, m_2, ..., m_n] The full centered codebook is: [-m_n, ..., -m_2, -m_1, center, m_1, m_2, ..., m_n] Because the same magnitude LUT is used on both sides, the function is symmetric around the center by construction.
         self.magnitude_lut = LearnableLinearLut(
             n_points=n_side + 1,
             low_init=0.0,
@@ -1158,9 +1128,7 @@ class ValueCenteredQuantizationLUT(nn.Module):
             falloff_kind=falloff_kind,
         )
 
-        # The magnitude codebook must start at zero. The center itself is
-        # handled by `self.center`, so the side LUT's zero endpoint should not
-        # drift away from 0.
+        # The magnitude codebook must start at zero. The center itself is handled by `self.center`, so the side LUT's zero endpoint should not drift away from 0.
         with torch.no_grad():
             self.magnitude_lut.codebook.low.fill_(0.0)
         self.magnitude_lut.codebook.low.requires_grad_(False)
@@ -1210,17 +1178,12 @@ class ValueCenteredQuantizationLUT(nn.Module):
 
         guard = self.sign_guard
 
-        # If strict sign preservation is required, make sure every nonzero
-        # radius produces a strictly positive magnitude. Without this, soft
-        # lookup responses can numerically collapse to zero near the center.
+        # If strict sign preservation is required, make sure every nonzero radius produces a strictly positive magnitude. Without this, soft lookup responses can numerically collapse to zero near the center.
         if self.strict_sign:
             guard = max(guard, torch.finfo(torch.float32).eps)
 
         if guard > 0.0:
-            # `guard * r` is monotonic, zero at r=0, and positive for r>0.
-            # Taking the maximum preserves non-negativity and helps enforce:
-            #   x > center -> f(x) > center
-            #   x < center -> f(x) < center
+            # `guard * r` is monotonic, zero at r=0, and positive for r>0. Taking the maximum preserves non-negativity and helps enforce: x > center -> f(x) > center x < center -> f(x) < center
             g = torch.maximum(g, guard * r)
         else:
             g = g.clamp_min(0.0)
@@ -1246,8 +1209,7 @@ class ValueCenteredQuantizationLUT(nn.Module):
         if r_flat.numel() == 0:
             return torch.empty_like(r, dtype=torch.float32)
 
-        # Clamp for nearest-neighbor search so +inf saturates to the largest
-        # magnitude codebook entry.
+        # Clamp for nearest-neighbor search so +inf saturates to the largest magnitude codebook entry.
         r_search = torch.clamp(r_flat, min=centers[0], max=centers[-1])
 
         idx = torch.searchsorted(centers, r_search)
@@ -1262,15 +1224,7 @@ class ValueCenteredQuantizationLUT(nn.Module):
         choose_left = d_left <= d_right
         idx = torch.where(choose_left, left, right)
 
-        # Strict sign preservation:
-        #
-        # If r > 0, do not allow quantization to the zero magnitude. This
-        # enforces:
-        #
-        #   x > center -> f(x) > center
-        #   x < center -> f(x) < center
-        #
-        # If you want classic deadzone quantization, set strict_sign=False.
+        # Strict sign preservation: if r > 0, quantize away from the zero magnitude (x > center -> f(x) > center, x < center -> f(x) < center); set strict_sign=False for classic deadzone quantization.
         if self.strict_sign and k > 1:
             idx = torch.where(
                 (idx == 0) & (r_flat > 0),
@@ -1292,23 +1246,11 @@ class ValueCenteredQuantizationLUT(nn.Module):
         d = x32 - center32
         r = d.abs()
 
-        # sign(d) gives the correct side of the center.
-        #
-        # At d == 0, sign(d) == 0, and the magnitude response is also zero,
-        # so the output is exactly center.
+        # sign(d) gives the correct side of the center. At d == 0, sign(d) == 0, and the magnitude response is also zero, so the output is exactly center.
         unit = torch.sign(d)
 
         if self.ste:
-            # QAT-style forward:
-            #
-            #   forward value: hard snapped codebook value
-            #   backward gradient: differentiable soft surrogate
-            #
-            # The expression:
-            #
-            #   hard + (soft - soft.detach())
-            #
-            # has the numerical value of `hard`, but the gradient of `soft`.
+            # QAT-style forward: forward value is the hard snapped codebook value, backward gradient is the differentiable soft surrogate; hard + (soft - soft.detach()) has the numerical value of `hard` but the gradient of `soft`.
             hard_mag = self._hard_magnitude(r)
             hard_out = center32 + unit * hard_mag
 

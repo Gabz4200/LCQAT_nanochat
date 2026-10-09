@@ -40,10 +40,7 @@ from nanochat.models.quant.codebook import (
 )
 from nanochat.models.quant.packing import index_dtype_for_k
 
-#: Guard for the inverse-softplus branch: `_inverse_softplus` takes a log of a
-#: quantity that goes to 0 as the target does, so an exact-zero target would
-#: produce -inf. That never reaches the result (see `raw_for_magnitudes`), but
-#: computing it would poison any gradient flowing through the masked branch.
+#: Guard for the inverse-softplus branch: `_inverse_softplus` takes a log of a quantity that goes to 0 as the target does, so an exact-zero target would produce -inf. That never reaches the result (see `raw_for_magnitudes`), but computing it would poison any gradient flowing through the masked branch.
 _MAGNITUDE_EPS = 1e-12
 
 
@@ -118,14 +115,7 @@ class PerChannelValueCenteredQuantizer(nn.Module):
         else:
             self.register_buffer("centers", centers)
 
-        # `m_neg + 1` and `m_pos + 1` magnitudes, one ladder per arm, both
-        # starting at zero at the centre. Each arm's high bound is the distance
-        # from the centre to that side's extreme -- `abs(init_min)` below and
-        # `init_max` above -- *not* `init_max - init_min`. Using the span makes
-        # the table asymmetric about the centre: for `init_min=-100,
-        # init_max=100` it produced `[-100, -67, -33, 0, 67, 133, 200]`, so the
-        # top level overshot by 2x and every positive value small enough to
-        # matter bucketized onto the anchor.
+        # `m_neg + 1` and `m_pos + 1` magnitudes, one ladder per arm, both starting at zero at the centre. Each arm's high bound is the distance from the centre to that side's extreme -- `abs(init_min)` below and `init_max` above -- *not* `init_max - init_min`. Using the span makes the table asymmetric about the centre: for `init_min=-100, init_max=100` it produced `[-100, -67, -33, 0, 67, 133, 200]`, so the top level overshot by 2x and every positive value small enough to matter bucketized onto the anchor.
         #
         self.raw_neg = nn.Parameter(
             self._inverse_softplus_linspace(init_min, m_neg + 1, num_channels)
@@ -173,12 +163,7 @@ class PerChannelValueCenteredQuantizer(nn.Module):
         strictly positive away from zero, so a level can be pulled in but never
         onto its neighbour.
         """
-        # Each arm's magnitude ladder starts at 0 and grows outward, so the
-        # leading zero is dropped and the rest reversed for the negative side.
-        # The drop has to happen *before* the flip: slicing after the flip would
-        # discard the largest magnitude instead of the zero, leaving the
-        # outermost level off the table and putting a spurious `0.0` next to the
-        # real anchor.
+        # Each arm's magnitude ladder starts at 0 and grows outward, so the leading zero is dropped and the rest reversed for the negative side. The drop has to happen *before* the flip: slicing after the flip would discard the largest magnitude instead of the zero, leaving the outermost level off the table and putting a spurious `0.0` next to the real anchor.
         neg = torch.flip(self._magnitudes(self.raw_neg)[:, 1:], dims=(1,))
         pos = self._magnitudes(self.raw_pos)[:, 1:]
         c = self.centers.reshape(-1, 1)
@@ -218,27 +203,18 @@ class PerChannelValueCenteredQuantizer(nn.Module):
         # Per-row boundaries: `[C, K-1]`, broadcast over the leading axes.
         mids = (codebook[:, :-1] + codebook[:, 1:]) * 0.5
         flat = x_fp32.reshape(-1, self.num_channels)
-        # One batched search over `[C]` boundary sets rather than `C` calls:
-        # `torch.searchsorted` takes a batched `sorted_sequence` (one `[K-1]`
-        # boundary row per channel) against a `[C, N]` value matrix, which
-        # `torch.bucketize` cannot express. `.t()` puts the channel axis first;
-        # both operands are made contiguous because searchsorted copies strided
-        # inputs internally, which warns once per process and in a test run
-        # surfaces as a stray warning attributed to this module.
+        # One batched search over `[C]` boundary sets rather than `C` calls: `torch.searchsorted` takes a batched `sorted_sequence` (one `[K-1]` boundary row per channel) against a `[C, N]` value matrix, which `torch.bucketize` cannot express. `.t()` puts the channel axis first; both operands are made contiguous because searchsorted copies strided inputs internally, which warns once per process and in a test run surfaces as a stray warning attributed to this module.
         idx_flat = torch.searchsorted(
             mids.detach().contiguous(), flat.detach().t().contiguous()
         ).t()
         idx = idx_flat.reshape(x_fp32.shape)
 
-        # Row-wise gather: `codebook[c, idx[..., c]]` for every element. The
-        # leading axes are flattened together, so the lookup is one `[N, C]`
-        # index into a `[C, K]` table and works for any input rank.
+        # Row-wise gather: `codebook[c, idx[..., c]]` for every element. The leading axes are flattened together, so the lookup is one `[N, C]` index into a `[C, K]` table and works for any input rank.
         dequant = codebook[
             torch.arange(self.num_channels, device=x.device).unsqueeze(0),
             idx_flat,
         ].reshape(x_fp32.shape)
-        # STE: identity on the input, live gather on the codebook, so both the
-        # weight and the per-channel deltas receive gradient.
+        # STE: identity on the input, live gather on the codebook, so both the weight and the per-channel deltas receive gradient.
         x_q = dequant + (x_fp32 - x_fp32.detach())
         return QuantizedOutput(
             value=x_q.to(x.dtype),
@@ -266,18 +242,10 @@ class PerChannelValueCenteredQuantizer(nn.Module):
         flat = x.detach().reshape(-1, self.num_channels).to(torch.float32)
         lo = torch.quantile(flat, (100.0 - percentile) / 100.0, dim=0)
         hi = torch.quantile(flat, percentile / 100.0, dim=0)
-        # Guard a degenerate channel: an all-constant column has zero range, which
-        # gives a zero-width table whose levels all sit on the anchor -- so every
-        # value buckets to index `m_neg`, the codebook gets zero gradient, and the
-        # channel is frozen for good. `span` therefore carries the floor, and the
-        # per-arm bound is driven off `centre +/- span/2` rather than off the
-        # channel's own (possibly zero) extent. Clamping the extent to a floor
-        # does not work: the floor is a *maximum* on the width, so a zero-width
-        # channel still comes out as zero-width and still duplicates levels.
+        # Guard a degenerate channel: an all-constant column has zero range, which gives a zero-width table whose levels all sit on the anchor -- so every value buckets to index `m_neg`, the codebook gets zero gradient, and the channel is frozen for good. `span` therefore carries the floor, and the per-arm bound is driven off `centre +/- span/2` rather than off the channel's own (possibly zero) extent. Clamping the extent to a floor does not work: the floor is a *maximum* on the width, so a zero-width channel still comes out as zero-width and still duplicates levels.
         span = torch.maximum((hi - lo).abs(), torch.full_like(hi, 1e-3))
         half = span * 0.5
-        # Per channel, not shared: collapsing to one bound across channels is
-        # exactly the compromise this module exists to avoid.
+        # Per channel, not shared: collapsing to one bound across channels is exactly the compromise this module exists to avoid.
         self._copy_magnitudes(self.raw_neg, torch.clamp(half, min=1e-3))
         self._copy_magnitudes(self.raw_pos, torch.clamp(half, min=1e-3))
 

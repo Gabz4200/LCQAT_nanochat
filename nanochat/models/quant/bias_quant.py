@@ -49,9 +49,7 @@ from nanochat.models.quant.packing import index_dtype_for_k
 if TYPE_CHECKING:
     from nanochat.models.quant.ablation_metrics import ReconstructionResult
 
-#: Default level count for the bias codebook. Matches `K_act`'s shipped default
-#: so enabling this on one layer and not another does not change which of the
-#: three terms is the coarse one.
+#: Default level count for the bias codebook. Matches `K_act`'s shipped default so enabling this on one layer and not another does not change which of the three terms is the coarse one.
 DEFAULT_K_BIAS = 15
 
 
@@ -100,9 +98,7 @@ class BiasQuantizer(nn.Module):
             raise ValueError(f"out_features must be an int, got {out_features!r}")
         if out_features < 1:
             raise ValueError(f"out_features must be >= 1, got {out_features}")
-        # Re-validated rather than trusted: a bad `grad_scale` here would
-        # silently pick a branch, which is the one outcome this module exists
-        # to rule out. Imported lazily because `linear.py` imports this module.
+        # Re-validated rather than trusted: a bad `grad_scale` here would silently pick a branch, which is the one outcome this module exists to rule out. Imported lazily because `linear.py` imports this module.
         from nanochat.models.quant.linear import GRAD_SCALES
 
         if grad_scale not in GRAD_SCALES:
@@ -111,8 +107,7 @@ class BiasQuantizer(nn.Module):
             )
         self.grad_scale = grad_scale
         self.out_features = out_features
-        # `linear.py` imports this module, so the codebook factory is imported
-        # lazily for the same reason the grad-scale table is.
+        # `linear.py` imports this module, so the codebook factory is imported lazily for the same reason the grad-scale table is.
         from nanochat.models.quant.linear import _make_codebook
 
         self.codebook = _make_codebook(
@@ -163,10 +158,7 @@ class BiasQuantizer(nn.Module):
         model than the flag says.
         """
         self._check_shape(bias)
-        # Imported lazily: `linear.py` imports this module, so a module-level
-        # import would be circular. The quantizer body itself is shared rather
-        # than reimplemented -- a second copy of the dual-gradient expression
-        # would be free to drift from the weight path's.
+        # Imported lazily: `linear.py` imports this module, so a module-level import would be circular. The quantizer body itself is shared rather than reimplemented -- a second copy of the dual-gradient expression would be free to drift from the weight path's.
         from nanochat.models.quant.linear import quantize_with_ste
 
         return quantize_with_ste(self.codebook, bias, bias.numel(), self.grad_scale)
@@ -215,11 +207,7 @@ class BiasQuantizer(nn.Module):
             return
         lo = torch.quantile(flat, (100.0 - percentile) / 100.0)
         hi = torch.quantile(flat, percentile / 100.0)
-        # The floor is on the *span*, for the same reason `per_channel.py` puts
-        # it there: clamping the extent to a floor is a maximum on the width, so
-        # a near-constant column would still come out near-zero-wide and still
-        # duplicate levels. The all-identical case returned above; this catches
-        # the merely tiny one.
+        # The floor is on the *span*, for the same reason `per_channel.py` puts it there: clamping the extent to a floor is a maximum on the width, so a near-constant column would still come out near-zero-wide and still duplicate levels. The all-identical case returned above; this catches the merely tiny one.
         span = float(torch.clamp((hi - lo).abs(), min=1e-3))
         fitted = MemoryEfficientLearnedCodebook(
             m_neg=self.codebook.m_neg,
@@ -230,9 +218,7 @@ class BiasQuantizer(nn.Module):
             if self.codebook.raw_pos_deltas is not None
             else self.codebook.compiled_codebook.device,
         )
-        # Copy rather than swap: `self.codebook` may already have parameters in
-        # an optimizer's param groups (or `del`-ed by compile_for_inference),
-        # and replacing the module would orphan them mid-training.
+        # Copy rather than swap: `self.codebook` may already have parameters in an optimizer's param groups (or `del`-ed by compile_for_inference), and replacing the module would orphan them mid-training.
         for name in ("raw_pos_deltas", "raw_neg_deltas"):
             src = getattr(fitted, name, None)
             dst = getattr(self.codebook, name, None)
@@ -291,8 +277,7 @@ def _reconstruct(
     one -- gather by index, score with `quantization_error`, count used levels
     -- so the three arms of the report are directly comparable.
     """
-    # Imported lazily: `ablation_metrics` imports `linear`, which imports this
-    # module, so a module-level import would be circular.
+    # Imported lazily: `ablation_metrics` imports `linear`, which imports this module, so a module-level import would be circular.
     from nanochat.models.quant.ablation_metrics import (
         ReconstructionResult,
         quantization_error,

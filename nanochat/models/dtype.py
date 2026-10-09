@@ -30,16 +30,14 @@ def _detect_compute_dtype() -> tuple[torch.dtype, str]:
             )
         return _DTYPE_MAP[env], f"set via NANOCHAT_DTYPE={env}"
     if torch.cuda.is_available():
-        # bf16 requires SM 80+ (Ampere: A100, A10, etc.)
-        # Older GPUs like V100 (SM 70) and T4 (SM 75) only have fp16 tensor cores
+        # bf16 requires SM 80+ (Ampere: A100, A10, etc.) Older GPUs like V100 (SM 70) and T4 (SM 75) only have fp16 tensor cores
         capability = torch.cuda.get_device_capability()
         if capability >= (8, 0):
             return (
                 torch.bfloat16,
                 f"auto-detected: CUDA SM {capability[0]}{capability[1]} (bf16 supported)",
             )
-        # fp16 training requires GradScaler (not yet implemented), so fall back to fp32.
-        # Users can still force fp16 via NANOCHAT_DTYPE=float16 if they know what they're doing.
+        # fp16 training requires GradScaler (not yet implemented), so fall back to fp32. Users can still force fp16 via NANOCHAT_DTYPE=float16 if they know what they're doing.
         return (
             torch.float32,
             f"auto-detected: CUDA SM {capability[0]}{capability[1]} "

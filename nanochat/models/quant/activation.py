@@ -36,33 +36,13 @@ import torch.nn as nn
 
 from nanochat.models.quant.lut import get_activation
 
-#: Floor on the inverse-square distance. Without it an input sitting exactly on a
-#: knot divides by zero. Matches `ablation/simple.py`.
+#: Floor on the inverse-square distance. Without it an input sitting exactly on a knot divides by zero. Matches `ablation/simple.py`.
 RBF_EPS = 1e-6
 
-#: Selector scale in units of the median knot spacing squared. The unscaled form
-#: saturates in FP32 at realistic K: at K=15 the gap is ~0.14, so the nearest
-#: knot scores ~770 against ~48 for its neighbour, a softmax argument gap of
-#: ~700, and everything off-diagonal underflows to exactly 0 -- the table then
-#: trains nothing while looking healthy. At 1.0 the nearest knot scores ~16
-#: against ~2 (`exp(14)`, comfortably representable), so every knot keeps a
-#: live gradient. Same reasoning as `PROXIMITY_SCALE_GRID_UNITS`, and measured
-#: rather than assumed.
-#:
-#: This governs *training* only. The initializer deliberately does NOT use it
-#: (see `FIT_SHARPNESS_REFERENCE`): fitting needs a near-delta basis, and
-#: conflating the two costs ~30x in fit error. Measured on relu^2 over [-1,1]
-#: with 5 basis functions: 0.025 at the unscaled reference vs 0.99 at the
-#: training scale. The two regimes want genuinely different selectors, so the
-#: initializer carries its own constant rather than borrowing this one.
+#: : Selector scale in units of the median knot spacing squared. The unscaled form saturates in FP32 at realistic K: at K=15 the gap is ~0.14, so the nearest knot scores ~770 against ~48 for its neighbour, a softmax argument gap of ~700, and everything off-diagonal underflows to exactly 0 -- the table then trains nothing while looking healthy. At 1.0 the nearest knot scores ~16 against ~2 (`exp(14)`, comfortably representable), so every knot keeps a live gradient. Same reasoning as `PROXIMITY_SCALE_GRID_UNITS`, and measured rather than assumed. : This governs *training* only. The initializer deliberately does NOT use it (see `FIT_SHARPNESS_REFERENCE`): fitting needs a near-delta basis, and conflating the two costs ~30x in fit error. Measured on relu^2 over [-1,1] with 5 basis functions: 0.025 at the unscaled reference vs 0.99 at the training scale. The two regimes want genuinely different selectors, so the initializer carries its own constant rather than borrowing this one.
 RBF_SCALE_GRID_UNITS = 1.0
 
-#: Grid-relative sharpness the *initializer* fits at, i.e. the training scale
-#: omitted. A near-delta basis (weight -> 1/eps at the nearest knot, 0
-#: elsewhere) is a piecewise-linear interpolator with a smooth seam, which is
-#: exactly what an activation fit wants. Gradients flow to the knots during the
-#: fit because Adam moves the knots off their initial on-grid positions in the
-#: first step, so `diff` is no longer 0 at the nearest knot.
+#: Grid-relative sharpness the *initializer* fits at, i.e. the training scale omitted. A near-delta basis (weight -> 1/eps at the nearest knot, 0 elsewhere) is a piecewise-linear interpolator with a smooth seam, which is exactly what an activation fit wants. Gradients flow to the knots during the fit because Adam moves the knots off their initial on-grid positions in the first step, so `diff` is no longer 0 at the nearest knot.
 FIT_SHARPNESS_REFERENCE = 0.0
 
 #: Activation bodies `--lcqat-act-body` can select.
@@ -120,9 +100,7 @@ class SmoothPWL(nn.Module):
         self.act_name = act_name
         self.zero_pin = bool(zero_pin)
 
-        # All three free. Constraining any of them would narrow a family that
-        # measured strictly better than the fixed-grid alternative, with no
-        # measured reason to constrain (HANDOFF §10.2.3).
+        # All three free. Constraining any of them would narrow a family that measured strictly better than the fixed-grid alternative, with no measured reason to constrain (HANDOFF §10.2.3).
         self.index = nn.Parameter(
             torch.linspace(-init_range, init_range, self.knots_count)
         )
@@ -130,14 +108,7 @@ class SmoothPWL(nn.Module):
         self.bias = nn.Parameter(torch.full((self.knots_count,), float(init_bias)))
 
         if self.zero_pin:
-            # The knot nearest the origin is the one whose basis would
-            # otherwise carry x through the intercept term at x=0. Pinning its
-            # bias to exactly -0.0 is a no-op numerically, so the exact zero
-            # comes from pinning the *output*: at x=0 the basis is dominated by
-            # the knot at 0, and `w_j * 0 + b_j` = b_j = 0. The pin therefore
-            # holds the knot at exactly 0.0 AND its bias at exactly 0.0, which
-            # makes the emitted value at x=0 exactly 0.0 while every other x
-            # remains free.
+            # The knot nearest the origin is the one whose basis would otherwise carry x through the intercept term at x=0. Pinning its bias to exactly -0.0 is a no-op numerically, so the exact zero comes from pinning the *output*: at x=0 the basis is dominated by the knot at 0, and `w_j * 0 + b_j` = b_j = 0. The pin therefore holds the knot at exactly 0.0 AND its bias at exactly 0.0, which makes the emitted value at x=0 exactly 0.0 while every other x remains free.
             pinned = int(torch.argmin(self.index.detach().abs()).item())
             mask = torch.zeros(self.knots_count, dtype=torch.bool)
             mask[pinned] = True
@@ -167,9 +138,7 @@ class SmoothPWL(nn.Module):
         fn = get_activation(self.act_name) if act_fn is None else act_fn
         with torch.no_grad():
             span = float(self.index.detach().abs().max())
-        # A denser sample grid than the RBF basis: the fit is scored between the
-        # knots too, where the body is only an approximation, and 64 points for 5
-        # basis functions would leave most of the span unconstrained.
+        # A denser sample grid than the RBF basis: the fit is scored between the knots too, where the body is only an approximation, and 64 points for 5 basis functions would leave most of the span unconstrained.
         grid = torch.linspace(-span, span, 400)
         with torch.no_grad():
             target = fn(grid)
@@ -194,13 +163,7 @@ class SmoothPWL(nn.Module):
                 opt.step()
             return self
         with torch.no_grad():
-            # Least squares on the coefficients with the basis held fixed. The
-            # map is linear in (weights, bias): out = sum_j basis_j * (w_j * x
-            # + b_j) = (basis * x) @ w + basis @ b, so the design matrix has one
-            # row per sample and one column per (weight, bias) pair. Built from
-            # two 2-D operands with an explicit `cat` on dim 1 -- broadcasting a
-            # `cat` operand promotes only that one operand to a higher rank, and
-            # `cat` then rejects the rank mismatch.
+            # Least squares on the coefficients with the basis held fixed. The map is linear in (weights, bias): out = sum_j basis_j * (w_j * x + b_j) = (basis * x) @ w + basis @ b, so the design matrix has one row per sample and one column per (weight, bias) pair. Built from two 2-D operands with an explicit `cat` on dim 1 -- broadcasting a `cat` operand promotes only that one operand to a higher rank, and `cat` then rejects the rank mismatch.
             basis = torch.softmax(
                 1.0 / ((grid.reshape(-1, 1) - self._pinned_index()).pow(2) + self.eps),
                 dim=-1,

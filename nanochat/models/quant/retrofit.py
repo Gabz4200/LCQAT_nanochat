@@ -29,14 +29,7 @@ from nanochat.models.quant.linear import (
     is_lcqat_layer,
 )
 
-#: The exact set of `LayerKConfig` fields whose value is a `CodebookSpec`.
-#:
-#: An explicit list, not a suffix heuristic (`name.endswith(("_weight", "_act"))`).
-#: The heuristic cannot work here: `per_channel_weight` is a `bool` whose name
-#: ends in `_weight`, so it is fed to `_validate_codebook_spec` as a codebook
-#: spec. A bool IS an int in Python, and `False <= 3`, so it raises. Naming the
-#: fields makes that class of mistake impossible; a suffix rule would also break
-#: every existing checkpoint's `meta["lcqat"]` if the field were ever renamed.
+#: : The exact set of `LayerKConfig` fields whose value is a `CodebookSpec`. : An explicit list, not a suffix heuristic (`name.endswith(("_weight", "_act"))`). The heuristic cannot work here: `per_channel_weight` is a `bool` whose name ends in `_weight`, so it is fed to `_validate_codebook_spec` as a codebook spec. A bool IS an int in Python, and `False <= 3`, so it raises. Naming the fields makes that class of mistake impossible; a suffix rule would also break every existing checkpoint's `meta["lcqat"]` if the field were ever renamed.
 CODEBOOK_SPEC_FIELDS: frozenset[str] = frozenset(
     {
         "qk_weight",
@@ -57,11 +50,7 @@ CODEBOOK_SPEC_FIELDS: frozenset[str] = frozenset(
 
 def _validate_codebook_spec(spec: CodebookSpec, label: str) -> None:
     """Raise unless `spec` is an int >= 3 or a valid `(m_neg, m_pos)` pair."""
-    # A bool is an int subclass, so `per_channel_weight=False` reaches the
-    # `isinstance(spec, int)` branch below as a "K of 0" without this guard --
-    # and False <= 3 would then raise the *wrong* error for the *right* reason.
-    # CODEBOOK_SPEC_FIELDS keeps booleans out of this function entirely; this
-    # guard is the defense-in-depth that makes that exclusion a non-issue.
+    # A bool is an int subclass, so `per_channel_weight=False` reaches the `isinstance(spec, int)` branch below as a "K of 0" without this guard -- and False <= 3 would then raise the *wrong* error for the *right* reason. CODEBOOK_SPEC_FIELDS keeps booleans out of this function entirely; this guard is the defense-in-depth that makes that exclusion a non-issue.
     if isinstance(spec, bool):
         raise ValueError(
             f"{label} is a bool, not a codebook spec; a codebook cardinality is "
@@ -80,8 +69,7 @@ def _validate_codebook_spec(spec: CodebookSpec, label: str) -> None:
             or not isinstance(m_pos, int)
         ):
             raise ValueError(f"{label}: m_neg/m_pos must be ints, got {spec!r}")
-        # Delegate the structural rules (non-negative, one-sided needs >= 2, and
-        # K >= 3) to the codebook's own validator so there is one source of truth.
+        # Delegate the structural rules (non-negative, one-sided needs >= 2, and K >= 3) to the codebook's own validator so there is one source of truth.
         _validate_split(m_neg, m_pos)
         return
     if isinstance(spec, bool) or not isinstance(spec, int):
@@ -150,53 +138,22 @@ class LayerKConfig:
     fc_act: CodebookSpec = 15
     down_weight: CodebookSpec = 15
     down_act: CodebookSpec = 15
-    # Output quantizers (c_q/c_k/c_v output, c_fc output). `fc_out` is the
-    # non-negative MLP hidden -> one-sided by default in the asym preset.
+    # Output quantizers (c_q/c_k/c_v output, c_fc output). `fc_out` is the non-negative MLP hidden -> one-sided by default in the asym preset.
     qkv_out: CodebookSpec = 15
     fc_out: CodebookSpec = 15
     quantize_qkv_out: bool = True
     quantize_fc_out: bool = True
     k_map: tuple[tuple[str, CodebookSpec, CodebookSpec], ...] = ()
     min_linear_dim: int = 128
-    # PRD 2.4: "none" (plain STE) or "inv_sqrt_n" (1/sqrt(numel) on the
-    # codebook gradient). Config-level so a checkpoint records which one it was
-    # trained under, rather than silently changing behaviour on reload.
+    # PRD 2.4: "none" (plain STE) or "inv_sqrt_n" (1/sqrt(numel) on the codebook gradient). Config-level so a checkpoint records which one it was trained under, rather than silently changing behaviour on reload.
     grad_scale: str = GRAD_SCALE_INV_SQRT_N
-    # PRD 3.4: one weight codebook per output channel instead of one shared.
-    # Config-level for the same reason as `grad_scale` -- a checkpoint has to
-    # record that it was trained this way, or a reload silently builds shared
-    # tables and the saved per-channel parameters are orphaned.
+    # PRD 3.4: one weight codebook per output channel instead of one shared. Config-level for the same reason as `grad_scale` -- a checkpoint has to record that it was trained this way, or a reload silently builds shared tables and the saved per-channel parameters are orphaned.
     per_channel_weight: bool = False
-    # Quantize the bias through a per-layer learned codebook
-    # (`LCQATLinear.bias_quantizer`). Off by default, and deliberately *not* a
-    # CODEBOOK_SPEC_FIELDS entry: it is a bool, so `validate()` must not feed it
-    # to `_validate_codebook_spec` -- that is exactly the §9.3 Defect 1 class of
-    # bug (a bool reaching an int validator) that the explicit frozenset exists
-    # to make impossible. Its cardinality, when enabled, defaults to `K_act`.
-    #
-    # Config-level for the same reason as `grad_scale`: a checkpoint trained
-    # with a bias codebook carries its step parameters, so a reload that skipped
-    # the flag would fail the strict state_dict load with "unexpected keys".
+    # Quantize the bias through a per-layer learned codebook (`LCQATLinear.bias_quantizer`). Off by default, and deliberately *not* a CODEBOOK_SPEC_FIELDS entry: it is a bool, so `validate()` must not feed it to `_validate_codebook_spec` -- that is exactly the §9.3 Defect 1 class of bug (a bool reaching an int validator) that the explicit frozenset exists to make impossible. Its cardinality, when enabled, defaults to `K_act`. Config-level for the same reason as `grad_scale`: a checkpoint trained with a bias codebook carries its step parameters, so a reload that skipped the flag would fail the strict state_dict load with "unexpected keys".
     quantize_bias: bool = False
-    # D9: how the *trained* activation LUT selects its output level.
-    # "logits" is the original free `(K_in, K_out)` logit matrix with a
-    # straight-through round; "proximity" replaces it with a `knots + levels`
-    # pair selected by inverse-square distance, which costs K_in + K_in
-    # parameters instead of K_in x K_out and has no softmax-saturation cliff
-    # (dev/HANDOFF_symbiosis.md §10.2.1).
-    #
-    # Config-level for the same reason as `grad_scale`: a checkpoint records
-    # which relaxation produced its LUT weights, so a reload does not silently
-    # build a different module with orphaned parameters.
+    # D9: how the *trained* activation LUT selects its output level. "logits" is the original free `(K_in, K_out)` logit matrix with a straight-through round; "proximity" replaces it with a `knots + levels` pair selected by inverse-square distance, which costs K_in + K_in parameters instead of K_in x K_out and has no softmax-saturation cliff (dev/HANDOFF_symbiosis.md §10.2.1). Config-level for the same reason as `grad_scale`: a checkpoint records which relaxation produced its LUT weights, so a reload does not silently build a different module with orphaned parameters.
     lut_relaxation: str = RELAXATION_LOGITS
-    # D9: which body approximates the elementwise activation between two
-    # quantized layers. "pwl" is the shipped frozen K_in -> K_out index table
-    # (exact at the knots, linear between). "smoothpwl" is the learnable
-    # radial-basis body from `activation.py`.
-    #
-    # Same reasoning as `lut_relaxation`: the two bodies have different
-    # parameter shapes, so a checkpoint trained with one cannot be reloaded as
-    # the other.
+    # D9: which body approximates the elementwise activation between two quantized layers. "pwl" is the shipped frozen K_in -> K_out index table (exact at the knots, linear between). "smoothpwl" is the learnable radial-basis body from `activation.py`. Same reasoning as `lut_relaxation`: the two bodies have different parameter shapes, so a checkpoint trained with one cannot be reloaded as the other.
     act_body: str = ACT_BODY_PWL
 
     @classmethod
@@ -220,11 +177,7 @@ class LayerKConfig:
         for substr, kw, ka in self.k_map:
             _validate_codebook_spec(kw, f"k_map rule {substr!r} K_weight")
             _validate_codebook_spec(ka, f"k_map rule {substr!r} K_act")
-        # Every codebook-spec field must be a *declared* member of
-        # CODEBOOK_SPEC_FIELDS, checked here rather than assumed. A field
-        # holding a CodebookSpec that nobody validates is a config that fails
-        # at model-build time instead of flag-parse time, which is the same
-        # late-failure mode the explicit set exists to prevent.
+        # Every codebook-spec field must be a *declared* member of CODEBOOK_SPEC_FIELDS, checked here rather than assumed. A field holding a CodebookSpec that nobody validates is a config that fails at model-build time instead of flag-parse time, which is the same late-failure mode the explicit set exists to prevent.
         undeclared = CODEBOOK_SPEC_FIELDS - {f.name for f in fields(self)}
         if undeclared:
             raise ValueError(
@@ -238,10 +191,7 @@ class LayerKConfig:
                 f"LayerKConfig.grad_scale must be one of {GRAD_SCALES}, got "
                 f"{self.grad_scale!r}"
             )
-        # Both are validated here rather than trusted from argparse, because a
-        # config also arrives from `from_dict` on a resume -- and a resume that
-        # silently accepted a typo would build a module whose parameter shape
-        # does not match the saved weights.
+        # Both are validated here rather than trusted from argparse, because a config also arrives from `from_dict` on a resume -- and a resume that silently accepted a typo would build a module whose parameter shape does not match the saved weights.
         if self.lut_relaxation not in RELAXATIONS:
             raise ValueError(
                 f"LayerKConfig.lut_relaxation must be one of {RELAXATIONS}, got "
@@ -270,17 +220,7 @@ class LayerKConfig:
         return data
 
 
-# small: maximum-compression default (user-approved). prd: PRD section 4 table
-# verbatim (8-bit down_proj / residual recombination path).
-#
-# asym (the default): same total level counts as `small`, but split so the two
-# non-negative tensors stop wasting half their codebook. `gpt.py`'s MLP is
-# `c_fc -> relu(x).square() -> c_proj`, so
-#   * `mlp.c_fc`'s OUTPUT codebook sees relu^2 >= 0  -> m_neg = 0
-#   * `mlp.c_proj`'s INPUT codebook sees relu^2 >= 0  -> m_neg = 0
-# A symmetric 15 spends 7 levels on a sign those tensors never take; 0/7 spends
-# all 8. Everything upstream of the activation (attention in/out, c_fc in) is
-# genuinely signed and gets an asymmetric split rather than a symmetric one.
+# small: maximum-compression default (user-approved). prd: PRD section 4 table verbatim (8-bit down_proj / residual recombination path). asym (the default): same total level counts as `small`, but split so the two non-negative tensors stop wasting half their codebook. `gpt.py`'s MLP is `c_fc -> relu(x).square() -> c_proj`, so * `mlp.c_fc`'s OUTPUT codebook sees relu^2 >= 0 -> m_neg = 0 * `mlp.c_proj`'s INPUT codebook sees relu^2 >= 0 -> m_neg = 0 A symmetric 15 spends 7 levels on a sign those tensors never take; 0/7 spends all 8. Everything upstream of the activation (attention in/out, c_fc in) is genuinely signed and gets an asymmetric split rather than a symmetric one.
 PRESETS: dict[str, LayerKConfig] = {
     "small": LayerKConfig(),
     "prd": LayerKConfig(down_weight=255, down_act=255),
@@ -440,9 +380,7 @@ def lcqat_config_from_args(args) -> LayerKConfig:
                 f"valid: {sorted(GRAD_SCALES)}"
             )
         cfg = replace(cfg, grad_scale=grad_scale)
-    # D9: the activation-LUT relaxation and the activation body. Both default to
-    # the shipped behaviour, and both are read with a `getattr` default so a
-    # caller that registers a subset of the flags keeps working.
+    # D9: the activation-LUT relaxation and the activation body. Both default to the shipped behaviour, and both are read with a `getattr` default so a caller that registers a subset of the flags keeps working.
     lut_relaxation = getattr(args, "lcqat_lut_relaxation", None)
     if lut_relaxation is not None:
         if lut_relaxation not in RELAXATIONS:
@@ -462,8 +400,7 @@ def lcqat_config_from_args(args) -> LayerKConfig:
     return cfg
 
 
-# Module-name roles: (weight spec field, act spec field, quantize-out flag field,
-# out spec field). A `None` flag field means the role has no output quantizer.
+# Module-name roles: (weight spec field, act spec field, quantize-out flag field, out spec field). A `None` flag field means the role has no output quantizer.
 _ROLE_QK = ("qk_weight", "qk_act", "quantize_qkv_out", "qkv_out")
 _ROLE_V = ("v_weight", "v_act", "quantize_qkv_out", "qkv_out")
 _ROLE_O = ("o_weight", "o_act", None, None)
@@ -479,8 +416,7 @@ def get_layer_config(module_name: str, config: LayerKConfig) -> LayerQuantSpec |
     carry that precondition on its own.
     """
     role = None
-    # Anchored on ".c_q" suffix segments so hypothetical `c_qkv`-style names
-    # do not false-positive; first-match-wins for k_map is documented.
+    # Anchored on ".c_q" suffix segments so hypothetical `c_qkv`-style names do not false-positive; first-match-wins for k_map is documented.
     if ".attn.c_q" in f".{module_name}" or ".attn.c_k" in f".{module_name}":
         role = _ROLE_QK
     elif ".attn.c_v" in f".{module_name}":
@@ -503,9 +439,7 @@ def get_layer_config(module_name: str, config: LayerKConfig) -> LayerQuantSpec |
     if out_field is None:
         return LayerQuantSpec(weight=k_weight, activation=k_act)
     quantize_out = bool(getattr(config, out_field))
-    # `out_spec_field` is set exactly when `out_field` is (see the _ROLE_*
-    # tuples), so the extra `is not None` is implied -- it only narrows the
-    # type for the checker, and never changes which branch runs.
+    # `out_spec_field` is set exactly when `out_field` is (see the _ROLE_* tuples), so the extra `is not None` is implied -- it only narrows the type for the checker, and never changes which branch runs.
     out_spec = (
         getattr(config, out_spec_field)
         if quantize_out and out_spec_field is not None
@@ -548,11 +482,7 @@ def retrofit_model(model: _M, config: LayerKConfig) -> _M:
     matched_rules: set[str] = set()
 
     for full_name, child in model.named_modules():
-        # `is_lcqat_layer` for the already-retrofitted skip: a
-        # SparsePropLinearLCQAT is an nn.Linear (through backbone
-        # Linear) and would otherwise be quantized a second time. The
-        # pipeline retrofits before it wraps, so this changes nothing
-        # there -- it removes the trap for any other call order.
+        # `is_lcqat_layer` for the already-retrofitted skip: a SparsePropLinearLCQAT is an nn.Linear (through backbone Linear) and would otherwise be quantized a second time. The pipeline retrofits before it wraps, so this changes nothing there -- it removes the trap for any other call order.
         if not isinstance(child, nn.Linear) or is_lcqat_layer(child):
             continue
         spec = get_layer_config(full_name, config)
@@ -665,14 +595,10 @@ def retrofit_summary(model: nn.Module | ModuleTree) -> dict[str, int]:
     """
     summary: dict[str, int] = {}
     for module in model.modules():
-        # `is_lcqat_layer`, not isinstance: a SparseProp-wrapped LC-QAT layer is
-        # one without being a subclass, and it carries both quantizers.
+        # `is_lcqat_layer`, not isinstance: a SparseProp-wrapped LC-QAT layer is one without being a subclass, and it carries both quantizers.
         if not is_lcqat_layer(module):
             continue
-        # Bound to locals: a sparse member may lack these attributes
-        # entirely, so direct access would not check. Weight and act
-        # quantizers are mandatory on every real layer (the assert
-        # documents that); only `out_quantizer` is optional.
+        # Bound to locals: a sparse member may lack these attributes entirely, so direct access would not check. Weight and act quantizers are mandatory on every real layer (the assert documents that); only `out_quantizer` is optional.
         w = getattr(module, "weight_quantizer", None)
         a = getattr(module, "act_quantizer", None)
         assert w is not None and a is not None, (
@@ -724,9 +650,7 @@ def prepare_exported_subtree_buffers(model: nn.Module, model_data: dict) -> None
     DiffusionBlocks engine's `adapters` and `denoise_heads` as well as for the
     bare GPT, since an exported engine artifact has to be reshaped on both.
     """
-    # `named_modules()` here must reach every retrofitted layer in whatever tree
-    # it is handed. An `nn.Module` (the GPT, a ModuleList of adapters) walks
-    # itself; the `DiffusionBlockEngine` forwards to its three owned subtrees.
+    # `named_modules()` here must reach every retrofitted layer in whatever tree it is handed. An `nn.Module` (the GPT, a ModuleList of adapters) walks itself; the `DiffusionBlockEngine` forwards to its three owned subtrees.
     for name, module in model.named_modules():
         if not is_lcqat_layer(module):
             continue
@@ -736,10 +660,7 @@ def prepare_exported_subtree_buffers(model: nn.Module, model_data: dict) -> None
                 f"exported artifact has no {idx_key}: the active LC-QAT config "
                 "does not match the model structure this artifact was built from"
             )
-        # Freeze quantizers exactly like export does: raw step params are
-        # deleted, only compiled_codebook buffers remain in the state.
-        # Bound to locals (see `retrofit_summary`): direct access would
-        # not check on a sparse member missing the attribute.
+        # Freeze quantizers exactly like export does: raw step params are deleted, only compiled_codebook buffers remain in the state. Bound to locals (see `retrofit_summary`): direct access would not check on a sparse member missing the attribute.
         weight_quantizer = getattr(module, "weight_quantizer", None)
         act_quantizer = getattr(module, "act_quantizer", None)
         assert weight_quantizer is not None and act_quantizer is not None, (
@@ -755,11 +676,7 @@ def prepare_exported_subtree_buffers(model: nn.Module, model_data: dict) -> None
         module.register_buffer(
             "weight_index_format", model_data[f"{name}.weight_index_format"]
         )
-        # Sparse artifact (W3.4): the layer was exported as CSR over the
-        # surviving index slots with a compacted alphabet. Carry the structure
-        # through so the runtime can take the zero-skipping path; without these
-        # the module would silently fall back to the dense interpretation of
-        # `packed_weight_indices`.
+        # Sparse artifact (W3.4): the layer was exported as CSR over the surviving index slots with a compacted alphabet. Carry the structure through so the runtime can take the zero-skipping path; without these the module would silently fall back to the dense interpretation of `packed_weight_indices`.
         for suffix in (
             "sparse_keep_indices",
             "sparse_row_ptr",
@@ -767,12 +684,7 @@ def prepare_exported_subtree_buffers(model: nn.Module, model_data: dict) -> None
             "sparse_index_format",
             "sparse_alphabet",
             "sparse_k_used",
-            # The training-time SparseProp bookkeeping travels in the artifact
-            # too (export does not strip it), so it has to land on the reshaped
-            # layer or the caller's strict load rejects it as unexpected. Not
-            # read by the quantized forward -- which uses the dense
-            # `packed_weight_indices` -- but keeping the trained mask means the
-            # artifact round-trips losslessly.
+            # The training-time SparseProp bookkeeping travels in the artifact too (export does not strip it), so it has to land on the reshaped layer or the caller's strict load rejects it as unexpected. Not read by the quantized forward -- which uses the dense `packed_weight_indices` -- but keeping the trained mask means the artifact round-trips losslessly.
             "sparsity_mask",
             "w_ptr",
             "w_ptr_csc",
@@ -847,11 +759,7 @@ def _lut_key_groups(model: nn.Module) -> dict[str, list[str]]:
         if "activation_lut" not in name:
             continue
         if "learnable_activation_lut." in name:
-            # `...c_fc.learnable_activation_lut.logits` -> the owning module, so
-            # each layer's learned table is its own group. Splitting on a fixed
-            # number of dots instead would merge layer 0 and layer 1 into one
-            # group and make an ordinary two-layer checkpoint look truncated
-            # whenever only one layer's table was absent.
+            # `...c_fc.learnable_activation_lut.logits` -> the owning module, so each layer's learned table is its own group. Splitting on a fixed number of dots instead would merge layer 0 and layer 1 into one group and make an ordinary two-layer checkpoint look truncated whenever only one layer's table was absent.
             group = name.rsplit(".learnable_activation_lut.", 1)[0]
         else:
             group = name
@@ -883,11 +791,7 @@ def _patch_missing_lut_keys(model: nn.Module, model_data: dict) -> int:
     """
     groups = _lut_key_groups(model)
     expected = {n for names in groups.values() for n in names}
-    # Keys the checkpoint has that this rebuild would not produce. Their
-    # presence means the resume rebuilt the wrong relaxation or body, which is
-    # a *config mismatch*, not truncation, and the caller's `strict=True` load
-    # reports that accurately as an unexpected key. Patching anything while
-    # such keys are present would paper over the real error with the wrong one.
+    # Keys the checkpoint has that this rebuild would not produce. Their presence means the resume rebuilt the wrong relaxation or body, which is a *config mismatch*, not truncation, and the caller's `strict=True` load reports that accurately as an unexpected key. Patching anything while such keys are present would paper over the real error with the wrong one.
     if any("activation_lut" in name and name not in expected for name in model_data):
         return 0
     missing: list[str] = []
@@ -911,8 +815,7 @@ def _patch_missing_lut_keys(model: nn.Module, model_data: dict) -> int:
     with torch.no_grad():
         for name in missing:
             model_data[name] = state[name].detach().clone()
-    # `warnings.warn` rather than the shell's `print0`: this is model-layer code,
-    # and importing the logging shell here would invert the dependency direction.
+    # `warnings.warn` rather than the shell's `print0`: this is model-layer code, and importing the logging shell here would invert the dependency direction.
     warnings.warn(
         f"Patched {len(missing)} missing activation-table entries to their "
         "initial values; this checkpoint predates those tables.",

@@ -14,18 +14,13 @@ import torch
 import torch.nn.functional as F
 
 _TRIT_POWERS = torch.tensor([1, 3, 9, 27, 81], dtype=torch.int32)
-#: Values packed per byte in the K=3 trit format. Public because the sparse
-#: artifact's byte accounting needs it to compare layouts.
+#: Values packed per byte in the K=3 trit format. Public because the sparse artifact's byte accounting needs it to compare layouts.
 TRITS_PER_BYTE = 5
 
-#: Largest codebook size whose indices still fit in one unsigned byte. This is
-#: the single boundary behind both the packed storage format
-#: (`FORMAT_UINT8`/`FORMAT_INT32`) and the in-memory index dtype
-#: (`index_dtype_for_k`), so the two can never disagree.
+#: Largest codebook size whose indices still fit in one unsigned byte. This is the single boundary behind both the packed storage format (`FORMAT_UINT8`/`FORMAT_INT32`) and the in-memory index dtype (`index_dtype_for_k`), so the two can never disagree.
 MAX_UINT8_CODEBOOK_K = 255
 
-# Storage-format tags for weight indices (dtype chosen from the codebook
-# size K; persisted as a 0-dim int buffer next to each packed weight).
+# Storage-format tags for weight indices (dtype chosen from the codebook size K; persisted as a 0-dim int buffer next to each packed weight).
 FORMAT_TRITS = 0  # K = 3: 5 trits/byte
 FORMAT_NIBBLES = 1  # K <= 15: 2 values/byte
 FORMAT_UINT8 = 2  # K <= MAX_UINT8_CODEBOOK_K: one byte/value
@@ -205,9 +200,7 @@ def unpack_nibbles(packed: torch.Tensor, n: int) -> torch.Tensor:
         )
     stacked = torch.stack([packed & 0x0F, packed >> 4], dim=-1)  # [..., B, 2]
     if packed.ndim == 2:
-        # `[m, B]` packs interleave row-wise, so decode per row and drop each
-        # row's pad value from the final byte. Decoding the buffer as one flat
-        # stream would shift every row after the first by half a byte.
+        # `[m, B]` packs interleave row-wise, so decode per row and drop each row's pad value from the final byte. Decoding the buffer as one flat stream would shift every row after the first by half a byte.
         rows, byte_count = packed.shape
         per_row = stacked.reshape(rows, byte_count * 2)[:, :n]
         return per_row.to(torch.uint8)

@@ -42,65 +42,27 @@ import torch.nn as nn
 from nanochat.models.quant.codebook import codebook_midpoints
 from nanochat.models.quant.lut import compile_activation_lut, get_activation
 
-#: Relaxation temperature for the softmax over output-level logits. Small
-#: enough that the relaxed value is dominated by the argmax at init, so the
-#: trained path and the hard path start numerically indistinguishable.
+#: Relaxation temperature for the softmax over output-level logits. Small enough that the relaxed value is dominated by the argmax at init, so the trained path and the hard path start numerically indistinguishable.
 DEFAULT_TEMPERATURE = 0.1
 
-#: How strongly the initial logits favour the baked index, in units of the
-#: softmax temperature. Multiplied by `temperature` on purpose: a gap that is
-#: large in absolute logits is *saturated*, and `exp(-gap / T)` then underflows
-#: to exactly 0 in FP32, which makes the softmax gradient identically zero and
-#: freezes the table forever. At 4 temperature units the initial softmax puts
-#: ~0.93 on the baked index -- peaked enough that the relaxed value starts near
-#: the hard one, and still far from the underflow cliff.
+#: How strongly the initial logits favour the baked index, in units of the softmax temperature. Multiplied by `temperature` on purpose: a gap that is large in absolute logits is *saturated*, and `exp(-gap / T)` then underflows to exactly 0 in FP32, which makes the softmax gradient identically zero and freezes the table forever. At 4 temperature units the initial softmax puts ~0.93 on the baked index -- peaked enough that the relaxed value starts near the hard one, and still far from the underflow cliff.
 LOGIT_SEED_STRENGTH = 4.0
 
-#: Selector relaxations for the trained table.
-#:
-#: `logits` is the original free `(K_in, K_out)` logit matrix with a
-#: straight-through round. `proximity` selects the output level by inverse-square
-#: distance to a learnable knot grid instead (the `ablation/simple.py` form,
-#: measured in HANDOFF §10.2.1: 30 parameters rather than 225 at K=15, and a
-#: ~6x larger gradient at init). The distance selector has no saturation cliff,
-#: which is the load-bearing difference -- a frozen table would silently void the
-#: PRD 2.4 gradient scaling.
+#: : Selector relaxations for the trained table. : `logits` is the original free `(K_in, K_out)` logit matrix with a straight-through round. `proximity` selects the output level by inverse-square distance to a learnable knot grid instead (the `ablation/simple.py` form, measured in HANDOFF §10.2.1: 30 parameters rather than 225 at K=15, and a ~6x larger gradient at init). The distance selector has no saturation cliff, which is the load-bearing difference -- a frozen table would silently void the PRD 2.4 gradient scaling.
 RELAXATION_LOGITS = "logits"
 RELAXATION_PROXIMITY = "proximity"
 RELAXATIONS = (RELAXATION_LOGITS, RELAXATION_PROXIMITY)
 
-#: Floor on the inverse-square distance, matching `ablation/simple.py`. Without
-#: it, an input sitting exactly on a knot divides by zero.
+#: Floor on the inverse-square distance, matching `ablation/simple.py`. Without it, an input sitting exactly on a knot divides by zero.
 PROXIMITY_EPS = 1e-6
 
-#: Knot storage dtype. fp8_e4m3fn round-trips the K=15 knot grid over [-1, 1]
-#: with the resolved index table bit-identical to fp32 knots (measured, HANDOFF
-#: §10.2.2), so knots cost 1 byte each instead of 4 at zero behavioural cost.
+#: Knot storage dtype. fp8_e4m3fn round-trips the K=15 knot grid over [-1, 1] with the resolved index table bit-identical to fp32 knots (measured, HANDOFF §10.2.2), so knots cost 1 byte each instead of 4 at zero behavioural cost.
 KNOT_DTYPE = torch.float8_e4m3fn
 
-#: Fraction of the local codebook gap by which each knot is nudged off the input
-#: position it serves. Non-zero is load-bearing, not cosmetic: at offset 0 the
-#: nearest knot is at `diff == 0`, the inverse-square weight is `1/eps == 1e6`,
-#: and every other weight underflows to exactly 0 in FP32. The softmax becomes a
-#: hard argmax whose knot gradient is identically zero -- the same permanent
-#: freeze the proximity relaxation was adopted to escape, one level down. At 1/4
-#: of the local gap the nearest knot still wins decisively (so the table stays
-#: the bake) while the off-diagonal weights stay in FP32 range.
+#: Fraction of the local codebook gap by which each knot is nudged off the input position it serves. Non-zero is load-bearing, not cosmetic: at offset 0 the nearest knot is at `diff == 0`, the inverse-square weight is `1/eps == 1e6`, and every other weight underflows to exactly 0 in FP32. The softmax becomes a hard argmax whose knot gradient is identically zero -- the same permanent freeze the proximity relaxation was adopted to escape, one level down. At 1/4 of the local gap the nearest knot still wins decisively (so the table stays the bake) while the off-diagonal weights stay in FP32 range.
 KNOT_INIT_OFFSET_FRACTION = 0.25
 
-#: How the inverse-square selector is scaled, as a multiple of the local knot
-#: spacing squared. Expressed as a multiple of the grid rather than as an
-#: absolute constant so it tracks K: at K=15 the gap is ~0.14, so an unscaled
-#: weight is `1/0.0013 ~ 770` at the nearest knot and `1/0.021 ~ 48` at the
-#: second -- a gap of ~700 in the softmax argument, which underflows to exactly
-#: 0 in FP32 and turns the selector back into a hard argmax with a zero knot
-#: gradient. That is the same saturation cliff `LOGIT_SEED_STRENGTH` exists to
-#: stay clear of, one level down, and it was measured here rather than assumed:
-#: `test_when_backpropagated_then_the_knot_gradient_is_nonzero` fails at 1.0.
-#:
-#: At 1.0 the nearest knot scores ~16 and its neighbour ~2, giving `exp(14)` --
-#: comfortably representable, so every knot keeps a live gradient. Measured as a
-#: parameter-reduction *and* gradient-quality win, not a cosmetic constant.
+#: : How the inverse-square selector is scaled, as a multiple of the local knot spacing squared. Expressed as a multiple of the grid rather than as an absolute constant so it tracks K: at K=15 the gap is ~0.14, so an unscaled weight is `1/0.0013 ~ 770` at the nearest knot and `1/0.021 ~ 48` at the second -- a gap of ~700 in the softmax argument, which underflows to exactly 0 in FP32 and turns the selector back into a hard argmax with a zero knot gradient. That is the same saturation cliff `LOGIT_SEED_STRENGTH` exists to stay clear of, one level down, and it was measured here rather than assumed: `test_when_backpropagated_then_the_knot_gradient_is_nonzero` fails at 1.0. : At 1.0 the nearest knot scores ~16 and its neighbour ~2, giving `exp(14)` -- comfortably representable, so every knot keeps a live gradient. Measured as a parameter-reduction *and* gradient-quality win, not a cosmetic constant.
 PROXIMITY_SCALE_GRID_UNITS = 1.0
 
 
@@ -167,29 +129,17 @@ class LearnableIndexLut(nn.Module):
                 output_codebook.to(torch.float32),
             ).to(torch.int64)
             if smooth_body is not None:
-                # The fitted body is a *better starting table* than the
-                # per-codebook bake: it approximates the activation over the
-                # whole span rather than at K_in sampled points, so its nearest
-                # codebook level is a better choice at every index. The table
-                # shape and dtype are unchanged -- this only picks which output
-                # level each input index starts on.
+                # The fitted body is a *better starting table* than the per-codebook bake: it approximates the activation over the whole span rather than at K_in sampled points, so its nearest codebook level is a better choice at every index. The table shape and dtype are unchanged -- this only picks which output level each input index starts on.
                 body_values = smooth_body(input_codebook.to(torch.float32)).reshape(-1)
                 midpoints = codebook_midpoints(output_codebook.to(torch.float32))
                 initial = torch.bucketize(body_values, midpoints).to(torch.int64)
-            # Seed the logits so softmax(logits / T) peaks on the baked index.
-            # A uniform init would make the relaxed value the mean of the
-            # output codebook at step 0, which is a large, arbitrary gradient
-            # pushing the table somewhere before it has learned anything.
+            # Seed the logits so softmax(logits / T) peaks on the baked index. A uniform init would make the relaxed value the mean of the output codebook at step 0, which is a large, arbitrary gradient pushing the table somewhere before it has learned anything.
             gap = LOGIT_SEED_STRENGTH * self.temperature
             logits = torch.full((self.k_in, self.k_out), -gap, dtype=torch.float32)
             rows = torch.arange(self.k_in)
             logits[rows, initial] = gap
 
-        # The input codebook is read by the proximity selector (it evaluates the
-        # knot distances *at* the codebook entries, since the table is indexed
-        # by input codebook position). Non-persistent for the same reason
-        # `output_codebook` is: it is already owned by the quantizer in the
-        # checkpoint and a second persistent copy could drift.
+        # The input codebook is read by the proximity selector (it evaluates the knot distances *at* the codebook entries, since the table is indexed by input codebook position). Non-persistent for the same reason `output_codebook` is: it is already owned by the quantizer in the checkpoint and a second persistent copy could drift.
         self.register_buffer(
             "input_codebook",
             input_codebook.detach().to(torch.float32),
@@ -252,10 +202,7 @@ class LearnableIndexLut(nn.Module):
 
         self.knots = nn.Parameter(self._initial_knots())
         self.levels = nn.Parameter(levels)
-        # `pin_mask` marks the knot whose level must stay exactly 0.0. Held as a
-        # buffer rather than folded into `levels` so the level itself stays a
-        # free parameter everywhere else, and so the pin is visible in the
-        # state_dict instead of being an invisible clamp.
+        # `pin_mask` marks the knot whose level must stay exactly 0.0. Held as a buffer rather than folded into `levels` so the level itself stays a free parameter everywhere else, and so the pin is visible in the state_dict instead of being an invisible clamp.
         pin = torch.zeros(self.k_in, dtype=torch.bool)
         pin[anchor] = True
         self.register_buffer("pin_mask", pin, persistent=True)
@@ -324,9 +271,7 @@ class LearnableIndexLut(nn.Module):
         """
         codebook = self.input_codebook.to(torch.float32)
         if self.k_in < 2:
-            # A single knot has no gap to offset into, and one knot already
-            # selects itself with a finite weight (diff is the codebook value,
-            # not 0, unless the codebook is a lone 0.0).
+            # A single knot has no gap to offset into, and one knot already selects itself with a finite weight (diff is the codebook value, not 0, unless the codebook is a lone 0.0).
             return codebook.clone()
         gaps = codebook[1:] - codebook[:-1]
         offset = KNOT_INIT_OFFSET_FRACTION * torch.cat([gaps[:1], gaps])
@@ -343,11 +288,7 @@ class LearnableIndexLut(nn.Module):
         """
         diff = self.input_codebook.unsqueeze(-1) - self.knots.unsqueeze(0)
         weights = 1.0 / (diff.pow(2) + PROXIMITY_EPS)
-        # Divide the *weight*, not the exponent: the softmax is invariant to a
-        # global factor, so scaling by `spacing^2` is exactly equivalent to
-        # subtracting `2*log(spacing)` from every exponent, and it keeps the
-        # argument in a range where neighbouring knots stay representable. See
-        # PROXIMITY_SCALE_GRID_UNITS for why the unscaled form saturates.
+        # Divide the *weight*, not the exponent: the softmax is invariant to a global factor, so scaling by `spacing^2` is exactly equivalent to subtracting `2*log(spacing)` from every exponent, and it keeps the argument in a range where neighbouring knots stay representable. See PROXIMITY_SCALE_GRID_UNITS for why the unscaled form saturates.
         spacing = self._knot_spacing()
         if spacing > 0.0:
             weights = weights * (PROXIMITY_SCALE_GRID_UNITS * spacing**2)
@@ -444,10 +385,7 @@ class LearnableIndexLut(nn.Module):
         hard = codebook[table[indices.long()]]
         if not torch.is_grad_enabled():
             return hard
-        # `_trained_parameters` is the source of truth for "does this
-        # relaxation have trainable parameters at all"; it reports non-None
-        # under proximity (knots + levels), so the guard below is exactly the
-        # frozen-logits case and the two branches share one relaxation.
+        # `_trained_parameters` is the source of truth for "does this relaxation have trainable parameters at all"; it reports non-None under proximity (knots + levels), so the guard below is exactly the frozen-logits case and the two branches share one relaxation.
         if self.relaxation != RELAXATION_PROXIMITY and (
             self._trained_parameters() is None
         ):

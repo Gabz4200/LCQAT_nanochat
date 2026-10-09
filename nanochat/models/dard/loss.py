@@ -134,18 +134,13 @@ class DardRuleLoss(nn.Module):
             raise ValueError(f"gradient_scale must be > 0, got {gradient_scale}")
         self.gamma = float(gamma)
         self.eps = float(eps)
-        # Sparse CSR buffers move with `.to(device)` and stay sparse, which is
-        # the whole reason the compiled form is CSR rather than dense.
+        # Sparse CSR buffers move with `.to(device)` and stay sparse, which is the whole reason the compiled form is CSR rather than dense.
         self.register_buffer("premise", rule_set.premise)
         self.register_buffer("conclusion", rule_set.conclusion)
         self.register_buffer("weights", rule_set.weights)
         self.register_buffer("frequency", rule_set.frequency)
         self.vocab_size = rule_set.vocab_size
-        # The calibration constant, computed once from the rule set: the mean
-        # number of premise tokens per rule. The penalty's gradient is
-        # proportional to v(premise), and v over k tokens is ~p^k, so 1/arity is
-        # the right order of magnitude to restore it. `None` means "derive it";
-        # an explicit float pins it (1.0 = the literal PRD formula).
+        # The calibration constant, computed once from the rule set: the mean number of premise tokens per rule. The penalty's gradient is proportional to v(premise), and v over k tokens is ~p^k, so 1/arity is the right order of magnitude to restore it. `None` means "derive it"; an explicit float pins it (1.0 = the literal PRD formula).
         self.gradient_scale = (
             self._derive_gradient_scale(rule_set)
             if gradient_scale is None
@@ -197,9 +192,7 @@ class DardRuleLoss(nn.Module):
         if self.weights.numel() == 0:
             return torch.zeros((), dtype=torch.float32, device=logits.device)
 
-        # fp32 for the whole block; see the module docstring. `device_type` is
-        # taken from the logits so the guard is valid under cpu, cuda and mps
-        # rather than assuming one.
+        # fp32 for the whole block; see the module docstring. `device_type` is taken from the logits so the guard is valid under cpu, cuda and mps rather than assuming one.
         with torch.autocast(device_type=logits.device.type, enabled=False):
             flat = logits.float().reshape(-1, logits.size(-1))
             log_probs = torch.log(torch.softmax(flat, dim=-1) + self.eps)
@@ -248,11 +241,7 @@ class DardLossBalancer(nn.Module):
         self.lambda_global = float(lambda_global)
         self.ema_decay = float(ema_decay)
         self.eps = float(eps)
-        # Until the EMA has seen enough steps it sits at its initial value and
-        # the first steps would be divided by an arbitrary scale. `warmup`
-        # instead lets the un-normalized loss through while `steps == 0`,
-        # which is the AutoLoss-style ramp the PRD's §7 mitigation asks for:
-        # start on cross-entropy, ramp in rule enforcement.
+        # Until the EMA has seen enough steps it sits at its initial value and the first steps would be divided by an arbitrary scale. `warmup` instead lets the un-normalized loss through while `steps == 0`, which is the AutoLoss-style ramp the PRD's §7 mitigation asks for: start on cross-entropy, ramp in rule enforcement.
         self.warmup = warmup
         self.register_buffer("mu_ce", torch.zeros(()))
         self.register_buffer("mu_aml", torch.zeros(()))
@@ -283,11 +272,7 @@ class DardLossBalancer(nn.Module):
         detached_ce = loss_ce.detach()
         detached_aml = loss_aml.detach()
         if self.warmup and int(self.steps) <= 1:
-            # First step only: mu is still 0, so dividing by max(mu, eps) would
-            # multiply the CE loss by 1e5. The aux term is *unweighted* rather
-            # than absent -- returning `loss_ce` alone would leave
-            # `loss_aml.grad is None` for that step, i.e. the rule penalty would
-            # contribute no gradient exactly once, silently.
+            # First step only: mu is still 0, so dividing by max(mu, eps) would multiply the CE loss by 1e5. The aux term is *unweighted* rather than absent -- returning `loss_ce` alone would leave `loss_aml.grad is None` for that step, i.e. the rule penalty would contribute no gradient exactly once, silently.
             return loss_ce + loss_aml, {
                 "ce": detached_ce,
                 "aml": detached_aml,
@@ -348,9 +333,7 @@ def load_dard_state(state: dict) -> tuple["DardRuleLoss", "DardLossBalancer"]:
             "changed, so the saved rules mean something different"
         )
 
-    # Rebuild the module at the *payload's* shapes, then let load_state_dict
-    # overwrite the values. A 0-row placeholder cannot accept a real rule set:
-    # `load_state_dict` checks shapes and rejects [0, V] <- [96, V].
+    # Rebuild the module at the *payload's* shapes, then let load_state_dict overwrite the values. A 0-row placeholder cannot accept a real rule set: `load_state_dict` checks shapes and rejects [0, V] <- [96, V].
     weights = state["loss"].get("weights")
     rows = int(weights.shape[0]) if weights is not None else 0
     vocab = int(state["vocab_size"])
@@ -373,11 +356,7 @@ def load_dard_state(state: dict) -> tuple["DardRuleLoss", "DardLossBalancer"]:
         eps=float(state.get("eps", 1e-8)),
     )
     balancer = DardLossBalancer()
-    # Assigned rather than `load_state_dict`: copying a populated CSR into a
-    # placeholder one goes through `copy_`, which requires an identical nnz
-    # count and rejects the transfer. Reading the buffers out of the payload is
-    # also the honest operation here -- these *are* the rule set, not a delta
-    # to be merged into one.
+    # Assigned rather than `load_state_dict`: copying a populated CSR into a placeholder one goes through `copy_`, which requires an identical nnz count and rejects the transfer. Reading the buffers out of the payload is also the honest operation here -- these *are* the rule set, not a delta to be merged into one.
     saved = state["loss"]
     for name in ("premise", "conclusion", "weights", "frequency"):
         setattr(loss_fn, name, saved[name].to(device="cpu"))

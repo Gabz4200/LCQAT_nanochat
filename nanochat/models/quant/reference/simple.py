@@ -2,10 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-#: Which front stage feeds the learned lookup in `QuantizedLinear`.
-#: `codebook` = none (feed the shadow parameter straight through, the original
-#: behaviour). `classic` = uniform fake-quant first, so the lookup trains
-#: against an inference-like input distribution.
+#: Which front stage feeds the learned lookup in `QuantizedLinear`. `codebook` = none (feed the shadow parameter straight through, the original behaviour). `classic` = uniform fake-quant first, so the lookup trains against an inference-like input distribution.
 LUT_FRONT_CODEBOOK = "codebook"
 LUT_FRONT_CLASSIC = "classic"
 LUT_FRONTS = (LUT_FRONT_CODEBOOK, LUT_FRONT_CLASSIC)
@@ -25,9 +22,7 @@ class SmoothPWL(nn.Module):
         self.bias = nn.Parameter(torch.ones(knots))
 
     def forward(self, x: torch.Tensor):
-        # Broadcast x against knots across any shape:
-        # x: (*shape) -> x.unsqueeze(-1): (*shape, 1)
-        # self.index: (knots,) -> broadcasts to (*shape, knots)
+        # Broadcast x against knots across any shape: x: (*shape) -> x.unsqueeze(-1): (*shape, 1) self.index: (knots,) -> broadcasts to (*shape, knots)
         diff = x.unsqueeze(-1) - self.index
         inverse_squared_distances = 1.0 / (diff.pow(2) + self.eps)
 
@@ -66,8 +61,7 @@ class LearnedLookup(nn.Module):
     ):
         super().__init__()
         self.eps = eps
-        # Storage dtype the knots are *exported* in. The parameter stays FP32 so
-        # it can train; see the class docstring.
+        # Storage dtype the knots are *exported* in. The parameter stays FP32 so it can train; see the class docstring.
         self.index_dtype = index_dtype
         self.index = nn.Parameter(torch.linspace(-1.0, 1.0, entries))
         self.outputs = nn.Parameter(
@@ -79,9 +73,7 @@ class LearnedLookup(nn.Module):
         return self.index.detach().to(self.index_dtype)
 
     def forward(self, x: torch.Tensor):
-        # Broadcast x against knots across any shape:
-        # x: (*shape) -> x.unsqueeze(-1): (*shape, 1)
-        # self.index: (knots,) -> broadcasts to (*shape, knots)
+        # Broadcast x against knots across any shape: x: (*shape) -> x.unsqueeze(-1): (*shape, 1) self.index: (knots,) -> broadcasts to (*shape, knots)
         diff = x.unsqueeze(-1) - self.index
         inverse_squared_distances = 1.0 / (diff.pow(2) + self.eps)
 
@@ -158,8 +150,7 @@ class ClassicUniformFakeQuant(nn.Module):
         scale = self.scale_for(x)
         q = torch.clamp(torch.round(x / scale), -float(self.levels), float(self.levels))
         x_q = q * scale
-        # STE identity: `x_q` is a step function of `x`, so the gradient flows
-        # to the shadow weight unattenuated.
+        # STE identity: `x_q` is a step function of `x`, so the gradient flows to the shadow weight unattenuated.
         return x_q + (x - x.detach())
 
 
@@ -234,9 +225,7 @@ class QuantizedLinear(nn.Module):
             if bias and quantize_bias
             else None
         )
-        # Present only in `classic` mode, and parameter-free: the scale is read
-        # off the tensor each call rather than stored, so there is no second
-        # learnable grid to tune.
+        # Present only in `classic` mode, and parameter-free: the scale is read off the tensor each call rather than stored, so there is no second learnable grid to tune.
         self.fake_quant = (
             ClassicUniformFakeQuant(entries=entries)
             if lut_front == LUT_FRONT_CLASSIC

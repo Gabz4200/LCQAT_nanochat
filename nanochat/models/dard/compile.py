@@ -152,9 +152,7 @@ def mine_rules(
         beta=beta,
         weight_temperature=weight_temperature,
     )
-    # Pruning happens *after* weighting, so `w_r` is computed against the full
-    # rule population and the surviving weights renormalize among themselves --
-    # pruning a threshold, not zeroing a row of an already-normalized vector.
+    # Pruning happens *after* weighting, so `w_r` is computed against the full rule population and the surviving weights renormalize among themselves -- pruning a threshold, not zeroing a row of an already-normalized vector.
     keep = [
         i
         for i, rule in enumerate(rules)
@@ -196,10 +194,7 @@ def _mine_all(
         return list(pool.map(_mine_shard, payloads))
 
 
-#: Stamped into every artifact. Bumping it must be a loud load-time failure,
-#: exactly as `NOISE_MAP_VERSION` is for the DiffusionBlocks block/noise map:
-#: a rule set compiled under a different weighting or pruning convention would
-#: still *load* (same shapes, same dtypes) and silently enforce different rules.
+#: Stamped into every artifact. Bumping it must be a loud load-time failure, exactly as `NOISE_MAP_VERSION` is for the DiffusionBlocks block/noise map: a rule set compiled under a different weighting or pruning convention would still *load* (same shapes, same dtypes) and silently enforce different rules.
 RULE_SET_VERSION = 1
 
 

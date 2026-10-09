@@ -17,9 +17,7 @@ from __future__ import annotations
 
 import torch
 
-#: PRD §3.1.1: "Each shard length |D_k| = N is capped at N < 1000 discrete
-#: sequences." Exceeding this is what the atom-growth bound in the module
-#: docstring is about, so it is a hard constant rather than a flag.
+#: PRD §3.1.1: "Each shard length |D_k| = N is capped at N < 1000 discrete sequences." Exceeding this is what the atom-growth bound in the module docstring is about, so it is a hard constant rather than a flag.
 MAX_SHARD_SIZE = 999
 
 

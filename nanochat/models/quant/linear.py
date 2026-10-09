@@ -51,34 +51,23 @@ class _CodebookSTE(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, codebook, numel: int) -> tuple[torch.Tensor, torch.Tensor]:
-        # Flatten for the gather: the codebook is 1-D, so `codebook[indices]`
-        # requires a 1-D index regardless of how x is shaped. The flat index is
-        # carried on ctx and reshaped back in backward.
+        # Flatten for the gather: the codebook is 1-D, so `codebook[indices]` requires a 1-D index regardless of how x is shaped. The flat index is carried on ctx and reshaped back in backward.
         x_flat = x.detach().reshape(-1).to(torch.float32)
         midpoints = codebook_midpoints(codebook)
-        # Detach for the index: the assignment is discrete and carries no
-        # gradient, exactly as in the plain-STE path.
+        # Detach for the index: the assignment is discrete and carries no gradient, exactly as in the plain-STE path.
         indices = torch.bucketize(x_flat, midpoints)
         ctx.save_for_backward(codebook, indices)
         ctx.scale = numel**-0.5
-        # The indices are returned as a second output so callers that need them
-        # (the fused inference path) reuse this bucketize instead of paying for
-        # an identical second one over the same tensor.
+        # The indices are returned as a second output so callers that need them (the fused inference path) reuse this bucketize instead of paying for an identical second one over the same tensor.
         return codebook[indices].reshape(x.shape), indices
 
     @staticmethod
     def backward(ctx, *grad_outputs: typing.Any) -> typing.Any:
         grad_out = grad_outputs[0]
         codebook, indices = ctx.saved_tensors
-        # STE identity: the forward value is C[Q], a step function, so the
-        # gradient w.r.t. the continuous input passes through unattenuated.
+        # STE identity: the forward value is C[Q], a step function, so the gradient w.r.t. the continuous input passes through unattenuated.
         grad_x = grad_out
-        # Dual gradient: scatter the output gradient onto the assigned levels.
-        # `indices` is flat (see forward), so flatten grad_out to match. The
-        # sigmoid(softplus) factor from the prefix-sum chain rule comes for free,
-        # because autograd differentiates the cumsum of softplus itself.
-        # Cast grad to codebook dtype: forward runs in fp32 but downstream
-        # grad arrives in activation dtype (bf16 under COMPUTE_DTYPE).
+        # Dual gradient: scatter the output gradient onto the assigned levels. `indices` is flat (see forward), so flatten grad_out to match. The sigmoid(softplus) factor from the prefix-sum chain rule comes for free, because autograd differentiates the cumsum of softplus itself. Cast grad to codebook dtype: forward runs in fp32 but downstream grad arrives in activation dtype (bf16 under COMPUTE_DTYPE).
         grad_codebook = (
             torch.zeros_like(codebook)
             .scatter_add_(0, indices, grad_out.reshape(-1).to(codebook.dtype))
@@ -106,10 +95,7 @@ def quantize_with_ste(
     """
     if grad_scale != GRAD_SCALE_INV_SQRT_N:
         return quantizer(x)
-    # `get_codebook` is only on the plain codebook: a sigma-modulated
-    # wrapper exposes `get_codebooks` (per-sigma) and `bucketize`, not a
-    # single table. The inv_sqrt_n path needs the single table for the
-    # STE, so a conditioned codebook here is a caller error.
+    # `get_codebook` is only on the plain codebook: a sigma-modulated wrapper exposes `get_codebooks` (per-sigma) and `bucketize`, not a single table. The inv_sqrt_n path needs the single table for the STE, so a conditioned codebook here is a caller error.
     assert isinstance(quantizer, MemoryEfficientLearnedCodebook), (
         "inv_sqrt_n grad_scale needs a plain (non-sigma) codebook"
     )
@@ -234,24 +220,13 @@ class LCQATLinear(Linear):
     the fused activation LUT, PRD 6).
     """
 
-    # Buffers installed by export (`export_lcqat_checkpoint`) and the
-    # activation-LUT wiring, read by the fused inference path. Declared so
-    # the checker sees tensors instead of `Module.__getattr__`; they hold
-    # no value until export registers them, and every reader guards on
-    # `named_buffers()` first.
+    # Buffers installed by export (`export_lcqat_checkpoint`) and the activation-LUT wiring, read by the fused inference path. Declared so the checker sees tensors instead of `Module.__getattr__`; they hold no value until export registers them, and every reader guards on `named_buffers()` first.
     packed_weight_indices: torch.Tensor
     weight_index_format: torch.Tensor
     activation_lut: torch.Tensor
-    # Active only once the packed buffers exist; the Literal matches the
-    # dispatcher's `backend` contract exactly.
+    # Active only once the packed buffers exist; the Literal matches the dispatcher's `backend` contract exactly.
     matmul_backend: typing.Literal["cpu", "gpu", "naive"]
-    # Quantizers are assigned in `__init__` from `_make_codebook`, which
-    # returns a `MemoryEfficientLearnedCodebook` or (when sigma-conditioned)
-    # a `SigmaModulatedCodebook`. Typed as the union: a layer that never
-    # takes the sigma path has the plain type, and assigning a
-    # `SigmaModulatedCodebook` to a `MemoryEfficientLearnedCodebook`
-    # attribute would otherwise be a bad-assignment error in every wiring
-    # test that swaps the codebook in place.
+    # Quantizers are assigned in `__init__` from `_make_codebook`, which returns a `MemoryEfficientLearnedCodebook` or (when sigma-conditioned) a `SigmaModulatedCodebook`. Typed as the union: a layer that never takes the sigma path has the plain type, and assigning a `SigmaModulatedCodebook` to a `MemoryEfficientLearnedCodebook` attribute would otherwise be a bad-assignment error in every wiring test that swaps the codebook in place.
     act_quantizer: MemoryEfficientLearnedCodebook | SigmaModulatedCodebook
     weight_quantizer: MemoryEfficientLearnedCodebook
     out_quantizer: MemoryEfficientLearnedCodebook | None
@@ -349,14 +324,9 @@ class LCQATLinear(Linear):
             if quantize_out
             else None
         )
-        # Assign the out quantizer last: it is built from the act quantizer's K,
-        # so K_act must already be readable when this runs.
+        # Assign the out quantizer last: it is built from the act quantizer's K, so K_act must already be readable when this runs.
         self.out_quantizer = out_quantizer
-        # Per-channel weight table (PRD 3.4), opt-in. Stored alongside rather
-        # than replacing `weight_quantizer`: the shared table stays readable so
-        # K_width, the export planner, and the optimizer partition keep working,
-        # and `weight_quantizer` becomes the fallback whenever the fused path
-        # needs a 1-D table.
+        # Per-channel weight table (PRD 3.4), opt-in. Stored alongside rather than replacing `weight_quantizer`: the shared table stays readable so K_width, the export planner, and the optimizer partition keep working, and `weight_quantizer` becomes the fallback whenever the fused path needs a 1-D table.
         self.per_channel_weight_quantizer = (
             PerChannelValueCenteredQuantizer(
                 num_channels=out_features,
@@ -366,12 +336,7 @@ class LCQATLinear(Linear):
             if per_channel_weight
             else None
         )
-        # Bias codebook (opt-in). A single shared [K] table over the bias
-        # vector, re-fitted to the bias itself immediately below.
-        #
-        # It does NOT conflict with `per_channel_weight`: that one is
-        # `out_features x K` on the *weight* side, this is `K` on the bias side,
-        # and neither shadows the other's table.
+        # Bias codebook (opt-in). A single shared [K] table over the bias vector, re-fitted to the bias itself immediately below. It does NOT conflict with `per_channel_weight`: that one is `out_features x K` on the *weight* side, this is `K` on the bias side, and neither shadows the other's table.
         self.bias_quantizer = (
             BiasQuantizer(
                 out_features=out_features,
@@ -386,20 +351,12 @@ class LCQATLinear(Linear):
             else None
         )
         if self.bias_quantizer is not None:
-            # Fit to the freshly-initialized bias, not to the `act_init` span
-            # above, for the reason `BiasQuantizer.init_from_tensor` documents:
-            # a span that overshoots the data is silent and permanent -- every
-            # entry bucketizes onto the zero anchor, so the codebook receives no
-            # gradient at all. Measured here: on a direct-constructed layer the
-            # unscaled codebook gradients were exactly 0.0. `from_float` refits
-            # after copying the float bias in.
+            # Fit to the freshly-initialized bias, not to the `act_init` span above, for the reason `BiasQuantizer.init_from_tensor` documents: a span that overshoots the data is silent and permanent -- every entry bucketizes onto the zero anchor, so the codebook receives no gradient at all. Measured here: on a direct-constructed layer the unscaled codebook gradients were exactly 0.0. `from_float` refits after copying the float bias in.
             self.bias_quantizer.init_from_tensor(self.bias.detach())
-        # Total level counts, kept as plain ints: packing, the KV cache, and the
-        # index kernels all key off K, not off the split.
+        # Total level counts, kept as plain ints: packing, the KV cache, and the index kernels all key off K, not off the split.
         self.K_weight = self.weight_quantizer.K
         self.K_act = self.act_quantizer.K
-        # Backend for the quantized-inference index path (active only once
-        # export/load has installed packed_weight_indices buffers).
+        # Backend for the quantized-inference index path (active only once export/load has installed packed_weight_indices buffers).
         self.matmul_backend = "cpu"
 
     def _quantize(
@@ -442,11 +399,7 @@ class LCQATLinear(Linear):
             return None
         if self.bias_quantizer is None:
             return self.bias.to(dtype=dtype)
-        # `grad_scale` is a plain attribute that existing callers mutate after
-        # construction (`test_w2_grad_scale` does exactly that), so the
-        # quantizer's copy can go stale. Synced here rather than by a property
-        # because `grad_scale` is assigned before `super().__init__()`, and a
-        # property setter would then fire on a not-yet-initialized module.
+        # `grad_scale` is a plain attribute that existing callers mutate after construction (`test_w2_grad_scale` does exactly that), so the quantizer's copy can go stale. Synced here rather than by a property because `grad_scale` is assigned before `super().__init__()`, and a property setter would then fire on a not-yet-initialized module.
         self.bias_quantizer.grad_scale = self.grad_scale
         return self.bias_quantizer(self.bias).value.to(dtype=dtype)
 
@@ -496,20 +449,14 @@ class LCQATLinear(Linear):
                 )
             return self._forward_quantized(input, x_q)
         if self.per_channel_weight_quantizer is not None:
-            # Per-channel weights: one `[C, K]` table, gathered row-wise. No
-            # `1/sqrt(N)` codebook scale here -- the per-channel table has
-            # `C x K` parameters rather than `K`, so the same constant would not
-            # mean the same thing it does for a shared table, and applying a
-            # scale derived from the shared path would silently change how this
-            # variant trains relative to the one it is being compared against.
+            # Per-channel weights: one `[C, K]` table, gathered row-wise. No `1/sqrt(N)` codebook scale here -- the per-channel table has `C x K` parameters rather than `K`, so the same constant would not mean the same thing it does for a shared table, and applying a scale derived from the shared path would silently change how this variant trains relative to the one it is being compared against.
             w_q = self.per_channel_weight_quantizer(self.weight).value
             bias = self._dequantized_bias(input.dtype)
             y = F.linear(x_q.value, w_q.to(dtype=input.dtype), bias)
             if self.out_quantizer is not None:
                 y = self._quantize(self.out_quantizer, y, y.numel()).value
             return y
-        # Fixed N: one weight matrix feeds one codebook, so the scale is constant
-        # across steps (unlike the activation path, whose N varies per batch).
+        # Fixed N: one weight matrix feeds one codebook, so the scale is constant across steps (unlike the activation path, whose N varies per batch).
         w_q = self._quantize(self.weight_quantizer, self.weight, self.weight.numel())
         bias = self._dequantized_bias(input.dtype)
         y = F.linear(x_q.value, w_q.value.to(dtype=input.dtype), bias)
@@ -585,12 +532,7 @@ class LCQATLinear(Linear):
                 )
 
         leading = x.shape[:-1]
-        # Narrow the quantizers to the plain codebook type: the attributes are
-        # typed as the union (plain or sigma-modulated), and the fused chain
-        # reads their codebooks directly. A sigma-conditioned layer would
-        # need a per-sigma table the chain cannot express, so the guard
-        # above (needs_sigma) already rejects it; the isinstance checks
-        # here narrow the locals so the checker sees the plain type.
+        # Narrow the quantizers to the plain codebook type: the attributes are typed as the union (plain or sigma-modulated), and the fused chain reads their codebooks directly. A sigma-conditioned layer would need a per-sigma table the chain cannot express, so the guard above (needs_sigma) already rejects it; the isinstance checks here narrow the locals so the checker sees the plain type.
         self_act_cb = self.act_quantizer
         assert isinstance(self_act_cb, MemoryEfficientLearnedCodebook), (
             "quantized_mlp_chain cannot run a sigma-conditioned activation "
@@ -694,15 +636,9 @@ class LCQATLinear(Linear):
                 "LCQATLinear.from_float requires materialized weights; "
                 "run to_empty()/init_weights() before retrofitting"
             )
-        # Weight quantizer spans the observed weight range; a zero span (zero-init
-        # projections) is floored inside the codebook so the zero anchor stays exact.
+        # Weight quantizer spans the observed weight range; a zero span (zero-init projections) is floored inside the codebook so the zero anchor stays exact.
         w_max = mod.weight.detach().abs().max().item()
-        # `and mod.bias is not None` rather than plain `quantize_bias`: `gpt.py`
-        # builds every projection with `bias=False`, so a config-level flag
-        # must degrade to "nothing to do" on a bias-free layer instead of
-        # raising on the first one it reaches. Direct construction
-        # (`LCQATLinear(..., quantize_bias=True, bias=False)`) still raises,
-        # because there the caller has both flags in hand.
+        # `and mod.bias is not None` rather than plain `quantize_bias`: `gpt.py` builds every projection with `bias=False`, so a config-level flag must degrade to "nothing to do" on a bias-free layer instead of raising on the first one it reaches. Direct construction (`LCQATLinear(..., quantize_bias=True, bias=False)`) still raises, because there the caller has both flags in hand.
         quantize_bias = bool(quantize_bias and mod.bias is not None)
         new_mod = cls(
             mod.in_features,
@@ -720,10 +656,7 @@ class LCQATLinear(Linear):
             K_act_split=K_act_split,
             out_split=out_split,
             grad_scale=grad_scale,
-            # Forwarded verbatim: `retrofit_model` passes it through, and
-            # dropping it here breaks every LC-QAT retrofit at model-build time
-            # on an unexpected keyword, with no per-channel flag even set.
-            # `pyrefly` catches a dropped keyword statically.
+            # Forwarded verbatim: `retrofit_model` passes it through, and dropping it here breaks every LC-QAT retrofit at model-build time on an unexpected keyword, with no per-channel flag even set. `pyrefly` catches a dropped keyword statically.
             per_channel_weight=per_channel_weight,
             quantize_bias=quantize_bias,
             K_bias=K_bias,
@@ -734,9 +667,6 @@ class LCQATLinear(Linear):
             if mod.bias is not None:
                 new_mod.bias.copy_(mod.bias)
         if new_mod.bias_quantizer is not None:
-            # Fit to the *copied* bias, not the ctor's act_init span. Same
-            # reason as the `w_max` measurement above: a span that overshoots the
-            # data is silent and permanent, because every entry then lands on
-            # the zero anchor and the codebook receives no gradient at all.
+            # Fit to the *copied* bias, not the ctor's act_init span. Same reason as the `w_max` measurement above: a span that overshoots the data is silent and permanent, because every entry then lands on the zero anchor and the codebook receives no gradient at all.
             new_mod.bias_quantizer.init_from_tensor(new_mod.bias.detach())
         return new_mod

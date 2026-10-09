@@ -71,14 +71,7 @@ def _activation_pairs(model: nn.Module | _EngineTree, table: tuple):
     from disagreeing about which layers get a table.
     """
     for name, module in model.named_modules():
-        # `getattr`, not attribute access: `SparsePropLinearLCQAT` re-parents only
-        # the quantizers that are not None, so a sparse-wrapped layer whose
-        # out_quantizer was None has no `out_quantizer` attribute at all rather
-        # than one set to None. Reading it directly raised AttributeError as soon
-        # as any such layer existed, which is every export of a model with
-        # --sparseprop applied to a projection that does not feed the KV cache.
-        # Bound to locals: `getattr` returns Any, which is what keeps this
-        # walk checkable (direct access would go through `Module.__getattr__`).
+        # `getattr`, not attribute access: `SparsePropLinearLCQAT` re-parents only the quantizers that are not None, so a sparse-wrapped layer whose out_quantizer was None has no `out_quantizer` attribute at all rather than one set to None. Reading it directly raised AttributeError as soon as any such layer existed, which is every export of a model with --sparseprop applied to a projection that does not feed the KV cache. Bound to locals: `getattr` returns Any, which is what keeps this walk checkable (direct access would go through `Module.__getattr__`).
         if not is_lcqat_layer(module):
             continue
         out_quantizer = getattr(module, "out_quantizer", None)
@@ -136,8 +129,7 @@ def attach_learnable_activation_luts(
         act_name,
         kwargs,
     ) in _activation_pairs(model, table):
-        # Quantizers ride along from the walk (which guarantees presence),
-        # so neither call site repeats the sparse-safe lookup.
+        # Quantizers ride along from the walk (which guarantees presence), so neither call site repeats the sparse-safe lookup.
         input_codebook = out_quantizer.get_codebook()
         output_codebook = act_quantizer.get_codebook()
         body = None
@@ -162,12 +154,7 @@ def attach_learnable_activation_luts(
             smooth_body=body,
         )
         module.learnable_activation_lut = lut
-        # Install the frozen table too, at the same dtype the non-learnable
-        # path would have produced. Hardcoding uint8 truncates for K_act >
-        # 255, where `compile_activation` yields int32 and the fused chain's
-        # `activation_lut.dtype != torch.uint8` guard then rejects a table
-        # this function built. Bound to a distinct name: reusing `table`
-        # here rebinds the loop's iteration variable mid-loop.
+        # Install the frozen table too, at the same dtype the non-learnable path would have produced. Hardcoding uint8 truncates for K_act > 255, where `compile_activation` yields int32 and the fused chain's `activation_lut.dtype != torch.uint8` guard then rejects a table this function built. Bound to a distinct name: reusing `table` here rebinds the loop's iteration variable mid-loop.
         resolved = lut.resolved_table()
         _install_lut(module, resolved.to(index_dtype_for_k(lut.k_out)))
         count += 1
@@ -223,13 +210,7 @@ def _next_quantized_sibling(
     declaration order and returns the first LCQATLinear with an act_quantizer
     whose key comes after `leaf`.
     """
-    # `parent_name` is empty only for a top-level module of a bare
-    # `nn.Module` root: the engine's `named_modules()` prefixes
-    # every owned module with `db_adapters.` / `db_denoise_heads.`,
-    # so an engine-backed walk never reaches the `else` arm. Only
-    # the engine's `get_submodule("")` returns the engine itself;
-    # every non-empty path resolves to a real `nn.Module`, which
-    # the cast states.
+    # `parent_name` is empty only for a top-level module of a bare `nn.Module` root: the engine's `named_modules()` prefixes every owned module with `db_adapters.` / `db_denoise_heads.`, so an engine-backed walk never reaches the `else` arm. Only the engine's `get_submodule("")` returns the engine itself; every non-empty path resolves to a real `nn.Module`, which the cast states.
     parent = model.get_submodule(parent_name) if parent_name else model
     parent = typing.cast(nn.Module, parent)
     found_self = False
@@ -286,26 +267,12 @@ def export_lcqat_checkpoint(
     model.eval()
 
     for _, module in model.named_modules():
-        # `SparsePropLinearLCQAT` re-parents an LCQATLinear's quantizers but is
-        # NOT an LCQATLinear subclass, so an isinstance check on LCQATLinear
-        # alone silently skips every sparse layer -- the artifact would come out
-        # with an FP32 shadow weight intact and no index buffers at all. Match
-        # on the quantizer the export actually needs, which both classes have.
-        # Bound to locals: `getattr` returns Any, which is what keeps this
-        # walk checkable (direct access would go through `Module.__getattr__`).
+        # `SparsePropLinearLCQAT` re-parents an LCQATLinear's quantizers but is NOT an LCQATLinear subclass, so an isinstance check on LCQATLinear alone silently skips every sparse layer -- the artifact would come out with an FP32 shadow weight intact and no index buffers at all. Match on the quantizer the export actually needs, which both classes have. Bound to locals: `getattr` returns Any, which is what keeps this walk checkable (direct access would go through `Module.__getattr__`).
         weight_quantizer = getattr(module, "weight_quantizer", None)
         k_weight = getattr(module, "K_weight", None)
         if weight_quantizer is None or k_weight is None:
             continue
-        # A per-channel layer quantizes through `per_channel_weight_quantizer`,
-        # a [C, K] table -- but `weight_quantizer` stays present and readable
-        # (LCQATLinear keeps it so K_weight / the optimizer partition still
-        # work), so the line below would pack indices from the *shared* table
-        # and silently emit an artifact whose indices mean something different
-        # from the weights the model was trained with. `LCQATLinear.forward`
-        # raises on this same combination at *inference* time; raising here too
-        # means the failure lands at export, where the mistake is made, instead
-        # of after the shadow weights have already been deleted.
+        # A per-channel layer quantizes through `per_channel_weight_quantizer`, a [C, K] table -- but `weight_quantizer` stays present and readable (LCQATLinear keeps it so K_weight / the optimizer partition still work), so the line below would pack indices from the *shared* table and silently emit an artifact whose indices mean something different from the weights the model was trained with. `LCQATLinear.forward` raises on this same combination at *inference* time; raising here too means the failure lands at export, where the mistake is made, instead of after the shadow weights have already been deleted.
         if getattr(module, "per_channel_weight_quantizer", None) is not None:
             raise ValueError(
                 "cannot export a layer using per-channel weight quantization: "
@@ -323,11 +290,7 @@ def export_lcqat_checkpoint(
             out_quantizer.compile_for_inference()
 
         indices = weight_quantizer(module.weight).indices
-        # The dense buffer is always written, and is always packed from the full
-        # [m, n] index matrix at the full alphabet. The sparse branch adds the
-        # CSR listing beside it; it must not overwrite `packed`/`fmt`, or the
-        # dense buffer ends up holding the flat `nnz` sparse values and every
-        # dense consumer silently reads a wrong-shaped tensor.
+        # The dense buffer is always written, and is always packed from the full [m, n] index matrix at the full alphabet. The sparse branch adds the CSR listing beside it; it must not overwrite `packed`/`fmt`, or the dense buffer ends up holding the flat `nnz` sparse values and every dense consumer silently reads a wrong-shaped tensor.
         packed, fmt = pack_weight_indices(indices, k_weight)
         module.register_buffer("packed_weight_indices", packed, persistent=True)
         module.register_buffer(

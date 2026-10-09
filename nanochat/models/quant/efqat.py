@@ -36,9 +36,7 @@ import torch.nn as nn
 if TYPE_CHECKING:
     from nanochat.models.backbone import GPT
 
-# Module-name substrings that are always kept trainable (PRD 3.2 "critical
-# outlier layers"). Everything not matching these patterns is a candidate for
-# freezing once warmup elapses.
+# Module-name substrings that are always kept trainable (PRD 3.2 "critical outlier layers"). Everything not matching these patterns is a candidate for freezing once warmup elapses.
 CRITICAL_PATTERNS = (
     "transformer.wte",  # input embedding projection
     "value_embeds",  # value embeddings
@@ -90,10 +88,7 @@ class SelectiveFreezer:
         self.freeze_middle_frac = float(freeze_middle_frac)
         self._frozen = False
         self._frozen_params: set[int] = set()
-        # Names of the frozen parameters, tracked alongside the ids because
-        # `is_trainable` is consulted once per parameter per block activation:
-        # resolving a name to a parameter means walking `named_parameters()`,
-        # which would make every activation O(P^2).
+        # Names of the frozen parameters, tracked alongside the ids because `is_trainable` is consulted once per parameter per block activation: resolving a name to a parameter means walking `named_parameters()`, which would make every activation O(P^2).
         self._frozen_names: set[str] = set()
 
     @staticmethod

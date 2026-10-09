@@ -112,9 +112,7 @@ def add_w6_args(parser: argparse.ArgumentParser) -> None:
             "be combined with the fused inference path."
         ),
     )
-    # D9: the activation-LUT relaxation and the activation body. Registered here
-    # rather than in the scripts so all three entry points cannot drift apart,
-    # the same reason `--lcqat-channel-center` lives in this helper.
+    # D9: the activation-LUT relaxation and the activation body. Registered here rather than in the scripts so all three entry points cannot drift apart, the same reason `--lcqat-channel-center` lives in this helper.
     parser.add_argument(
         "--lcqat-lut-relaxation",
         type=str,
@@ -184,9 +182,7 @@ def install_sigma_codebooks(
             f"{anchors}. Use --db-sigma-codebook=modulated for a single "
             "gain-modulated codebook."
         )
-    # Only *activation* quantizers are conditioned. A weight matrix feeds every
-    # noise level, so a per-sigma weight codebook would need a separate matrix
-    # per sigma -- that is a different (and much larger) change than this flag.
+    # Only *activation* quantizers are conditioned. A weight matrix feeds every noise level, so a per-sigma weight codebook would need a separate matrix per sigma -- that is a different (and much larger) change than this flag.
     n_conditioned = 0
     for module in engine.modules():
         quantizer = getattr(module, "act_quantizer", None)

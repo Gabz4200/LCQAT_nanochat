@@ -35,11 +35,7 @@ from __future__ import annotations
 
 import torch
 
-#: Alphabet sizes above which the product table stops paying for itself.
-#: `product` costs `K_act * K_weight` FP32 slots; a linear saves `m * n`
-#: multiplies. With LC-QAT's K<=16 the table is a few hundred floats, so the
-#: only case that matters is the degenerate one where a caller passes a huge
-#: act alphabet (a quantizer configured far above the storage budget).
+#: Alphabet sizes above which the product table stops paying for itself. `product` costs `K_act * K_weight` FP32 slots; a linear saves `m * n` multiplies. With LC-QAT's K<=16 the table is a few hundred floats, so the only case that matters is the degenerate one where a caller passes a huge act alphabet (a quantizer configured far above the storage budget).
 MAX_PRODUCT_TABLE_ENTRIES = 1 << 16
 
 
@@ -131,9 +127,7 @@ def fused_index_linear(
     table = build_product_table(act_lut, weight_lut) if product is None else product
     a = act_indices.long()  # [T, n]
     w = weight_indices.long()  # [m, n]
-    # One gather per term instead of two fetches plus a multiply. `w.t()` is
-    # [n, m], broadcast against `a` [T, n] to pair the j-th column of the
-    # activation with the j-th column of every weight row.
+    # One gather per term instead of two fetches plus a multiply. `w.t()` is [n, m], broadcast against `a` [T, n] to pair the j-th column of the activation with the j-th column of every weight row.
     terms = table[a.unsqueeze(-1), w.t().unsqueeze(0)]  # [T, n, m]
     return terms.sum(dim=1)
 

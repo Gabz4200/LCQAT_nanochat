@@ -91,18 +91,14 @@ def _to_fp8(x, fp8_dtype):
     fp8_max = torch.finfo(fp8_dtype).max
     # Compute the max absolute value across the entire tensor
     amax = x.float().abs().max()
-    # Scale maps [0, amax] -> [0, fp8_max]. Use float64 for the division to
-    # ensure consistent numerics between torch.compile and eager mode.
-    # (torchao does the same upcast — without it, compile/eager can diverge)
+    # Scale maps [0, amax] -> [0, fp8_max]. Use float64 for the division to ensure consistent numerics between torch.compile and eager mode. (torchao does the same upcast — without it, compile/eager can diverge)
     scale = fp8_max / amax.double().clamp(min=EPS)
     scale = scale.float()
-    # Quantize: scale into FP8 range, saturate (clamp prevents overflow when
-    # casting — PyTorch's default is to wrap, not saturate), then cast to FP8
+    # Quantize: scale into FP8 range, saturate (clamp prevents overflow when casting — PyTorch's default is to wrap, not saturate), then cast to FP8
     x_scaled = x.float() * scale
     x_clamped = x_scaled.clamp(-fp8_max, fp8_max)
     x_fp8 = x_clamped.to(fp8_dtype)
-    # _scaled_mm expects the *inverse* of our scale (it multiplies by this to
-    # convert FP8 values back to the original range during the matmul)
+    # _scaled_mm expects the *inverse* of our scale (it multiplies by this to convert FP8 values back to the original range during the matmul)
     inv_scale = scale.reciprocal()
     return x_fp8, inv_scale
 
@@ -118,9 +114,7 @@ def _to_col_major(x):
     return x.t().contiguous().t()
 
 
-# allow_in_graph tells torch.compile to treat this as an opaque operation —
-# dynamo won't try to decompose it into smaller ops. See the module docstring
-# for how this differs from torchao's tensor subclass approach.
+# allow_in_graph tells torch.compile to treat this as an opaque operation — dynamo won't try to decompose it into smaller ops. See the module docstring for how this differs from torchao's tensor subclass approach.
 @torch._dynamo.allow_in_graph
 class _Float8Matmul(torch.autograd.Function):
     """Custom autograd for the three FP8 GEMMs of a Linear layer.
@@ -136,33 +130,26 @@ class _Float8Matmul(torch.autograd.Function):
         weight_fp8, weight_inv = _to_fp8(weight, torch.float8_e4m3fn)
         ctx.save_for_backward(input_fp8, input_inv, weight_fp8, weight_inv)
 
-        # output = input @ weight.T
-        # input_fp8 is [B, K] contiguous = row-major (good for first arg)
-        # weight_fp8 is [N, K] contiguous, so weight_fp8.t() is [K, N] with
-        # strides (1, K) = column-major (good for second arg, no copy needed!)
+        # output = input @ weight.T input_fp8 is [B, K] contiguous = row-major (good for first arg) weight_fp8 is [N, K] contiguous, so weight_fp8.t() is [K, N] with strides (1, K) = column-major (good for second arg, no copy needed!)
         output = torch._scaled_mm(
             input_fp8,
             weight_fp8.t(),
             scale_a=input_inv,
             scale_b=weight_inv,
             out_dtype=input_2d.dtype,
-            # use_fast_accum=True accumulates the dot products in lower precision.
-            # Slightly less accurate but measurably faster. Standard practice for
-            # the forward pass; we use False in backward for more precise gradients.
+            # use_fast_accum=True accumulates the dot products in lower precision. Slightly less accurate but measurably faster. Standard practice for the forward pass; we use False in backward for more precise gradients.
             use_fast_accum=True,
         )
         return output
 
     @staticmethod
     def backward(ctx, *grad_outputs):
-        # `Function.backward` is `*grad_outputs`; this op
-        # has a single output, so the grad arrives alone.
+        # `Function.backward` is `*grad_outputs`; this op has a single output, so the grad arrives alone.
         (grad_output,) = grad_outputs
         in_fp8, in_inv, w_fp8, w_inv = ctx.saved_tensors
 
         go_fp8, go_inv = _to_fp8(grad_output, torch.float8_e5m2)
-        # go_fp8 is [B, N] contiguous = row-major, good for first arg
-        # w_fp8 is [N, K] contiguous = row-major, need column-major for second arg
+        # go_fp8 is [B, N] contiguous = row-major, good for first arg w_fp8 is [N, K] contiguous = row-major, need column-major for second arg
         w_col = _to_col_major(w_fp8)
         grad_input = torch._scaled_mm(
             go_fp8,
@@ -195,8 +182,7 @@ class Float8Linear(nn.Linear):
     """
 
     def forward(self, input):
-        # Cast input to COMPUTE_DTYPE (typically bf16) since _scaled_mm expects
-        # reduced precision input, and we no longer rely on autocast to do this.
+        # Cast input to COMPUTE_DTYPE (typically bf16) since _scaled_mm expects reduced precision input, and we no longer rely on autocast to do this.
         input = input.to(COMPUTE_DTYPE)
         # _scaled_mm only works on 2D tensors, so flatten batch dimensions
         orig_shape = input.shape

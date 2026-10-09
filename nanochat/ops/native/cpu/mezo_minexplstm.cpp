@@ -37,8 +37,7 @@ inline float clampf(float x, float lo, float hi) {
     return x < lo ? lo : (x > hi ? hi : x);
 }
 
-// Scalar implementation for fallback and tail handling.
-// Mirrors _mezo_minexplstm_step_naive (nanochat/ops/mezo_minexplstm.py).
+// Scalar implementation for fallback and tail handling. Mirrors _mezo_minexplstm_step_naive (nanochat/ops/mezo_minexplstm.py).
 void mezo_minexplstm_step_scalar(
     const float* __restrict__ fir,
     const float* __restrict__ mezo,
@@ -103,8 +102,7 @@ void mezo_minexplstm_step_scalar(
         float gamma_c = clampf(gamma, kGammaMin, kGammaMax);
         float beta_c = clampf(beta, -clamp_val, clamp_val);
 
-        // FiLM-modulated MeZO update with coordinate-wise clipping
-        // (PRD 2.4/2.5) and decoupled weight decay.
+        // FiLM-modulated MeZO update with coordinate-wise clipping (PRD 2.4/2.5) and decoupled weight decay.
         float raw_update = gamma_c * mezo[i] + beta_c;
         float clipped = clampf(raw_update, -clip_val, clip_val);
         weight_out[i] = weight[i] * (1.0f - lr * wd) - lr * clipped;
@@ -149,10 +147,7 @@ void mezo_minexplstm_step(
     TORCH_CHECK(mezo.sizes() == fir.sizes(), "mezo shape mismatch");
     TORCH_CHECK(weight.sizes() == fir.sizes(), "weight shape mismatch");
     TORCH_CHECK(h_int8.sizes() == fir.sizes(), "h shape mismatch");
-    // Validate dtypes and devices: data_ptr<float> / item<float>
-    // are undefined behavior on a non-FP32 tensor and silently
-    // wrong on a non-CPU tensor, so the contract is enforced
-    // here rather than left to the caller.
+    // Validate dtypes and devices: data_ptr<float> / item<float> are undefined behavior on a non-FP32 tensor and silently wrong on a non-CPU tensor, so the contract is enforced here rather than left to the caller.
     TORCH_CHECK(fir.device().is_cpu(), "fir must be a CPU tensor");
     TORCH_CHECK(fir.dtype() == at::kFloat, "fir must be FP32");
     TORCH_CHECK(mezo.dtype() == at::kFloat, "mezo must be FP32");
@@ -200,8 +195,7 @@ void mezo_minexplstm_step(
     float film_b_arr[2];
     for (int i = 0; i < 2; ++i) film_b_arr[i] = film_b[i].item<float>();
 
-    // Call the scalar implementation (cache-blocked in the fused
-    // pipeline shape shared with the SGD kernel).
+    // Call the scalar implementation (cache-blocked in the fused pipeline shape shared with the SGD kernel).
     mezo_minexplstm_step_scalar(
         fir.data_ptr<float>(),
         mezo.data_ptr<float>(),

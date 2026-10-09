@@ -30,12 +30,7 @@ def _ensure_cpu_op() -> None:
 
     load_cpu_sparseprop_extension()
     if not _fake_registered:
-        # The fake's parameters bind by position to the schema
-        # (w_val, w_col, w_ptr, x, bias, M). Naming them in schema
-        # order is what makes the shape below read from the right
-        # tensor; a mismatched order silently builds the output shape
-        # from the wrong argument under fake-tensor mode (opcheck,
-        # torch.compile).
+        # The fake's parameters bind by position to the schema (w_val, w_col, w_ptr, x, bias, M). Naming them in schema order is what makes the shape below read from the right tensor; a mismatched order silently builds the output shape from the wrong argument under fake-tensor mode (opcheck, torch.compile).
         def _sparseprop_forward_fake(w_val, w_col, w_ptr, x, bias, M):
             return torch.empty(M, x.size(1), dtype=torch.float32, device=x.device)
 
@@ -260,9 +255,7 @@ def _build_csc_from_mask(mask: torch.Tensor):
     column.
     """
     K = mask.shape[1]
-    # Transpose first: nonzero over the transposed mask enumerates
-    # (col, row) pairs in column-major order, so within each column the row
-    # indices come out ascending -- exactly the CSC layout the kernel expects.
+    # Transpose first: nonzero over the transposed mask enumerates (col, row) pairs in column-major order, so within each column the row indices come out ascending -- exactly the CSC layout the kernel expects.
     cols, rows = torch.nonzero(mask.t().contiguous(), as_tuple=True)
     counts = torch.bincount(cols, minlength=K)
     col_ptr = torch.zeros(K + 1, dtype=torch.int64, device=mask.device)
@@ -383,9 +376,7 @@ def gather_values_from_dense_csc(
     return weight_dense.reshape(-1)[lin_idx.to(weight_dense.device)]
 
 
-# GPU backend (Taichi/Vulkan). Same signatures as the CPU functions so a
-# backend swap is a one-word change; the kernels consume the same CSR/CSC
-# listings, so the three backends agree by construction.
+# GPU backend (Taichi/Vulkan). Same signatures as the CPU functions so a backend swap is a one-word change; the kernels consume the same CSR/CSC listings, so the three backends agree by construction.
 
 
 def sparseprop_forward_gpu(

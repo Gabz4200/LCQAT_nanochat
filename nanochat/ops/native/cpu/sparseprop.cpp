@@ -40,13 +40,7 @@ void spmm_row_avx2(const float* __restrict x_base,
                    const float* __restrict vals,       // [nnz_in_row] weight values
                    int nnz_in_row, int B,
                    float* __restrict y_row) {
-  // Register-blocked over the batch axis. The naive form accumulated straight
-  // into y_row, so every nnz entry paid a load/add/store round trip on the
-  // output row: at the default 0.75 sparsity that is ~4/3 * K read-modify-writes
-  // per output element, which streamed y far more than it did arithmetic and
-  // lost to a dense GEMM. Here each AVX2 lane chunk is accumulated in a
-  // register across all nnz in the row and stored once, so y is touched O(B/W)
-  // times per row instead of O(nnz * B/W).
+  // Register-blocked over the batch axis. The naive form accumulated straight into y_row, so every nnz entry paid a load/add/store round trip on the output row: at the default 0.75 sparsity that is ~4/3 * K read-modify-writes per output element, which streamed y far more than it did arithmetic and lost to a dense GEMM. Here each AVX2 lane chunk is accumulated in a register across all nnz in the row and stored once, so y is touched O(B/W) times per row instead of O(nnz * B/W).
   constexpr int VB = 8;  // one __m256 of accumulators
   int nvec = B / VB;
   for (int i = 0; i < nvec; ++i) {
@@ -164,13 +158,7 @@ Path select_path() {
   return Path::kScalar;
 }
 
-// Validates a CSR/CSC listing before the kernels walk it: the row (or
-// column) pointers must be monotone from 0 to nnz, and every stored
-// index must lie inside the matrix. The Python facade only ever
-// produces canonical listings, but the ops are reachable directly
-// through torch.ops, and a malformed listing would otherwise read
-// out of bounds inside the kernels with no error. The pass is O(nnz),
-// the same order as the walk it guards.
+// Validates a CSR/CSC listing before the kernels walk it: the row (or column) pointers must be monotone from 0 to nnz, and every stored index must lie inside the matrix. The Python facade only ever produces canonical listings, but the ops are reachable directly through torch.ops, and a malformed listing would otherwise read out of bounds inside the kernels with no error. The pass is O(nnz), the same order as the walk it guards.
 void validate_listing(const int32_t* __restrict ptr, int64_t rows,
                       const int32_t* __restrict idx, int64_t nnz,
                       int64_t max_index, const char* kind) {
@@ -228,9 +216,7 @@ at::Tensor lcqat_sparseprop_forward(
   const float* wv_ptr = w_val.data_ptr<float>();
   const int32_t* wc_ptr = w_col.data_ptr<int32_t>();
   const int32_t* wp_ptr = w_ptr.data_ptr<int32_t>();
-  // The kernels walk the listing with raw pointer arithmetic, so a
-  // malformed one would read out of bounds with no error: validate it
-  // here, once, before the walk.
+  // The kernels walk the listing with raw pointer arithmetic, so a malformed one would read out of bounds with no error: validate it here, once, before the walk.
   validate_listing(wp_ptr, M, wc_ptr, nnz, K, "CSR");
   float* y_ptr = y.data_ptr<float>();
   const Path path = select_path();
@@ -289,11 +275,7 @@ std::tuple<at::Tensor, at::Tensor> lcqat_sparseprop_backward(
   const float* wvc_ptr = w_val_csc.data_ptr<float>();
   const int32_t* wr_ptr = w_row.data_ptr<int32_t>();
   const int32_t* wcptr_ptr = w_cptr.data_ptr<int32_t>();
-  // The kernels walk both listings with raw pointer arithmetic,
-  // so a malformed one would read out of bounds with no error:
-  // validate them here, once, before the walk. CSR walks
-  // columns of W (max index K); CSC walks rows of W (max
-  // index M).
+  // The kernels walk both listings with raw pointer arithmetic, so a malformed one would read out of bounds with no error: validate them here, once, before the walk. CSR walks columns of W (max index K); CSC walks rows of W (max index M).
   validate_listing(wp_ptr, M, wc_ptr, nnz, K, "CSR");
   validate_listing(wcptr_ptr, K, wr_ptr, nnz, M, "CSC");
   float* gw_ptr = gW_val.data_ptr<float>();
@@ -343,20 +325,11 @@ std::tuple<at::Tensor, at::Tensor> lcqat_sparseprop_backward(
 //
 //   y[t, m] = sum_j act_lut[act_indices[t, j]] * alphabet[slot_index[m, j]]
 //
-// The listing is (row_ptr, col_indices, alphabet) with `alphabet[k]` the FP32
-// weight of the k-th *stored* slot; the ordering within a row is the caller's
-// CSR order (ascending column). This is the runtime form of
-// `sparse_linear_reference.reference_sparse_index_linear`.
+// The listing is (row_ptr, col_indices, alphabet) with `alphabet[k]` the FP32 weight of the k-th *stored* slot; the ordering within a row is the caller's CSR order (ascending column). This is the runtime form of `sparse_linear_reference.reference_sparse_index_linear`.
 //
-// Zero-skip: a stored slot whose alphabet value is exactly 0.0 contributes
-// nothing, so its column fetch and multiply are skipped. That is not an
-// optimisation -- LC-QAT's zero anchor makes 0.0 a first-class weight, and a
-// pruned slot is stored as a real entry rather than dropped from the listing.
-// Skipping is therefore observably equal to accumulating a zero.
+// Zero-skip: a stored slot whose alphabet value is exactly 0.0 contributes nothing, so its column fetch and multiply are skipped. That is not an optimisation -- LC-QAT's zero anchor makes 0.0 a first-class weight, and a pruned slot is stored as a real entry rather than dropped from the listing. Skipping is therefore observably equal to accumulating a zero.
 //
-// One thread per (row, t) output element, -O3 scalar: the inner loop is a
-// short strided gather over <= nnz_row slots, so a SIMD variant would need a
-// gather instruction this path cannot rely on.
+// One thread per (row, t) output element, -O3 scalar: the inner loop is a short strided gather over <= nnz_row slots, so a SIMD variant would need a gather instruction this path cannot rely on.
 at::Tensor lcqat_sparse_index_linear(
     const at::Tensor& act_indices, const at::Tensor& act_lut,
     const at::Tensor& col_indices, const at::Tensor& row_ptr,
@@ -416,10 +389,7 @@ at::Tensor lcqat_sparse_index_linear(
 
   at::parallel_for(0, M * T, 1, [&](int64_t begin, int64_t end) {
     for (int64_t idx = begin; idx < end; ++idx) {
-      // `out` is [T, M] row-major, so element (t, m) lives at t * M + m.
-      // Deriving the linear index from (m, t) instead would write the whole
-      // result transposed -- a correct accumulation landing in the wrong row,
-      // which shows up only as a wrong number, never as a shape error.
+      // `out` is [T, M] row-major, so element (t, m) lives at t * M + m. Deriving the linear index from (m, t) instead would write the whole result transposed -- a correct accumulation landing in the wrong row, which shows up only as a wrong number, never as a shape error.
       const int64_t m = idx / T;
       const int64_t t = idx % T;
       const uint8_t* act_row = act_ptr + t * N;
@@ -428,8 +398,7 @@ at::Tensor lcqat_sparse_index_linear(
       float acc = 0.0f;
       for (int32_t p = p_start; p < p_end; ++p) {
         const float w = alpha_ptr[p];
-        // Zero-skip: an exact 0.0 weight contributes nothing, so skip the
-        // column fetch and the multiply entirely.
+        // Zero-skip: an exact 0.0 weight contributes nothing, so skip the column fetch and the multiply entirely.
         if (w == 0.0f) continue;
         const int64_t j = cols_ptr[p];
         acc += lut_ptr[act_row[j]] * w;

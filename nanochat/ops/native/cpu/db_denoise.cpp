@@ -2,19 +2,11 @@
 //
 //   loss = weight * mean((pred - clean)^2)
 //
-// `pred` is the active block's denoiser prediction, `clean` the detached
-// L2-normalized target embeddings, `weight` the scalar EDM weight w(sigma).
-// DiffusionBlocks trains one scalar sigma per optimizer step, so the weight
-// is a single float for the whole batch (not per-sample).
+// `pred` is the active block's denoiser prediction, `clean` the detached L2-normalized target embeddings, `weight` the scalar EDM weight w(sigma). DiffusionBlocks trains one scalar sigma per optimizer step, so the weight is a single float for the whole batch (not per-sample).
 //
-// One thread per chunk with per-thread partial sums: the reduction is a
-// single scalar, so parallelizing over output elements would race. N is
-// typically B*T*D (tens of thousands of elements); the serial tail that sums
-// the partials is O(threads).
+// One thread per chunk with per-thread partial sums: the reduction is a single scalar, so parallelizing over output elements would race. N is typically B*T*D (tens of thousands of elements); the serial tail that sums the partials is O(threads).
 //
-// This op is forward-only (inference-only registration): training gradients
-// reach pred/clean through DbDenoiseLossFunction's analytic backward in
-// nanochat/ops/db_denoise.py, never by differentiating through this kernel.
+// This op is forward-only (inference-only registration): training gradients reach pred/clean through DbDenoiseLossFunction's analytic backward in nanochat/ops/db_denoise.py, never by differentiating through this kernel.
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
@@ -65,9 +57,7 @@ at::Tensor lcqat_db_denoise(
 
 }  // namespace
 
-// Fragment: other extensions may already own the `nanochat` library in this
-// process; TORCH_LIBRARY enforces single registration per namespace and
-// aborts (uncaught exception in static init) on a second one.
+// Fragment: other extensions may already own the `nanochat` library in this process; TORCH_LIBRARY enforces single registration per namespace and aborts (uncaught exception in static init) on a second one.
 TORCH_LIBRARY_FRAGMENT(nanochat, m) {
   m.def("lcqat_db_denoise(Tensor pred, Tensor clean, float weight) -> Tensor");
 }

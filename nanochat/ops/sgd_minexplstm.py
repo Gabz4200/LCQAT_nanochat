@@ -230,8 +230,7 @@ def _sgd_minexplstm_step_naive(
     """
     eps = 1e-8
 
-    # The fused kernels are not autograd-tracked; neither is the
-    # naive reference (the optimizer runs its step under no_grad).
+    # The fused kernels are not autograd-tracked; neither is the naive reference (the optimizer runs its step under no_grad).
     with torch.no_grad():
         grad_f = grad.float().reshape(-1)
         weight_f = weight.float().reshape(-1)

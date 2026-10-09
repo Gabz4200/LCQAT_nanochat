@@ -1,14 +1,8 @@
 // LC-QAT mul-less ternary GEMV (PRD section 5.2).
 //
-// K_W=3 weights are decoded from row-wise packed trits (5 per byte); activation
-// indices arrive as packed nibbles (2 per byte) and are resolved through the
-// FP32 LUT (dequantize-on-fetch). The inner loop performs no floating-point
-// multiplications of values: ternary states become conditional additions into
-// separate positive/negative accumulators, and the two asymmetric codebook
-// scales (delta minus / delta plus) are applied once per output row.
+// K_W=3 weights are decoded from row-wise packed trits (5 per byte); activation indices arrive as packed nibbles (2 per byte) and are resolved through the FP32 LUT (dequantize-on-fetch). The inner loop performs no floating-point multiplications of values: ternary states become conditional additions into separate positive/negative accumulators, and the two asymmetric codebook scales (delta minus / delta plus) are applied once per output row.
 //
-// AVX-512 is the primary path; AVX2 and a scalar loop are runtime-selected via
-// cpuid so the extension builds and runs on machines without AVX-512.
+// AVX-512 is the primary path; AVX2 and a scalar loop are runtime-selected via cpuid so the extension builds and runs on machines without AVX-512.
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
@@ -169,8 +163,7 @@ at::Tensor lcqat_gemv_k3(
     const int64_t row_bytes = weight_trits.size(1);
     TORCH_CHECK(row_bytes * kTritsPerByte >= n, "weight_trits rows too narrow for n");
 
-    // Every activation nibble (including the pad nibble of an odd tail) must
-    // resolve inside the LUT; the kernel indexes it without further checks.
+    // Every activation nibble (including the pad nibble of an odd tail) must resolve inside the LUT; the kernel indexes it without further checks.
     const uint8_t* nib = act_nibbles.data_ptr<uint8_t>();
     const int64_t nibbles = act_nibbles.numel();
     for (int64_t b = 0; b < nibbles; ++b) {
@@ -207,9 +200,7 @@ at::Tensor lcqat_gemv_k3(
 
 }  // namespace
 
-// Fragment: quant_attn.cpp's extension may already own the `nanochat`
-// library in this process; TORCH_LIBRARY enforces single registration per
-// namespace and aborts (uncaught exception in static init) on a second one.
+// Fragment: quant_attn.cpp's extension may already own the `nanochat` library in this process; TORCH_LIBRARY enforces single registration per namespace and aborts (uncaught exception in static init) on a second one.
 TORCH_LIBRARY_FRAGMENT(nanochat, m) {
     m.def(
         "lcqat_gemv_k3(Tensor act_nibbles, Tensor act_lut, Tensor weight_trits, "

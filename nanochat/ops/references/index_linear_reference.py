@@ -77,9 +77,7 @@ def validate_index_linear_inputs(
         raise ValueError(
             f"raw weight rows have width {weight_indices.shape[1]}, need n={n}"
         )
-    # Data-dependent value scans call .item()/max(), which torch.compile
-    # cannot trace; the shape checks above are static and always run.
-    # Inputs entering a compiled graph are guarded by the eager call.
+    # Data-dependent value scans call .item()/max(), which torch.compile cannot trace; the shape checks above are static and always run. Inputs entering a compiled graph are guarded by the eager call.
     if torch.compiler.is_compiling():
         return
     if act_indices.numel() and int(act_indices.max()) >= act_lut.numel():

@@ -9,8 +9,7 @@ on the first GPU dispatch - never at package import - and Taichi's own
 offline kernel cache covers the persistent shader-cache requirement.
 """
 
-# NOTE: no `from __future__ import annotations` here - Taichi kernels need
-# real annotation objects at definition time, not PEP 563 strings.
+# NOTE: no `from __future__ import annotations` here - Taichi kernels need real annotation objects at definition time, not PEP 563 strings.
 
 import typing
 from threading import Lock
@@ -25,18 +24,10 @@ from nanochat.models.quant.packing import (
     TRITS_PER_BYTE,
 )
 
-#: Largest head dim the attention kernel's per-row accumulator is sized for.
-#: Taichi resolves a module-level Python int as a compile-time constant inside a
-#: kernel body, so the Python-side guard in `quant_attn_gpu` and the `ti.Vector`
-#: width below are the same number by construction rather than by convention:
-#: raising the guard alone would otherwise turn a clear ValueError into an
-#: out-of-range write.
+#: Largest head dim the attention kernel's per-row accumulator is sized for. Taichi resolves a module-level Python int as a compile-time constant inside a kernel body, so the Python-side guard in `quant_attn_gpu` and the `ti.Vector` width below are the same number by construction rather than by convention: raising the guard alone would otherwise turn a clear ValueError into an out-of-range write.
 GPU_MAX_HEAD_DIM = 256
 
-#: Floor for the MeZO hidden-state scale. A degenerate all-zero hidden state
-#: quantizes to scale 0, which would divide by zero on the next dequantize;
-#: the floor keeps the scale strictly positive. Distinct from the RMS eps
-#: (1e-8): this is a quantization floor, not a numerical stability constant.
+#: Floor for the MeZO hidden-state scale. A degenerate all-zero hidden state quantizes to scale 0, which would divide by zero on the next dequantize; the floor keeps the scale strictly positive. Distinct from the RMS eps (1e-8): this is a quantization floor, not a numerical stability constant.
 _SCALE_H_MIN = 1e-12
 
 _lock = Lock()
@@ -79,13 +70,7 @@ def vulkan_available() -> bool:
         return False
 
 
-# Taichi annotations must be NdarrayType INSTANCES; binding them to names keeps
-# them valid taichi annotations without call expressions inside signatures.
-# The checker half declares them opaque: at type-check time their values are
-# template instances rather than type forms, which pyrefly rejects as
-# annotations. Runtime (the else half) binds the real templates, which is
-# what `@ti.kernel` needs -- annotations here must stay real objects
-# (no `from __future__ import annotations`).
+# Taichi annotations must be NdarrayType INSTANCES; binding them to names keeps them valid taichi annotations without call expressions inside signatures. The checker half declares them opaque: at type-check time their values are template instances rather than type forms, which pyrefly rejects as annotations. Runtime (the else half) binds the real templates, which is what `@ti.kernel` needs -- annotations here must stay real objects (no `from __future__ import annotations`).
 if typing.TYPE_CHECKING:
     _F32_ARR: typing.Any
     _I32_ARR: typing.Any
@@ -93,8 +78,7 @@ else:
     _F32_ARR = ti.types.ndarray(dtype=ti.f32)
     _I32_ARR = ti.types.ndarray(dtype=ti.i32)
 
-# Taichi compiles kernels at first launch (after _ensure_init); module import
-# only decorates them, which needs no runtime.
+# Taichi compiles kernels at first launch (after _ensure_init); module import only decorates them, which needs no runtime.
 
 
 @ti.kernel
@@ -232,15 +216,7 @@ def _index_linear_kernel(
         out[linear] = acc
 
 
-# SparseProp kernels (arXiv 2302.04852, Algorithms 1-2). Each mirrors
-# the CPU kernel's decomposition so the backends agree by construction:
-# forward and dX are element-parallel over (row, batch) and
-# (column, batch) respectively -- every output element is written by
-# exactly one thread, so no atomics or barriers are needed -- and dW is
-# row-parallel over the CSR listing, where rows own disjoint nnz ranges.
-# All loop bounds are kernel arguments: Taichi resolves Python-level
-# globals at first compile, so a shape change must not require editing
-# the kernel.
+# SparseProp kernels (arXiv 2302.04852, Algorithms 1-2). Each mirrors the CPU kernel's decomposition so the backends agree by construction: forward and dX are element-parallel over (row, batch) and (column, batch) respectively -- every output element is written by exactly one thread, so no atomics or barriers are needed -- and dW is row-parallel over the CSR listing, where rows own disjoint nnz ranges. All loop bounds are kernel arguments: Taichi resolves Python-level globals at first compile, so a shape change must not require editing the kernel.
 
 
 @ti.kernel
@@ -336,12 +312,7 @@ def _sparseprop_backward_dx_kernel(
 
 
 def _to_ti(t: torch.Tensor, dtype) -> typing.Any:
-    # Returns a Taichi-owned ndarray. `ti.ndarray` is a factory function,
-    # not a type, so the annotation is opaque; callers only pass it into
-    # kernels and read it back with `to_numpy`.
-    # GPU runners return host CPU tensors: detach, move to CPU, then stage.
-    # Direct `.numpy()` on CUDA/requires-grad tensors raises a confusing
-    # TypeError from inside staging; fail with a clear contract instead.
+    # Returns a Taichi-owned ndarray. `ti.ndarray` is a factory function, not a type, so the annotation is opaque; callers only pass it into kernels and read it back with `to_numpy`. GPU runners return host CPU tensors: detach, move to CPU, then stage. Direct `.numpy()` on CUDA/requires-grad tensors raises a confusing TypeError from inside staging; fail with a clear contract instead.
     if t.requires_grad:
         t = t.detach()
     if t.is_cuda:
@@ -466,9 +437,7 @@ def run_sparseprop_forward(
     B = int(x.shape[1])
     out = ti.ndarray(ti.f32, shape=(M * B,))
     has_bias = 1 if bias is not None and bias.numel() > 0 else 0
-    # A one-element dummy keeps the kernel's bias argument a valid
-    # ndarray when the layer has no bias; the has_bias guard means it
-    # is never indexed.
+    # A one-element dummy keeps the kernel's bias argument a valid ndarray when the layer has no bias; the has_bias guard means it is never indexed.
     bias_arr = _to_ti(
         bias if bias is not None else torch.zeros(1, dtype=torch.float32), ti.f32
     )
@@ -509,8 +478,7 @@ def run_sparseprop_backward(
     _ensure_init()
     B = int(gY.shape[1])
     nnz = int(w_val.shape[0])
-    # Stage the operands both kernels share once; a second _to_ti of
-    # the same tensor would copy it twice.
+    # Stage the operands both kernels share once; a second _to_ti of the same tensor would copy it twice.
     gY_arr = _to_ti(gY, ti.f32)
     x_arr = _to_ti(x, ti.f32)
     gX = ti.ndarray(ti.f32, shape=(K * B,))
@@ -539,8 +507,7 @@ def run_sparseprop_backward(
     return gx, gw
 
 
-# SGD-MinExpLSTM fused optimizer kernel (PRD v3.2, section 6): three Taichi launches.
-# Pass 1 computes the layer-wise gradient RMS; pass 2 blends the EMAs; pass 3 runs the cell and updates.
+# SGD-MinExpLSTM fused optimizer kernel (PRD v3.2, section 6): three Taichi launches. Pass 1 computes the layer-wise gradient RMS; pass 2 blends the EMAs; pass 3 runs the cell and updates.
 
 
 @ti.kernel
@@ -567,12 +534,7 @@ def run_sgd_minexplstm_rms(
 ) -> float:
     """Run pass 1: layer-wise RMS of the gradient (PRD 3.1)."""
     _ensure_init()
-    # Taichi-owned accumulator: _to_ti copies data in but never
-    # back, so a torch tensor passed through _to_ti would read
-    # stale zeros on the host after the kernel writes into the
-    # Taichi ndarray. The GEMV kernel above uses this same
-    # pattern: allocate the output with ti.ndarray, launch, sync,
-    # then read back with to_numpy().copy().
+    # Taichi-owned accumulator: _to_ti copies data in but never back, so a torch tensor passed through _to_ti would read stale zeros on the host after the kernel writes into the Taichi ndarray. The GEMV kernel above uses this same pattern: allocate the output with ti.ndarray, launch, sync, then read back with to_numpy().copy().
     rms_g_sq = ti.ndarray(ti.f32, shape=(1,))
     _sgd_minexplstm_rms_kernel(
         _to_ti(grad.contiguous(), ti.f32),
@@ -615,8 +577,7 @@ def _sgd_minexplstm_blend_kernel(
         g = grad[i]
         # Layer-wise RMS-normalized gradient (PRD 3.1).
         g_norm = g / (rms_g + eps)
-        # Lambda-coupled beta prediction (PRD 3.2): a single
-        # shared scalar affine map through a hard sigmoid.
+        # Lambda-coupled beta prediction (PRD 3.2): a single shared scalar affine map through a hard sigmoid.
         u = w_beta * g_norm + b_beta
         sig = 0.5 + 0.125 * u
         if sig < 0.0:
@@ -654,9 +615,7 @@ def run_sgd_minexplstm_blend(
 ) -> tuple[float, float, torch.Tensor, torch.Tensor]:
     """Run pass 2: blend EMAs and return the new-EMA RMS sums."""
     _ensure_init()
-    # Taichi-owned accumulators and stashes (see run_sgd_minexplstm_rms:
-    # _to_ti is one-way, so reduction outputs and stashes must be
-    # ti.ndarray allocations read back with to_numpy().copy()).
+    # Taichi-owned accumulators and stashes (see run_sgd_minexplstm_rms: _to_ti is one-way, so reduction outputs and stashes must be ti.ndarray allocations read back with to_numpy().copy()).
     rms_fast_new_sq = ti.ndarray(ti.f32, shape=(1,))
     rms_slow_new_sq = ti.ndarray(ti.f32, shape=(1,))
     ema_fast_new = ti.ndarray(ti.f32, shape=(n,))
@@ -734,10 +693,7 @@ def run_sgd_minexplstm_step(
     ema_slow_int8 = ema_slow_int8.contiguous()
     h_int8 = h_int8.contiguous()
 
-    # Extract scalar cell parameters. The cell's Linear layers
-    # store weights as [out, in] (e.g. phi_proj.weight is [1, 3])
-    # and biases as [out] (e.g. phi_proj.bias is [1]); flatten both
-    # so indexing is shape-agnostic regardless of the Linear geometry.
+    # Extract scalar cell parameters. The cell's Linear layers store weights as [out, in] (e.g. phi_proj.weight is [1, 3]) and biases as [out] (e.g. phi_proj.bias is [1]); flatten both so indexing is shape-agnostic regardless of the Linear geometry.
     phi_w = phi_w.contiguous().flatten()
     phi_b = phi_b.contiguous().flatten()
     iota_w = iota_w.contiguous().flatten()
@@ -762,8 +718,7 @@ def run_sgd_minexplstm_step(
     # Pass 1: layer-wise RMS of the gradient (PRD 3.1).
     rms_g = run_sgd_minexplstm_rms(grad, n)
 
-    # Pass 2: blend the EMAs and accumulate the new-EMA squares
-    # (PRD 3.2/3.3). The new EMAs are stashed in scratch buffers.
+    # Pass 2: blend the EMAs and accumulate the new-EMA squares (PRD 3.2/3.3). The new EMAs are stashed in scratch buffers.
     rms_fast_new, rms_slow_new, ema_fast_new, ema_slow_new = run_sgd_minexplstm_blend(
         grad,
         ema_fast_int8,
@@ -777,31 +732,14 @@ def run_sgd_minexplstm_step(
         n,
     )
 
-    # Pass 3 outputs: the updated weight, the FP32 stashes
-    # for the new states (h_next and the already-blended
-    # EMAs), and the per-tensor max-abs scales for the new
-    # states. The host re-quantizes the stashes to INT8
-    # against the final scales once the kernel returns (the
-    # kernel folds the max-abs reduction into the scale
-    # arrays, which is serial by construction). All outputs
-    # are Taichi-owned ndarrays: _to_ti is one-way, so the
-    # GEMV pattern (allocate with ti.ndarray, read back with
-    # to_numpy().copy()) applies to every output here.
+    # Pass 3 outputs: the updated weight, the FP32 stashes for the new states (h_next and the already-blended EMAs), and the per-tensor max-abs scales for the new states. The host re-quantizes the stashes to INT8 against the final scales once the kernel returns (the kernel folds the max-abs reduction into the scale arrays, which is serial by construction). All outputs are Taichi-owned ndarrays: _to_ti is one-way, so the GEMV pattern (allocate with ti.ndarray, read back with to_numpy().copy()) applies to every output here.
     weight_out = ti.ndarray(ti.f32, shape=(n,))
     h_next_out = ti.ndarray(ti.f32, shape=(n,))
     scale_fast_out = ti.ndarray(ti.f32, shape=(1,))
     scale_slow_out = ti.ndarray(ti.f32, shape=(1,))
     scale_h_out = ti.ndarray(ti.f32, shape=(1,))
 
-    # Pack the 34 cell scalars into a single constant array
-    # (PRD section 6.3: load cell weights into constant memory).
-    # Layout (32 floats):
-    #   [0:3]   phi_w   [3]   phi_b
-    #   [4:7]   iota_w  [7]   iota_b
-    #   [8:11]  h_w     [11]  h_b
-    #   [12:16] out_w   [16:20] out_b
-    #   [20:28] film_w  [28:30] film_b
-    #   [30]    w_beta  [31]  b_beta
+    # Pack the 34 cell scalars into a single constant array (PRD section 6.3: load cell weights into constant memory). Layout (32 floats): [0:3] phi_w [3] phi_b [4:7] iota_w [7] iota_b [8:11] h_w [11] h_b [12:16] out_w [16:20] out_b [20:28] film_w [28:30] film_b [30] w_beta [31] b_beta
     cell_params_host = torch.zeros(32, dtype=torch.float32, device=grad.device)
     cell_params_host[0:3] = phi_w
     cell_params_host[3] = phi_b_val
@@ -839,29 +777,19 @@ def run_sgd_minexplstm_step(
     )
     ti.sync()
 
-    # The kernel folded the per-tensor max-abs reduction
-    # into scale_*_out[0] (serial by construction, like the
-    # RMS pass). Read the final max-abs values back, convert
-    # to the symmetric INT8 scale (max-abs / 127, matching
-    # the naive reference's _quantize), then re-quantize the
-    # stashed FP32 states to INT8 against the true final
-    # scales (the kernel could not do this in a single
-    # launch: the scale is unknown until every thread has
-    # contributed its magnitude).
+    # The kernel folded the per-tensor max-abs reduction into scale_*_out[0] (serial by construction, like the RMS pass). Read the final max-abs values back, convert to the symmetric INT8 scale (max-abs / 127, matching the naive reference's _quantize), then re-quantize the stashed FP32 states to INT8 against the true final scales (the kernel could not do this in a single launch: the scale is unknown until every thread has contributed its magnitude).
     eps = 1e-8
     scale_fast_new = float(scale_fast_out.to_numpy().copy()[0]) / 127.0 + eps
     scale_slow_new = float(scale_slow_out.to_numpy().copy()[0]) / 127.0 + eps
     scale_h_new = float(scale_h_out.to_numpy().copy()[0]) / 127.0 + eps
-    # Guard against a degenerate all-zero state (the
-    # scale would be 0 and the INT8 values would be 0/0).
+    # Guard against a degenerate all-zero state (the scale would be 0 and the INT8 values would be 0/0).
     scale_fast_new = max(scale_fast_new, _SCALE_H_MIN)
     scale_slow_new = max(scale_slow_new, _SCALE_H_MIN)
     scale_h_new = max(scale_h_new, _SCALE_H_MIN)
 
     # Copy the updated weight back to the caller's tensor.
     weight.copy_(torch.from_numpy(weight_out.to_numpy().copy()).reshape(weight.shape))
-    # Re-quantize the new states to INT8 against the final
-    # scales (PRD 4.1: symmetric max-abs, int8 range).
+    # Re-quantize the new states to INT8 against the final scales (PRD 4.1: symmetric max-abs, int8 range).
     ema_fast_int8.copy_(
         torch.clamp(
             torch.round(ema_fast_new / scale_fast_new),
@@ -886,16 +814,7 @@ def run_sgd_minexplstm_step(
     return scale_fast_new, scale_slow_new, scale_h_new
 
 
-# MeZO-MinExpLSTM fused optimizer kernel (PRD v2.0, sections
-# 2.2-2.5/6): two Taichi launches. Pass 1 reduces the
-# squared FIR/MeZO/hidden magnitudes (the layer-wise RMS
-# inputs); pass 2 runs the cell and the update. The FIR
-# signal and the raw MeZO vector are replayed from the
-# PRNG seeds host-side (the Python reference `_replay`),
-# so the kernel consumes the resulting [N] float vectors
-# directly -- one thread per element, the idiomatic
-# Taichi form shared with the GEMV, SparseProp and
-# SGD-MinExpLSTM kernels.
+# MeZO-MinExpLSTM fused optimizer kernel (PRD v2.0, sections 2.2-2.5/6): two Taichi launches. Pass 1 reduces the squared FIR/MeZO/hidden magnitudes (the layer-wise RMS inputs); pass 2 runs the cell and the update. The FIR signal and the raw MeZO vector are replayed from the PRNG seeds host-side (the Python reference `_replay`), so the kernel consumes the resulting [N] float vectors directly -- one thread per element, the idiomatic Taichi form shared with the GEMV, SparseProp and SGD-MinExpLSTM kernels.
 
 
 @ti.kernel
@@ -934,10 +853,7 @@ def run_mezo_minexplstm_rms(
 ) -> tuple[float, float, float]:
     """Run pass 1: layer-wise RMS inputs (PRD 3.1 contract)."""
     _ensure_init()
-    # Taichi-owned accumulators: _to_ti copies data in but
-    # never back, so reduction outputs must be ti.ndarray
-    # allocations read back with to_numpy().copy() (the GEMV
-    # pattern).
+    # Taichi-owned accumulators: _to_ti copies data in but never back, so reduction outputs must be ti.ndarray allocations read back with to_numpy().copy() (the GEMV pattern).
     fir_sq = ti.ndarray(ti.f32, shape=(1,))
     mezo_sq = ti.ndarray(ti.f32, shape=(1,))
     h_sq = ti.ndarray(ti.f32, shape=(1,))
@@ -970,13 +886,7 @@ def _mezo_minexplstm_step_kernel(
     rms_fir: ti.f32,
     rms_mezo: ti.f32,
     rms_h: ti.f32,
-    # Cell parameters packed into a single constant array.
-    # Layout (30 floats):
-    #   [0:3]   phi_w   [3]   phi_b
-    #   [4:7]   iota_w  [7]   iota_b
-    #   [8:11]  h_w     [11]  h_b
-    #   [12:16] out_w   [16:20] out_b
-    #   [20:28] film_w  [28:30] film_b
+    # Cell parameters packed into a single constant array. Layout (30 floats): [0:3] phi_w [3] phi_b [4:7] iota_w [7] iota_b [8:11] h_w [11] h_b [12:16] out_w [16:20] out_b [20:28] film_w [28:30] film_b
     cell_params: _F32_ARR,
     # Optimizer hyperparams
     lr: ti.f32,
@@ -1002,22 +912,18 @@ def _mezo_minexplstm_step_kernel(
     """
     eps = 1e-8
     for tid in range(n):
-        # 1. Dequantize the hidden state and RMS-normalize
-        # all three cell inputs (the scale-invariant input
-        # contract).
+        # 1. Dequantize the hidden state and RMS-normalize all three cell inputs (the scale-invariant input contract).
         h_prev = ti.cast(h_int8[tid], ti.f32) * scale_h
         fir_norm = fir[tid] / (rms_fir + eps)
         mezo_norm = mezo[tid] / (rms_mezo + eps)
         h_norm = h_prev / (rms_h + eps)
 
-        # 2. Cell forward (log-domain gates, 4D latent FiLM).
-        # x = [fir_norm, mezo_norm, h_norm]
+        # 2. Cell forward (log-domain gates, 4D latent FiLM). x = [fir_norm, mezo_norm, h_norm]
         gamma, beta, h_next = _minexp_cell_forward(
             fir_norm, mezo_norm, h_norm, h_prev, cell_params
         )
 
-        # 3. FiLM clamp bounds, coordinate-wise clipping, and
-        # the decoupled-weight-decay MeZO update (PRD 2.4/2.5).
+        # 3. FiLM clamp bounds, coordinate-wise clipping, and the decoupled-weight-decay MeZO update (PRD 2.4/2.5).
         if gamma < -0.9:
             gamma = -0.9
         elif gamma > 2.0:
@@ -1033,12 +939,7 @@ def _mezo_minexplstm_step_kernel(
             raw_update = clip_val
         weight_out[tid] = weight[tid] * (1.0 - lr * wd) - lr * raw_update
 
-        # 4. Fold the per-tensor max-abs into the scale
-        # accumulator (serial by construction; ti.atomic_max is
-        # the atomic reduction primitive). The INT8 quantization
-        # happens host-side against the final scale once the
-        # kernel returns -- the scale is unknown until every
-        # thread has contributed its magnitude.
+        # 4. Fold the per-tensor max-abs into the scale accumulator (serial by construction; ti.atomic_max is the atomic reduction primitive). The INT8 quantization happens host-side against the final scale once the kernel returns -- the scale is unknown until every thread has contributed its magnitude.
         ah = h_next
         if ah < 0.0:
             ah = -ah
@@ -1089,8 +990,7 @@ def run_mezo_minexplstm_step(
     # Pass 1: layer-wise RMS of the FIR/MeZO/hidden inputs.
     rms_fir, rms_mezo, rms_h = run_mezo_minexplstm_rms(fir, mezo, h_int8, scale_h, n)
 
-    # Pack the 30 cell scalars into a single constant array
-    # (PRD section 6.3: load cell weights into constant memory).
+    # Pack the 30 cell scalars into a single constant array (PRD section 6.3: load cell weights into constant memory).
     cell_params_host = torch.zeros(30, dtype=torch.float32, device=fir.device)
     cell_params_host[0:3] = phi_w.contiguous().flatten()
     cell_params_host[3] = phi_b.contiguous().flatten()[0]
@@ -1103,9 +1003,7 @@ def run_mezo_minexplstm_step(
     cell_params_host[20:28] = film_w.contiguous().flatten()
     cell_params_host[28:30] = film_b.contiguous().flatten()
 
-    # Outputs are Taichi-owned ndarrays: _to_ti is one-way, so
-    # the GEMV pattern (allocate with ti.ndarray, read back with
-    # to_numpy().copy()) applies to every output here.
+    # Outputs are Taichi-owned ndarrays: _to_ti is one-way, so the GEMV pattern (allocate with ti.ndarray, read back with to_numpy().copy()) applies to every output here.
     weight_out = ti.ndarray(ti.f32, shape=(n,))
     h_next_out = ti.ndarray(ti.f32, shape=(n,))
     scale_h_out = ti.ndarray(ti.f32, shape=(1,))
@@ -1131,24 +1029,15 @@ def run_mezo_minexplstm_step(
     )
     ti.sync()
 
-    # The kernel folded the per-tensor max-abs into
-    # scale_h_out[0] (serial by construction, like the RMS
-    # pass). Read the final max-abs back, convert to the
-    # symmetric INT8 scale (max-abs / 127, matching the naive
-    # reference's _quantize), then re-quantize the stashed
-    # FP32 hidden state to INT8 against the true final scale.
+    # The kernel folded the per-tensor max-abs into scale_h_out[0] (serial by construction, like the RMS pass). Read the final max-abs back, convert to the symmetric INT8 scale (max-abs / 127, matching the naive reference's _quantize), then re-quantize the stashed FP32 hidden state to INT8 against the true final scale.
     eps = 1e-8
     scale_h_new = float(scale_h_out.to_numpy().copy()[0]) / 127.0 + eps
-    # Guard against a degenerate all-zero hidden state (scale 0
-    # would divide by zero on the next dequantize). Distinct from
-    # the RMS eps: this is a quantization floor, not a numerical
-    # stability constant.
+    # Guard against a degenerate all-zero hidden state (scale 0 would divide by zero on the next dequantize). Distinct from the RMS eps: this is a quantization floor, not a numerical stability constant.
     scale_h_new = max(scale_h_new, _SCALE_H_MIN)
 
     # Copy the updated weight back to the caller's tensor.
     weight.copy_(torch.from_numpy(weight_out.to_numpy().copy()).reshape(weight.shape))
-    # Re-quantize the new hidden state to INT8 against the
-    # final scale (PRD 4.1: symmetric max-abs, int8 range).
+    # Re-quantize the new hidden state to INT8 against the final scale (PRD 4.1: symmetric max-abs, int8 range).
     h_next = torch.from_numpy(h_next_out.to_numpy().copy()).reshape(h_int8.shape)
     h_int8.copy_(
         torch.clamp(
@@ -1169,22 +1058,14 @@ def _sgd_minexplstm_step_kernel(
     weight: _F32_ARR,
     h_int8: _I32_ARR,
     scale_h: ti.f32,
-    # Layer-wise RMS values: rms_g from pass 1, the
-    # new-EMA RMS sums from pass 2 (PRD 3.1/3.3).
+    # Layer-wise RMS values: rms_g from pass 1, the new-EMA RMS sums from pass 2 (PRD 3.1/3.3).
     rms_g: ti.f32,
     rms_fast_new: ti.f32,
     rms_slow_new: ti.f32,
     # The stashed new EMAs (blended in pass 2).
     ema_fast_new: _F32_ARR,
     ema_slow_new: _F32_ARR,
-    # Cell parameters packed into a single constant array.
-    # Layout (32 floats, PRD section 5.1):
-    #   [0:3]   phi_w   [3] phi_b
-    #   [4:7]   iota_w  [7] iota_b
-    #   [8:11]  h_w     [11] h_b
-    #   [12:16] out_w   [16:20] out_b
-    #   [20:28] film_w  [28:30] film_b
-    #   [30] w_beta  [31] b_beta
+    # Cell parameters packed into a single constant array. Layout (32 floats, PRD section 5.1): [0:3] phi_w [3] phi_b [4:7] iota_w [7] iota_b [8:11] h_w [11] h_b [12:16] out_w [16:20] out_b [20:28] film_w [28:30] film_b [30] w_beta [31] b_beta
     cell_params: _F32_ARR,
     # Optimizer hyperparams
     lr: ti.f32,
@@ -1208,8 +1089,7 @@ def _sgd_minexplstm_step_kernel(
        and stash the new hidden state in FP32 (the host
        re-quantizes to INT8 against the final scales)
     """
-    # Element-parallel: one thread per element (the idiomatic
-    # Taichi form, matching the GEMV / SparseProp kernels).
+    # Element-parallel: one thread per element (the idiomatic Taichi form, matching the GEMV / SparseProp kernels).
     for tid in range(n):
         _sgd_minexplstm_step_element(
             tid,
@@ -1268,8 +1148,7 @@ def _minexp_cell_forward(
     )
     # h_next = hat_phi * h_prev + (1 - hat_phi) * tilde_h
     h_next = hat_phi * h_prev + (1.0 - hat_phi) * tilde_h
-    # 4D latent: z = ReLU(out_proj(h_next))
-    # out_proj.weight is [4, 1] flattened to [4].
+    # 4D latent: z = ReLU(out_proj(h_next)) out_proj.weight is [4, 1] flattened to [4].
     z0 = cell_params[12] * h_next + cell_params[16]
     z1 = cell_params[13] * h_next + cell_params[17]
     z2 = cell_params[14] * h_next + cell_params[18]
@@ -1282,9 +1161,7 @@ def _minexp_cell_forward(
         z2 = 0.0
     if z3 < 0.0:
         z3 = 0.0
-    # FiLM: [gamma, delta] = film_proj(z)
-    # film_w is [2, 4] flattened row-major at
-    # cell_params[20:28]; film_b at [28:30].
+    # FiLM: [gamma, delta] = film_proj(z) film_w is [2, 4] flattened row-major at cell_params[20:28]; film_b at [28:30].
     gamma = (
         cell_params[20] * z0
         + cell_params[21] * z1
@@ -1340,8 +1217,7 @@ def _sgd_minexplstm_step_element(
     # Dequantize the hidden state with its per-tensor scale.
     h_prev = ti.cast(h_int8[tid], ti.f32) * scale_h
 
-    # 2. Cell forward (PRD 3.4 + 3.5).
-    # x = [g_norm, fast_norm, slow_norm]
+    # 2. Cell forward (PRD 3.4 + 3.5). x = [g_norm, fast_norm, slow_norm]
     gamma, delta, h_next = _minexp_cell_forward(
         g_norm, fast_norm, slow_norm, h_prev, cell_params
     )
@@ -1362,17 +1238,7 @@ def _sgd_minexplstm_step_element(
     decay_step = -lr * wd * weight[tid]
     weight_out[tid] = weight[tid] + film_scaled_sgd + delta_clamped + decay_step
 
-    # 4. Re-quantize the new states to INT8 (symmetric
-    # max-abs, PRD 4.1). The per-tensor scale is the
-    # max-abs over the whole tensor; each thread folds its
-    # element's magnitude into the running max via a
-    # compare-and-write on the scale_out[0] slot (the
-    # reduction is serial by construction, like the RMS
-    # pass). The INT8 value is then quantized against the
-    # *final* scale, which is unknown until every thread
-    # has contributed -- so we quantize against the
-    # running max here and the host publishes the final
-    # scale (see run_sgd_minexplstm_step).
+    # 4. Re-quantize the new states to INT8 (symmetric max-abs, PRD 4.1). The per-tensor scale is the max-abs over the whole tensor; each thread folds its element's magnitude into the running max via a compare-and-write on the scale_out[0] slot (the reduction is serial by construction, like the RMS pass). The INT8 value is then quantized against the *final* scale, which is unknown until every thread has contributed -- so we quantize against the running max here and the host publishes the final scale (see run_sgd_minexplstm_step).
     af = ef_new
     if af < 0.0:
         af = -af
@@ -1382,29 +1248,15 @@ def _sgd_minexplstm_step_element(
     ah = h_next
     if ah < 0.0:
         ah = -ah
-    # Fold the per-tensor max-abs into the scale
-    # accumulators. ti.atomic_max is the atomic
-    # reduction primitive (the plain compare-and-write
-    # above races: parallel threads read the running
-    # max, compute a larger value, and clobber each
-    # other's update, so the final max is wrong).
+    # Fold the per-tensor max-abs into the scale accumulators. ti.atomic_max is the atomic reduction primitive (the plain compare-and-write above races: parallel threads read the running max, compute a larger value, and clobber each other's update, so the final max is wrong).
     ti.atomic_max(scale_fast_out[0], af)
     ti.atomic_max(scale_slow_out[0], aslow)
     ti.atomic_max(scale_h_out[0], ah)
-    # Stash the new hidden state in FP32; the host
-    # re-quantizes it (and the two EMAs, which pass 2
-    # already stashed) to INT8 against the final
-    # per-tensor max-abs scales once the kernel returns
-    # (the scale is unknown until every thread has
-    # contributed its magnitude, so a single-launch
-    # quantization would round against a partial max).
+    # Stash the new hidden state in FP32; the host re-quantizes it (and the two EMAs, which pass 2 already stashed) to INT8 against the final per-tensor max-abs scales once the kernel returns (the scale is unknown until every thread has contributed its magnitude, so a single-launch quantization would round against a partial max).
     h_next_out[tid] = h_next
 
 
-# loss = w * mean((pred - clean)^2) over all N elements. One thread walks the
-# flattened buffers and reduces into a scalar -- the reduction is serial by
-# construction (parallel writes to one accumulator would race), which is the
-# same shape as the GEMV kernel above: correctness first, in one fused pass.
+# loss = w * mean((pred - clean)^2) over all N elements. One thread walks the flattened buffers and reduces into a scalar -- the reduction is serial by construction (parallel writes to one accumulator would race), which is the same shape as the GEMV kernel above: correctness first, in one fused pass.
 
 
 @ti.kernel

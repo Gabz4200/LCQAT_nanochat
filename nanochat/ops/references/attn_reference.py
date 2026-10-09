@@ -72,9 +72,7 @@ def validate_quant_attn_inputs(
         )
     if window_left < -1:
         raise ValueError(f"window_left must be >= -1, got {window_left}")
-    # Data-dependent value scans call .item(), which torch.compile cannot trace;
-    # shape checks above are static and always run. Inputs entering a compiled
-    # graph are guarded by the eager call that produced them.
+    # Data-dependent value scans call .item(), which torch.compile cannot trace; shape checks above are static and always run. Inputs entering a compiled graph are guarded by the eager call that produced them.
     if torch.compiler.is_compiling():
         return
     if int(cache_seqlens.min()) < tq or int(cache_seqlens.max()) > t:
@@ -85,8 +83,7 @@ def validate_quant_attn_inputs(
     for label, idx in (("k_idx", k_idx), ("v_idx", v_idx)):
         if not idx.numel():
             continue
-        # Packed bytes hold two nibbles each: bound both halves (a byte's max
-        # value says nothing about its individual nibbles, e.g. 0x1F).
+        # Packed bytes hold two nibbles each: bound both halves (a byte's max value says nothing about its individual nibbles, e.g. 0x1F).
         nibble_max = max(int((idx & 0x0F).max()), int((idx >> 4).max()))
         if nibble_max >= k:
             raise ValueError(
@@ -125,8 +122,7 @@ def reference_quant_attn(
         k = k.repeat_interleave(group, dim=2)
         v = v.repeat_interleave(group, dim=2)
 
-    # Query i sits at global position g_i = s - Tq + i; it may attend
-    # j in [g_i - window_left, g_i] (window_left = -1 -> [0, g_i]).
+    # Query i sits at global position g_i = s - Tq + i; it may attend j in [g_i - window_left, g_i] (window_left = -1 -> [0, g_i]).
     seqlens = cache_seqlens.to(torch.long)
     g = (seqlens - tq).unsqueeze(1) + torch.arange(tq, device=q.device)  # [B, Tq]
     j = torch.arange(k.shape[1], device=q.device).view(1, 1, -1)  # [1,1,T]

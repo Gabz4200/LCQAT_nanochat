@@ -12,9 +12,7 @@ from typing import Literal
 
 import torch
 
-#: The three backends every dispatcher accepts. `naive` is the pure-PyTorch
-#: oracle and is reached only when explicitly requested; `cpu` and `gpu` are
-#: the compiled paths.
+#: The three backends every dispatcher accepts. `naive` is the pure-PyTorch oracle and is reached only when explicitly requested; `cpu` and `gpu` are the compiled paths.
 Backend = Literal["naive", "cpu", "gpu"]
 
 VALID_BACKENDS: tuple[str, ...] = ("naive", "cpu", "gpu")

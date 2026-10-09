@@ -1,14 +1,8 @@
 // K-agnostic index-weight linear (quantized runtime, TODO section 1).
 //
-// Weights arrive in their K-selected storage format (trits / nibbles /
-// uint8 / int32, tag from nanochat.lcqat.packing FORMAT_*) and are
-// resolved through the FP32 weight LUT inside the kernel
-// (dequantize-on-fetch); activations are uint8 IDs resolved through the
-// activation LUT. The packed storage is read in place - no materialized
-// fp32 weight matrix, which is the memory point of the whole runtime.
+// Weights arrive in their K-selected storage format (trits / nibbles / uint8 / int32, tag from nanochat.lcqat.packing FORMAT_*) and are resolved through the FP32 weight LUT inside the kernel (dequantize-on-fetch); activations are uint8 IDs resolved through the activation LUT. The packed storage is read in place - no materialized fp32 weight matrix, which is the memory point of the whole runtime.
 //
-// One thread per output element [T, m]; -O3 scalar. SIMD only if the
-// bench in scripts/gemv_bench.py says it is needed.
+// One thread per output element [T, m]; -O3 scalar. SIMD only if the bench in scripts/gemv_bench.py says it is needed.
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
@@ -77,12 +71,7 @@ at::Tensor lcqat_index_linear(
         act_indices.size(1) == n, "act_indices width must equal n");
 
     const int64_t k_w = weight_lut.numel();
-    // K >= 3 only. An *odd* K is NOT required: LC-QAT's asymmetric split
-    // `K = m_neg + 1 + m_pos` exists precisely so a one-sided codebook
-    // (m_neg = 0) makes the true 2-bit (K=4) and 4-bit (K=16) boundaries
-    // reachable, both of which are even. Requiring odd K here would reject
-    // exactly the bit-widths the design targets, and `expected_format` below
-    // already selects a storage format for every K >= 3.
+    // K >= 3 only. An *odd* K is NOT required: LC-QAT's asymmetric split `K = m_neg + 1 + m_pos` exists precisely so a one-sided codebook (m_neg = 0) makes the true 2-bit (K=4) and 4-bit (K=16) boundaries reachable, both of which are even. Requiring odd K here would reject exactly the bit-widths the design targets, and `expected_format` below already selects a storage format for every K >= 3.
     TORCH_CHECK(k_w >= 3, "weight_lut K must be an integer >= 3");
     TORCH_CHECK(
         format == expected_format(k_w),
@@ -123,8 +112,7 @@ at::Tensor lcqat_index_linear(
             TORCH_CHECK(false, "unknown weight index format: ", format);
     }
 
-    // Bound every index against its LUT before the kernel trusts it
-    // (same contract as lcqat_gemv_k3; the kernel indexes unchecked).
+    // Bound every index against its LUT before the kernel trusts it (same contract as lcqat_gemv_k3; the kernel indexes unchecked).
     const int64_t k_a = act_lut.numel();
     // Same reasoning as weight_lut above: K >= 3, even K allowed.
     TORCH_CHECK(k_a >= 3, "act_lut K must be an integer >= 3");
@@ -213,8 +201,7 @@ at::Tensor lcqat_index_linear(
 
 }  // namespace
 
-// Fragment: other nanochat extensions may already own the `nanochat`
-// library in this process (TORCH_LIBRARY enforces one registration).
+// Fragment: other nanochat extensions may already own the `nanochat` library in this process (TORCH_LIBRARY enforces one registration).
 TORCH_LIBRARY_FRAGMENT(nanochat, m) {
     m.def(
         "lcqat_index_linear(Tensor act_indices, Tensor act_lut, "

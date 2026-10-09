@@ -62,8 +62,7 @@ def reference_dard_loss(
 
     rules: list[torch.Tensor] = []
     for r in range(premise.shape[0]):
-        # Explicit sums, not `premise[r] @ log_probs`: this loop is the oracle,
-        # so it must not go through the same reduction the implementation uses.
+        # Explicit sums, not `premise[r] @ log_probs`: this loop is the oracle, so it must not go through the same reduction the implementation uses.
         log_v_premise = log_probs[..., sorted(_row(premise, r))].sum(dim=-1)
         log_v_conclusion = log_probs[..., sorted(_row(conclusion, r))].sum(dim=-1)
         violation = torch.exp(log_v_premise) - torch.exp(log_v_conclusion)

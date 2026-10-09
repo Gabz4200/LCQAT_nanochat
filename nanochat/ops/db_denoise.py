@@ -96,14 +96,10 @@ class DbDenoiseLossFunction(torch.autograd.Function):
         n = ctx.numel
         pred, clean = ctx.saved_tensors
         diff = pred - clean
-        # `grad_outputs` is the variadic tuple `Function.backward` expects;
-        # the EDM loss is a scalar, so there is exactly one.
+        # `grad_outputs` is the variadic tuple `Function.backward` expects; the EDM loss is a scalar, so there is exactly one.
         grad_output = grad_outputs[0]
         scale = grad_output * (2.0 * weight / n)
-        # Both inputs differentiate: dL/dp = +scale*diff,
-        # dL/dc = -scale*diff. (`forward` detaches only its SAVED
-        # copies for the kernel; the graph inputs keep their grads.
-        # The engine passes a detached clean, where this is a no-op.)
+        # Both inputs differentiate: dL/dp = +scale*diff, dL/dc = -scale*diff. (`forward` detaches only its SAVED copies for the kernel; the graph inputs keep their grads. The engine passes a detached clean, where this is a no-op.)
         return scale * diff, -scale * diff, None, None
 
 

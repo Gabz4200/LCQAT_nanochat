@@ -29,9 +29,7 @@ def validate_gemv_inputs(
             f"shape mismatch: act_indices has {act_indices.numel()} entries, "
             f"weights expect {weight_indices.shape[1]}"
         )
-    # Data-dependent value scans call .item(), which torch.compile cannot trace;
-    # shape checks above are static and always run. Inputs entering a compiled
-    # graph are guarded by the eager call that produced them.
+    # Data-dependent value scans call .item(), which torch.compile cannot trace; shape checks above are static and always run. Inputs entering a compiled graph are guarded by the eager call that produced them.
     if torch.compiler.is_compiling():
         return
     if weight_indices.numel() and int(weight_indices.max()) > 2:

@@ -134,12 +134,7 @@ def dispatch_mezo_minexplstm_step(
         )
 
     def _gpu():
-        # GPU (Taichi) fused kernel. The GPU path receives the
-        # per-tensor scale as a float (Taichi kernels take
-        # scalars, not torch tensors) and returns the updated
-        # scale; write it back so the caller's scale tensor
-        # reflects this step's quantization, matching the
-        # in-place mutation of the naive and CPU paths.
+        # GPU (Taichi) fused kernel. The GPU path receives the per-tensor scale as a float (Taichi kernels take scalars, not torch tensors) and returns the updated scale; write it back so the caller's scale tensor reflects this step's quantization, matching the in-place mutation of the naive and CPU paths.
         from nanochat.ops.kernels.gpu_loader import run_mezo_minexplstm_step
 
         scale_h_new = run_mezo_minexplstm_step(
@@ -207,8 +202,7 @@ def _mezo_minexplstm_step_naive(
     """
     eps = 1e-8
 
-    # The fused kernels are not autograd-tracked; neither is the
-    # naive reference (the optimizer runs its step under no_grad).
+    # The fused kernels are not autograd-tracked; neither is the naive reference (the optimizer runs its step under no_grad).
     with torch.no_grad():
         fir_f = fir.float().reshape(-1)
         mezo_f = mezo.float().reshape(-1)
@@ -217,8 +211,7 @@ def _mezo_minexplstm_step_naive(
         # 1. Dequantize the INT8 hidden state with its scale.
         h_prev = h_int8.to(torch.float32).reshape(-1) * scale_h
 
-        # 2. Layer-wise RMS normalization (the cell's
-        # scale-invariant input contract).
+        # 2. Layer-wise RMS normalization (the cell's scale-invariant input contract).
         rms_fir = torch.sqrt(fir_f.square().mean() + eps)
         rms_mezo = torch.sqrt(mezo_f.square().mean() + eps)
         rms_h = torch.sqrt(h_prev.square().mean() + eps)
@@ -239,18 +232,11 @@ def _mezo_minexplstm_step_naive(
         gamma = film_out[..., 0]
         beta = film_out[..., 1]
 
-        # 4. FiLM clamp bounds: gain keeps (1 + gamma) in
-        # [0.1, 3.0]; beta is clamped by clamp_val.
+        # 4. FiLM clamp bounds: gain keeps (1 + gamma) in [0.1, 3.0]; beta is clamped by clamp_val.
         gamma_c = torch.clamp(gamma, -0.9, 2.0)
         beta_c = torch.clamp(beta, -clamp_val, clamp_val)
 
-        # 5. FiLM-modulated MeZO update with coordinate-wise
-        # clipping (PRD 2.4/2.5) and decoupled weight decay.
-        # PRD 2.5: w_{t+1} = (1 - lambda*eta) * w_t - eta * clipped.
-        # The decay is applied multiplicatively to the weight
-        # (AdamW-style decoupled), not folded into the update
-        # term -- folding it in yields lr^2 * wd, which the
-        # fused kernels do not do.
+        # 5. FiLM-modulated MeZO update with coordinate-wise clipping (PRD 2.4/2.5) and decoupled weight decay. PRD 2.5: w_{t+1} = (1 - lambda*eta) * w_t - eta * clipped. The decay is applied multiplicatively to the weight (AdamW-style decoupled), not folded into the update term -- folding it in yields lr^2 * wd, which the fused kernels do not do.
         raw_update = gamma_c * mezo_f + beta_c
         clipped = torch.clamp(raw_update, -clip_bound, clip_bound)
         weight_next = weight_f * (1.0 - lr * wd) - lr * clipped

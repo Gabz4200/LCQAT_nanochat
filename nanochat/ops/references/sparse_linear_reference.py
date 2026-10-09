@@ -66,12 +66,7 @@ def validate_sparse_index_linear_inputs(
             raise ValueError(f"{label} must be float32, got {lut.dtype}")
     if act_lut.numel() < 3:
         raise ValueError("act_lut K must be an integer >= 3")
-    # No size floor on `alphabet`, deliberately. On this reference path it is a
-    # codebook, so it would normally be >= 3; but the compiled runtime path
-    # passes the already-resolved per-slot *values* under the same name, and a
-    # heavily pruned layer may have fewer than 3 surviving slots in total.
-    # Its length is checked against `indices` below, which is the invariant
-    # that actually matters.
+    # No size floor on `alphabet`, deliberately. On this reference path it is a codebook, so it would normally be >= 3; but the compiled runtime path passes the already-resolved per-slot *values* under the same name, and a heavily pruned layer may have fewer than 3 surviving slots in total. Its length is checked against `indices` below, which is the invariant that actually matters.
     if row_ptr.ndim != 1:
         raise ValueError(f"row_ptr must be 1-D, got {tuple(row_ptr.shape)}")
     if row_ptr.numel() != m + 1:
@@ -132,9 +127,7 @@ def reference_sparse_index_linear(
         stop = int(row_ptr[i + 1])
         if stop <= start:
             continue
-        # Gather the activation columns this row actually touches and take the
-        # dot product directly: no dense [m, n] allocation, so the oracle stays
-        # honest about which entries contribute.
+        # Gather the activation columns this row actually touches and take the dot product directly: no dense [m, n] allocation, so the oracle stays honest about which entries contribute.
         cols_i = cols[start:stop]
         out[:, i] = (x[:, cols_i] * weights[start:stop].to(x.dtype)).sum(dim=-1)
     return out

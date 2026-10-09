@@ -27,11 +27,7 @@
 
 namespace {
 
-// Cell parameters (34 total, loaded from Python)
-// Layout: [phi_w(3), iota_w(3), h_w(3), out_w(4),
-//          film_w(8), film_b(2), phi_b, iota_b, h_b,
-//          out_b(4), w_beta, b_beta]
-// Total: 3+3+3+4+8+2 + 1+1+1+4 + 1+1 = 34 floats
+// Cell parameters (34 total, loaded from Python) Layout: [phi_w(3), iota_w(3), h_w(3), out_w(4), film_w(8), film_b(2), phi_b, iota_b, h_b, out_b(4), w_beta, b_beta] Total: 3+3+3+4+8+2 + 1+1+1+4 + 1+1 = 34 floats
 
 constexpr float kEps = 1e-8f;
 constexpr float kGammaMin = -0.9f;
@@ -81,8 +77,7 @@ void sgd_minexplstm_step_scalar(
     float lr, float wd, float lam, float clamp_val,
     int64_t n
 ) {
-    // 1. Dequantize INT8 -> FP32
-    // 2. Layer-wise RMS of gradient
+    // 1. Dequantize INT8 -> FP32 2. Layer-wise RMS of gradient
     float sum_sq = 0.0f;
     for (int64_t i = 0; i < n; ++i) {
         float g = grad[i];
@@ -90,9 +85,7 @@ void sgd_minexplstm_step_scalar(
     }
     float rms_g = sqrtf(sum_sq / n + kEps);
 
-    // Dequantize EMA states. Heap, not stack: `n` is the parameter
-    // count and an lm_head alone is vocab*dim elements (millions),
-    // which would overflow the stack frame via alloca.
+    // Dequantize EMA states. Heap, not stack: `n` is the parameter count and an lm_head alone is vocab*dim elements (millions), which would overflow the stack frame via alloca.
     std::vector<float> ema_fast(static_cast<size_t>(n));
     std::vector<float> ema_slow(static_cast<size_t>(n));
     std::vector<float> h_prev(static_cast<size_t>(n));
@@ -102,10 +95,7 @@ void sgd_minexplstm_step_scalar(
         h_prev[static_cast<size_t>(i)] = h_int8[i] * scale_h;
     }
 
-    // Lambda-coupled beta prediction (shared w_beta, b_beta).
-    // Sized to `n`, not a fixed 1024: the prediction is
-    // per-coordinate and the kernel processes the whole tensor
-    // in one pass, so any n > 1024 would overflow a fixed buffer.
+    // Lambda-coupled beta prediction (shared w_beta, b_beta). Sized to `n`, not a fixed 1024: the prediction is per-coordinate and the kernel processes the whole tensor in one pass, so any n > 1024 would overflow a fixed buffer.
     std::vector<float> beta_fast_arr(static_cast<size_t>(n));
     std::vector<float> beta_slow_arr(static_cast<size_t>(n));
     for (int64_t i = 0; i < n; ++i) {
@@ -174,8 +164,7 @@ void sgd_minexplstm_step_scalar(
 
         weight_out[i] = weight_new;
 
-        // Update EMA states for re-quantization (blending already
-        // wrote ema_fast/ema_slow in place above)
+        // Update EMA states for re-quantization (blending already wrote ema_fast/ema_slow in place above)
         h_prev[i] = h_next; // h_next becomes h for next step
 
         // Track max abs for quantization
@@ -237,11 +226,7 @@ void sgd_minexplstm_step(
     TORCH_CHECK(ema_fast_int8.sizes() == grad.sizes(), "ema_fast shape mismatch");
     TORCH_CHECK(ema_slow_int8.sizes() == grad.sizes(), "ema_slow shape mismatch");
     TORCH_CHECK(h_int8.sizes() == grad.sizes(), "h shape mismatch");
-    // Validate dtypes and devices: the raw-pointer extraction
-    // below (data_ptr<float>, item<float>) is undefined
-    // behavior on a non-FP32 tensor and silently wrong on a
-    // non-CPU tensor, so the contract is enforced here rather
-    // than left to the caller.
+    // Validate dtypes and devices: the raw-pointer extraction below (data_ptr<float>, item<float>) is undefined behavior on a non-FP32 tensor and silently wrong on a non-CPU tensor, so the contract is enforced here rather than left to the caller.
     TORCH_CHECK(grad.device().is_cpu(), "grad must be a CPU tensor");
     TORCH_CHECK(grad.dtype() == at::kFloat, "grad must be FP32");
     TORCH_CHECK(weight.dtype() == at::kFloat, "weight must be FP32");
@@ -297,8 +282,7 @@ void sgd_minexplstm_step(
     float film_b_arr[2];
     for (int i = 0; i < 2; ++i) film_b_arr[i] = film_b[i].item<float>();
 
-    // Scalar implementation; AVX2/block parallelism
-    // is future work (see the header comment).
+    // Scalar implementation; AVX2/block parallelism is future work (see the header comment).
     sgd_minexplstm_step_scalar(
         grad.data_ptr<float>(),
         weight.data_ptr<float>(),

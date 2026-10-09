@@ -78,11 +78,7 @@ def validate_sparse_index_linear_inputs(
         validate_sparse_index_linear_inputs as _validate_reference,
     )
 
-    # The reference validator takes both the *codebook indices* and the
-    # alphabet because its kernel resolves `alphabet[indices[i]]`. This path
-    # consumes pre-resolved values (compaction already did that lookup), so
-    # the value buffer stands in for the index buffer -- the validator checks
-    # only its *length*, and the structural guarantees are what matter here.
+    # The reference validator takes both the *codebook indices* and the alphabet because its kernel resolves `alphabet[indices[i]]`. This path consumes pre-resolved values (compaction already did that lookup), so the value buffer stands in for the index buffer -- the validator checks only its *length*, and the structural guarantees are what matter here.
     _validate_reference(
         act_indices, act_lut, row_ptr, col_indices, alphabet, alphabet, m, n
     )
@@ -158,23 +154,7 @@ def sparse_index_linear(
             reference_sparse_index_linear,
         )
 
-        # The kernel and the oracle describe the same listing two ways:
-        #   kernel:  (row_ptr, col_indices, alphabet) where `alphabet` is the
-        #            resolved FP32 weight of each stored slot, length nnz.
-        #   oracle:  (row_ptr, col_indices, indices, alphabet) where `indices`
-        #            is the *compacted codebook index* of each stored slot and
-        #            `alphabet` is the compacted codebook (length k_used), so
-        #            `weights = alphabet[indices[i]]`.
-        # The naive branch used to pass the kernel's 7-arg form directly,
-        # which was both a missing argument and a positional mismatch:
-        # `col_indices` landed on `indices`, `row_ptr` on `col_indices`,
-        # `alphabet` on `row_ptr`. The path then validated a listing it did
-        # not walk, and every naive-vs-cpu parity test compared two
-        # different statements. Reconstruct the oracle's two inputs from the
-        # kernel's one: the codebook is the unique values of `alphabet`, and
-        # the per-slot indices are the argsort that maps each slot back into
-        # it. (A codebook with duplicates would break this bijection, which
-        # the kernel's own zero-anchor contract forbids.)
+        # The kernel and the oracle describe the same listing two ways: kernel:  (row_ptr, col_indices, alphabet) where `alphabet` is the resolved FP32 weight of each stored slot, length nnz. oracle:  (row_ptr, col_indices, indices, alphabet) where `indices` is the *compacted codebook index* of each stored slot and `alphabet` is the compacted codebook (length k_used), so `weights = alphabet[indices[i]]`. The naive branch used to pass the kernel's 7-arg form directly, which was both a missing argument and a positional mismatch: `col_indices` landed on `indices`, `row_ptr` on `col_indices`, `alphabet` on `row_ptr`. The path then validated a listing it did not walk, and every naive-vs-cpu parity test compared two different statements. Reconstruct the oracle's two inputs from the kernel's one: the codebook is the unique values of `alphabet`, and the per-slot indices are the argsort that maps each slot back into it. (A codebook with duplicates would break this bijection, which the kernel's own zero-anchor contract forbids.)
         codebook, inv = torch.unique(alphabet, sorted=True)
         indices = inv[torch.searchsorted(codebook, alphabet)]
         return reference_sparse_index_linear(

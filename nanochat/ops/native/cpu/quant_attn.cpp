@@ -1,14 +1,8 @@
 // Index-native quantized-KV decode attention (LC-QAT PRD section 7.1).
 //
-// K/V live as nibble-packed uint8 indices and are resolved to FP32 through
-// per-head LUTs inside the kernel (dequantize-on-fetch), so the cache never
-// materializes as bf16. Covers causal masking with an optional left sliding
-// window, GQA (query head h reads KV head h / group), and any number of
-// queries Tq ending at cache_seqlens (write-before-attend contract).
+// K/V live as nibble-packed uint8 indices and are resolved to FP32 through per-head LUTs inside the kernel (dequantize-on-fetch), so the cache never materializes as bf16. Covers causal masking with an optional left sliding window, GQA (query head h reads KV head h / group), and any number of queries Tq ending at cache_seqlens (write-before-attend contract).
 //
-// Scalar + -O3: the decode working set (window rows) is L1/L2 resident and the
-// bottleneck is LUT gathers, not FMA throughput. SIMD is a follow-up only if
-// benchmarks demand it.
+// Scalar + -O3: the decode working set (window rows) is L1/L2 resident and the bottleneck is LUT gathers, not FMA throughput. SIMD is a follow-up only if benchmarks demand it.
 
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
@@ -69,8 +63,7 @@ at::Tensor lcqat_quant_attn(
     TORCH_CHECK(cache_seqlens.dim() == 1 && cache_seqlens.size(0) == b, "cache_seqlens must be [B]");
     TORCH_CHECK(window_left >= -1, "window_left must be >= -1");
 
-    // Every nibble (including the pad nibble of an odd tail) must resolve
-    // inside the LUT; the kernel indexes it without further checks.
+    // Every nibble (including the pad nibble of an odd tail) must resolve inside the LUT; the kernel indexes it without further checks.
     const uint8_t* k_ptr = k_idx.data_ptr<uint8_t>();
     const uint8_t* v_ptr = v_idx.data_ptr<uint8_t>();
     const int64_t cache_elems = k_idx.numel();
@@ -149,8 +142,7 @@ at::Tensor lcqat_quant_attn(
 
 }  // namespace
 
-// Fragment: gemv.cpp's extension may already own the `nanochat` library in
-// this process; TORCH_LIBRARY enforces single registration per namespace.
+// Fragment: gemv.cpp's extension may already own the `nanochat` library in this process; TORCH_LIBRARY enforces single registration per namespace.
 TORCH_LIBRARY_FRAGMENT(nanochat, m) {
     m.def(
         "lcqat_quant_attn(Tensor q, Tensor k_idx, Tensor v_idx, Tensor k_lut, "
